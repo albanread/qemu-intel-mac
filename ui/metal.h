@@ -84,12 +84,15 @@ typedef struct MetalFbView {
 int metal_glue_fb_view(MetalFbView *out);
 
 /*
- * Has anything been drawn since this was last asked?  Raised on the
- * vCPU thread by the blitter, taken and cleared here.  Declared in this
- * header rather than the device's so the Objective-C side can ask
- * without dragging QOM into a .m file.
+ * Has anything been drawn since this was last asked?  1 or 0, taken and
+ * cleared -- on the Pi the blitter raises it on the vCPU thread.  -1 when
+ * the machine has no such signal, and every frame is to be copied.
  */
-unsigned riscos_blitter_take_damage(void);
+int metal_glue_take_damage(void);
+
+/* The window title's two halves (ui/metal-board.h): the system, such as
+ * "RISC OS 5", and the machine, such as "Raspberry Pi 4 (QEMU)". */
+void metal_glue_title(const char **system, const char **machine);
 
 /* Drop any cached mapping (called once from the UI loop at exit). */
 void metal_glue_fb_done(void);

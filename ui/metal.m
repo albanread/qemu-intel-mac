@@ -43,7 +43,6 @@
 /* ------------------------------------------------------------------ */
 /* State, owned by the UI thread only                                  */
 
-#define METAL_TITLE     @"RISC OS 5 — Raspberry Pi 4 (QEMU)"
 #define METAL_RING      3               /* frames of upload buffer in flight */
 
 @class MetalView;
@@ -1345,7 +1344,8 @@ static bool fb_upload(const MetalFbView *v)
     static uint64_t frames, copied, on_settle, on_timeout;
     static unsigned held;
     static bool pending;
-    bool drawing = riscos_blitter_take_damage() != 0;
+    int damage = metal_glue_take_damage();
+    bool drawing = damage > 0;
     bool settled;
 
     frames++;
@@ -1353,8 +1353,10 @@ static bool fb_upload(const MetalFbView *v)
         pending = true;             /* new content, not shown yet */
     }
 
+    /* No damage signal at all (a virtio-gpu scanout): nothing says when
+     * the guest has finished, so every frame is copied. */
     settled = pending && !drawing;
-    if (fb.uploaded && !settled && ++held < METAL_SETTLE_MAX) {
+    if (damage >= 0 && fb.uploaded && !settled && ++held < METAL_SETTLE_MAX) {
         if (fb_damage_on() && frames % 300 == 0) {
             metal_log("upload: %llu of %llu frames copied (%.1f%%), "
                       "%llu on settle, %llu on timeout",
@@ -1430,10 +1432,13 @@ static void metal_update_title(void)
     if (last_tick && now > last_tick) {
         unsigned fps = (unsigned)((frame_count - last_second_frame)
                                   / (now - last_tick));
+        const char *sys, *mach;
+
+        metal_glue_title(&sys, &mach);
         [m.window setTitle:
             [NSString stringWithFormat:
-                @"RISC OS 5 — %ux%u, %u bpp · %u fps — Raspberry Pi 4 (QEMU)",
-                fb.xres, fb.yres, fb.bpp, fps]];
+                @"%s — %ux%u, %u bpp · %u fps — %s",
+                sys, fb.xres, fb.yres, fb.bpp, fps, mach]];
     }
     last_tick = now;
     last_second_frame = frame_count;
@@ -2528,7 +2533,12 @@ static bool metal_create_window(void)
     if (!m.window) {
         return false;
     }
-    [m.window setTitle:METAL_TITLE];
+    {
+        const char *sys, *mach;
+
+        metal_glue_title(&sys, &mach);
+        [m.window setTitle:[NSString stringWithFormat:@"%s — %s", sys, mach]];
+    }
     [m.window setDelegate:delegate];
     [m.window setAcceptsMouseMovedEvents:YES];
     [m.window setReleasedWhenClosed:NO];

@@ -73,6 +73,10 @@ endif
 system_ss.add(when: cocoa, if_true: files('cocoa.m'))
 system_ss.add(when: dx11, if_true: [files('dx11.c', 'dx11.cpp'), dx11])
 system_ss.add(when: metal, if_true: [files('metal.c', 'metal.m', 'metal_script.m'), metal])
+# The Metal window's boards (metal-board.h): each is linked only into
+# targets that have its display device.
+system_ss.add(when: [metal, 'CONFIG_RASPI'], if_true: files('metal-pi.c'))
+system_ss.add(when: [metal, 'CONFIG_VIRTIO_GPU'], if_true: files('metal-virtio-gpu.c'))
 
 vnc_ss = ss.source_set()
 vnc_ss.add(files(

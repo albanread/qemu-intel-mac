@@ -1942,7 +1942,10 @@ bool metal_ui_screenshot(const char *path)
 }
 
 /* One tracking area over the whole view, so entering and leaving the
- * guest's screen is an event rather than something polled per frame. */
+ * guest's screen is an event rather than something polled per frame --
+ * and so plain movement is one too: without NSTrackingMouseMoved (or
+ * acceptsMouseMovedEvents) Cocoa sends mouseMoved: nowhere, and the
+ * guest's arrow followed the host's only while a button was held. */
 - (void)updateTrackingAreas
 {
     NSTrackingArea *area;
@@ -1953,6 +1956,7 @@ bool metal_ui_screenshot(const char *path)
     area = [[NSTrackingArea alloc]
             initWithRect:[self bounds]
                  options:NSTrackingMouseEnteredAndExited
+                         | NSTrackingMouseMoved
                          | NSTrackingActiveInKeyWindow
                          | NSTrackingInVisibleRect
                    owner:self

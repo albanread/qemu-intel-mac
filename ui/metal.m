@@ -869,11 +869,19 @@ static id<MTLRenderPipelineState> metal_pipeline(NSString *fragment,
  * what you get before touching anything -- and a 1920x1200 desktop
  * shrunk into 800x600 is not it. The size is in backing pixels, so on a
  * Retina panel the guest lands one pixel to one pixel rather than
- * doubled, and it is clamped to what the screen can actually show.
+ * doubled -- or zoom= of them to each (ROSGD asks for 2, a guest pixel a
+ * point) -- and it is clamped to what the screen can actually show.
  *
  * Once the window has been resized by hand it is left alone: the size we
  * chose is remembered, and anything else means the user has an opinion.
  */
+static int fit_zoom = 1;                /* screen pixels to a guest pixel */
+
+void metal_glue_zoom(int zoom)
+{
+    fit_zoom = zoom;
+}
+
 static void metal_fit_window_to_mode(uint32_t xres, uint32_t yres)
 {
     NSSize now = [[m.window contentView] frame].size;
@@ -890,8 +898,8 @@ static void metal_fit_window_to_mode(uint32_t xres, uint32_t yres)
         return;                         /* the user has resized it */
     }
 
-    want.width = xres / scale;
-    want.height = yres / scale;
+    want.width = xres * fit_zoom / scale;
+    want.height = yres * fit_zoom / scale;
 
     /* Leave room for the title bar and the Dock rather than filling the
      * screen exactly; a window you cannot grab is worse than a small one. */

@@ -1637,13 +1637,19 @@
 #     "acorn", "acorn-live", "tile:PATH" or "picture:PATH" (or a bare
 #     PATH) turn it on with that scene.
 #
+# @zoom: the window's size when it is fitted to the guest's mode:
+#     this many of the screen's pixels to each of the guest's, 1 to
+#     4 (default 1; on a Retina screen 2 makes a guest pixel a point).
+#     A window resized by hand is left alone.
+#
 # Since: 11.1
 ##
 { 'struct'  : 'DisplayMetal',
   'data'    : { '*vsync' : 'int',
                 '*scaling' : 'DisplayMetalScaling',
                 '*scanlines' : 'bool',
-                '*backdrop' : 'str' },
+                '*backdrop' : 'str',
+                '*zoom' : 'int' },
   'if'      : 'CONFIG_METAL' }
 
 ##

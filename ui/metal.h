@@ -160,6 +160,8 @@ void metal_glue_video_opts(int scaling, int scanlines);
  * "The backdrop layer").  Once, after metal_backend_init; an unreadable
  * image falls back to acorn. */
 void metal_glue_backdrop(const char *spec);
+/* The window's fit to a mode: screen pixels to a guest pixel, 1 to 4 */
+void metal_glue_zoom(int zoom);
 
 /* UI-side reads for the scripting surface, all UI-thread only like the
  * rest of this side of the boundary. */

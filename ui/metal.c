@@ -1755,6 +1755,9 @@ static void metal_display_init(DisplayState *ds, DisplayOptions *opts)
     if (opts->u.metal.backdrop) {
         metal_glue_backdrop(opts->u.metal.backdrop);
     }
+    if (opts->u.metal.has_zoom) {
+        metal_glue_zoom(MIN(MAX(opts->u.metal.zoom, 1), 4));
+    }
     /* The hand-off: system/main.c sees this set after qemu_init and runs
      * the QEMU main loop on its own thread, giving the UI the main one.
      * On Darwin qemu_main already points at a bare CFRunLoop; replacing

@@ -254,7 +254,7 @@ static void vg_fb_done(void)
 
 static struct {
     uint32_t argb[VG_CURSOR * VG_CURSOR];
-    int32_t x, y;
+    int32_t x, y, hot_x, hot_y;
     bool visible;
     uint32_t generation;
 } cur;
@@ -264,7 +264,7 @@ static int vg_cursor_view(MetalCursorView *out)
     bool locked = !bql_locked();
     struct virtio_gpu_scanout *s;
     bool visible, changed = false;
-    int32_t x = 0, y = 0;
+    int32_t x = 0, y = 0, hx = 0, hy = 0;
 
     if (!view.g) {
         return 0;
@@ -277,10 +277,16 @@ static int vg_cursor_view(MetalCursorView *out)
               && s->current_cursor->width == VG_CURSOR
               && s->current_cursor->height == VG_CURSOR;
     if (visible) {
-        /* QEMU's position is the hot spot's; the sprite's corner is
-         * that less the hot spot. */
-        x = (int32_t)s->cursor.pos.x - s->current_cursor->hot_x;
-        y = (int32_t)s->cursor.pos.y - s->current_cursor->hot_y;
+        /* The position is the cursor plane's corner, and the hot spot
+         * comes beside it: Linux's virtio-gpu sends crtc_x/crtc_y and
+         * the plane's HOTSPOT_X/Y (drm_plane.c, "hotspot properties";
+         * virtgpu_plane.c), the pointer being the corner plus the hot
+         * spot -- which is what lets a console draw the pointer where
+         * the host's mouse is before the guest has moved it. */
+        x = (int32_t)s->cursor.pos.x;
+        y = (int32_t)s->cursor.pos.y;
+        hx = (int32_t)s->current_cursor->hot_x;
+        hy = (int32_t)s->current_cursor->hot_y;
         if (memcmp(cur.argb, s->current_cursor->data, sizeof(cur.argb))) {
             memcpy(cur.argb, s->current_cursor->data, sizeof(cur.argb));
             changed = true;
@@ -290,11 +296,13 @@ static int vg_cursor_view(MetalCursorView *out)
         bql_unlock();
     }
     if (changed || visible != cur.visible || x != cur.x || y != cur.y
-        || !cur.generation) {
+        || hx != cur.hot_x || hy != cur.hot_y || !cur.generation) {
         cur.generation++;
         cur.visible = visible;
         cur.x = x;
         cur.y = y;
+        cur.hot_x = hx;
+        cur.hot_y = hy;
     }
 
     out->generation = cur.generation;
@@ -302,6 +310,9 @@ static int vg_cursor_view(MetalCursorView *out)
     out->visible = cur.visible;
     out->x = cur.x;
     out->y = cur.y;
+    out->hot_x = cur.hot_x;
+    out->hot_y = cur.hot_y;
+    out->has_hot = true;
     out->w = VG_CURSOR;
     out->h = VG_CURSOR;
     out->img_w = VG_CURSOR;

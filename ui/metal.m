@@ -201,6 +201,8 @@ static struct {
     int32_t x, y, w, h;             /* dest rect, display pixels */
     int32_t img_w, img_h;           /* the sprite's own resolution */
     int32_t disp_w, disp_h;         /* the display the rect is measured in */
+    int32_t hot_x, hot_y;           /* the hot spot, when has_hot */
+    bool has_hot;
 } ptr;
 
 /* The shader constants, mirroring the Params struct in the MSL below. */
@@ -295,7 +297,16 @@ static struct {
     int gx, gy;
     bool have_guest;
     int gxres, gyres;               /* guest screen size, from the fb view */
+    /* the positions sent lately, oldest overwritten: what the guest's
+     * pointer, a VSync or two behind, may still be showing */
+    struct {
+        int gx, gy;
+        double t;
+    } sent[32];
+    unsigned sent_next;
 } mouse;
+
+#define METAL_ECHO_SECONDS 0.25     /* how late the guest's pointer may be */
 
 /* A point in the view's coordinates, put on the screen in Quartz's:
  * Cocoa measures up from the bottom of the main screen, CoreGraphics
@@ -382,6 +393,10 @@ static void metal_mouse_send_abs(int gx, int gy)
         mouse.gx = gx;
         mouse.gy = gy;
         mouse.have_guest = true;
+        mouse.sent[mouse.sent_next].gx = gx;
+        mouse.sent[mouse.sent_next].gy = gy;
+        mouse.sent[mouse.sent_next].t = CACurrentMediaTime();
+        mouse.sent_next = (mouse.sent_next + 1) % 32;
         m.mouse_moves++;
     }
 }
@@ -1452,6 +1467,24 @@ static void metal_update_title(void)
     last_second_frame = frame_count;
 }
 
+/* Is the guest's pointer, at gx,gy, one of the positions sent in the
+ * last METAL_ECHO_SECONDS (to a pixel: the guest rounds through OS
+ * units)?  Then it is only late, and the host's mouse is where it is
+ * going; otherwise the guest has put it somewhere of its own. */
+static bool metal_pointer_is_echo(int32_t gx, int32_t gy)
+{
+    double now = CACurrentMediaTime();
+    unsigned i;
+
+    for (i = 0; i < 32; i++) {
+        if (mouse.sent[i].t > 0 && now - mouse.sent[i].t <= METAL_ECHO_SECONDS
+            && abs(mouse.sent[i].gx - gx) <= 1 && abs(mouse.sent[i].gy - gy) <= 1) {
+            return true;
+        }
+    }
+    return abs(mouse.gx - gx) <= 1 && abs(mouse.gy - gy) <= 1;
+}
+
 static bool metal_render_frame(void)
 {
     MetalFbView v;
@@ -1587,12 +1620,12 @@ static bool metal_render_frame(void)
      * is always a complete new sprite and position; a read that raced
      * one is reported stale and the previous frame's is kept. */
     {
-        MetalCursorView cv;
+        MetalCursorView cv = { 0 };
         bool torn = false;
 
         if (ptr.pipe && metal_glue_cursor_view(&cv) && !cv.stale
             && cv.generation != ptr.generation) {
-            MetalCursorView again;
+            MetalCursorView again = { 0 };
 
             memcpy([ptr.image contents], cv.argb,
                    METAL_CURSOR_TEXELS * METAL_CURSOR_TEXELS * 4);
@@ -1612,6 +1645,9 @@ static bool metal_render_frame(void)
                 ptr.img_h = cv.img_h;
                 ptr.disp_w = cv.disp_w;
                 ptr.disp_h = cv.disp_h;
+                ptr.hot_x = cv.hot_x;
+                ptr.hot_y = cv.hot_y;
+                ptr.has_hot = cv.has_hot;
             }
         }
         if (have_fb && ptr.pipe && !torn && ptr.visible
@@ -1628,9 +1664,28 @@ static bool metal_render_frame(void)
              * stretched to the rect, whatever mode is underneath. */
             double k, mx, my, sx, sy, sw, sh;
 
+            double px = ptr.x, py = ptr.y;
+
+            /* The guest moves its pointer once a VSync, a frame or two
+             * after the mouse has moved: drawn where the guest has it,
+             * the arrow trails the hand and steps.  So while the host
+             * cursor is the guest's (ungrabbed, over the view, in the
+             * key window) and the guest's pointer is only late -- at a
+             * position sent lately -- its sprite is drawn at the mouse,
+             * by its hot spot, every frame.  Where the guest has put
+             * the pointer itself (a drag held to its box, a program
+             * moving it, the pointer unlinked from the mouse) it is
+             * drawn there. */
+            if (ptr.has_hot && !kbd.on && cursor.inside && [m.window isKeyWindow]
+                && mouse.have_guest && ptr.disp_w == mouse.gxres
+                && ptr.disp_h == mouse.gyres
+                && metal_pointer_is_echo(ptr.x + ptr.hot_x, ptr.y + ptr.hot_y)) {
+                px = mouse.gx - ptr.hot_x;
+                py = mouse.gy - ptr.hot_y;
+            }
             metal_disp_transform(dw, dh, v.xres, v.yres, &k, &mx, &my);
-            sx = ((double)ptr.x - mx) / k;   /* display -> guest pixels */
-            sy = ((double)ptr.y - my) / k;
+            sx = (px - mx) / k;             /* display -> guest pixels */
+            sy = (py - my) / k;
             sw = (double)ptr.w / k;
             sh = (double)ptr.h / k;
 
@@ -1789,7 +1844,7 @@ static bool metal_screenshot_to(NSString *path)
      * display pixels, so it is mapped into the decoded surface's own
      * guest pixels first; the image is indexed by its own resolution. */
     {
-        MetalCursorView cv;
+        MetalCursorView cv = { 0 };
 
         if (metal_glue_cursor_view(&cv) && !cv.stale && cv.visible
             && cv.w > 0 && cv.h > 0 && cv.img_w > 0 && cv.img_h > 0

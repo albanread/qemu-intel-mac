@@ -112,6 +112,9 @@ typedef struct MetalCursorView {
     int32_t w, h;                   /* dest rect size, display pixels */
     int32_t img_w, img_h;           /* the sprite's own resolution, texels */
     int32_t disp_w, disp_h;         /* the display the rect is measured in */
+    int32_t hot_x, hot_y;           /* the hot spot in the rect, display pixels */
+    bool has_hot;                   /* hot_x/hot_y are known: the pointer is
+                                       at x + hot_x, y + hot_y */
     const void *argb;               /* img_w * img_h words */
 } MetalCursorView;
 

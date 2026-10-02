@@ -50,7 +50,7 @@ set -e
 HERE="${0:A:h}"
 ROOT="${HERE:h:h}"
 WORK="${WORK:-$ROOT/build-modules}"
-DDE="${DDE:-/Volumes/S/RISCOSDEV/bigmacfarm/master/farm-dev-hostfs-2026-09-12}"
+DDE="${DDE:-${ROOT:h:h}/bigmacfarm/master/farm-dev-hostfs-2026-09-12}"
 BOOT_HOSTFS="${BOOT_HOSTFS:-}"          # resolved under "guest builds"
 IMAGES="${RISCOS_IMAGES:-$ROOT/riscos-images}"
 Q="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"

@@ -180,7 +180,38 @@ static struct {
     uint8_t *stage;             /* the frame's bytes, contiguous */
     size_t stage_len;
     uint32_t pal[256];
+    /* Power: whether the picture changed, so that the window presents a
+     * frame only when there is something new (metal.m).  A compositor
+     * (rosgd.display=compositor) shows each new picture by flipping to
+     * another resource, which costs nothing to see; a screen drawn in
+     * place is compared with the last copy, chunk by chunk, and only the
+     * changed chunks copied -- every frame while it changes, and once
+     * still for a tenth of a second, one frame in six. */
+    uint32_t content;           /* MetalFbView.content */
+    const void *content_res;    /* the resource the stage was copied from */
+    uint32_t copied_gen;        /* the mode generation it was copied in */
+    uint32_t drawn_pal[256];    /* the palette last seen: a change is new */
+    unsigned still, tick;
 } view;
+
+/* the stage brought up to date with the guest's bytes; whether any changed */
+static bool vg_stage_sync(size_t need)
+{
+    enum { CHUNK = 16384 };
+    uint8_t buf[CHUNK];
+    bool changed = false;
+
+    for (size_t off = 0; off < need; off += CHUNK) {
+        size_t n = need - off < CHUNK ? need - off : CHUNK;
+
+        iov_to_buf(view.b.iov, view.b.niov, off, buf, n);
+        if (memcmp(view.stage + off, buf, n) != 0) {
+            memcpy(view.stage + off, buf, n);
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 static int vg_fb_view(MetalFbView *out)
 {
@@ -223,8 +254,25 @@ static int vg_fb_view(MetalFbView *out)
         g_free(view.stage);
         view.stage = g_malloc(need);
         view.stage_len = need;
+        view.content_res = NULL;        /* all of it copied, below */
     }
-    iov_to_buf(view.b.iov, view.b.niov, 0, view.stage, need);
+    view.tick++;
+    if (view.content_res != view.b.res || view.copied_gen != view.generation) {
+        /* another resource: a compositor's new frame, or a new mode */
+        iov_to_buf(view.b.iov, view.b.niov, 0, view.stage, need);
+        view.content_res = view.b.res;
+        view.copied_gen = view.generation;
+        view.content++;
+        view.still = 0;
+    } else if (view.still < 6 || view.tick % 6 == 0) {
+        /* the same resource, drawn in place: looked at */
+        if (vg_stage_sync(need)) {
+            view.content++;
+            view.still = 0;
+        } else {
+            view.still++;
+        }
+    }
 
     out->xres = m.xres;
     out->yres = m.yres;
@@ -234,7 +282,12 @@ static int vg_fb_view(MetalFbView *out)
     out->bpp = m.bpp;
     out->pixo = m.pixo;
     out->rows = m.yres + m.yoffset;
+    if (memcmp(view.drawn_pal, view.pal, sizeof(view.pal)) != 0) {
+        memcpy(view.drawn_pal, view.pal, sizeof(view.pal));
+        view.content++;                 /* a palette mode's colours */
+    }
     out->generation = view.generation;
+    out->content = view.content ? view.content : 1;
     out->gbase = 0;             /* scattered pages: no one guest address */
     out->fb = view.stage;
     out->palette = view.pal;

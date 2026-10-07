@@ -69,6 +69,11 @@ static struct {
 } m;
 
 static uint32_t frame_count;
+/* Power: a frame is drawn only when there is something new -- the guest's
+ * picture (MetalFbView.content), its pointer, the window, or an event --
+ * and the loop sleeps between.  A board that cannot tell (content 0) is
+ * drawn every frame, as it always was. */
+static bool frame_wanted = true, frame_skipped;
 
 /* -display metal options, set once at init: how the guest screen is
  * magnified to the content view (sharp-bilinear by default) and whether
@@ -1545,6 +1550,30 @@ static bool metal_render_frame(void)
         metal_log("frame %u: no fb view yet", frame_count);
     }
 
+    /* Power: nothing new, no frame (and nothing copied, decoded or
+     * presented); the loop sleeps instead */
+    {
+        static uint32_t drawn_content, drawn_gen;
+        static CGSize drawn_size;
+        MetalCursorView pc = { 0 };
+        uint32_t pgen = ptr.generation;
+        CGSize size = m.layer.drawableSize;
+
+        if (ptr.pipe && metal_glue_cursor_view(&pc) && !pc.stale) {
+            pgen = pc.generation;
+        }
+        if (have_fb && v.content && !frame_wanted && v.content == drawn_content
+            && v.generation == drawn_gen && pgen == ptr.generation
+            && size.width == drawn_size.width && size.height == drawn_size.height) {
+            frame_skipped = true;
+            return have_fb;
+        }
+        frame_wanted = false;
+        drawn_content = have_fb ? v.content : 0;
+        drawn_gen = have_fb ? v.generation : 0;
+        drawn_size = size;
+    }
+
     /* Wait for a ring slot before touching one: the frame three back has
      * to have left the GPU. */
     dispatch_semaphore_wait(m.inflight, DISPATCH_TIME_FOREVER);
@@ -2722,6 +2751,7 @@ int metal_backend_main(void)
                     }
                 }
                 [NSApp sendEvent:e];
+                frame_wanted = true;    /* input, a resize: draw */
             }
             if (m.lost) {
                 break;
@@ -2738,6 +2768,10 @@ int metal_backend_main(void)
                 continue;
             }
             metal_render_frame();
+            if (frame_skipped) {
+                frame_skipped = false;
+                usleep(8 * 1000);       /* nothing new: half a frame's wait */
+            }
         }
     }
 

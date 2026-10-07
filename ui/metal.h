@@ -70,6 +70,9 @@ typedef struct MetalFbView {
     uint32_t pixo;                  /* 1 = RGB order, 0 = BGR */
     uint32_t rows;                  /* mapped buffer rows (>= yres+yoffset) */
     uint32_t generation;            /* config generation of this view */
+    uint32_t content;               /* moves when the picture may have changed;
+                                       0: the board cannot tell (draw every
+                                       frame) -- the power saving's signal */
     uint64_t gbase;                 /* guest address of the buffer */
     const void *fb;                 /* raw framebuffer bytes, pitch * rows */
     const void *palette;            /* 256 * 4 bytes, 0x00BBGGRR; always set */

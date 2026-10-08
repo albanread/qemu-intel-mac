@@ -931,8 +931,19 @@ static void metal_fit_window_to_mode(uint32_t xres, uint32_t yres)
         want.height = floor(want.height * fit);
     }
 
-    [m.window setContentSize:want];
-    [m.window center];
+    /* Resize about the top-left corner, where the user put the window:
+     * a mode change must not move it.  Only keep it on the screen. */
+    {
+        NSRect before = [m.window frame];
+        NSPoint top_left = NSMakePoint(NSMinX(before), NSMaxY(before));
+        NSRect after;
+
+        [m.window setContentSize:want];
+        [m.window setFrameTopLeftPoint:top_left];
+        after = [m.window constrainFrameRect:[m.window frame]
+                                    toScreen:[m.window screen]];
+        [m.window setFrame:after display:YES];
+    }
     m.auto_size = [[m.window contentView] frame].size;
     metal_log("window fitted to %ux%u at scale %.1f -> %.0fx%.0f points",
               xres, yres, scale, m.auto_size.width, m.auto_size.height);
@@ -2638,7 +2649,12 @@ static bool metal_create_window(void)
     [m.window setDelegate:delegate];
     [m.window setAcceptsMouseMovedEvents:YES];
     [m.window setReleasedWhenClosed:NO];
-    [m.window center];
+    /* Where the user last left the window, else the middle of the screen
+     * the first time */
+    if (![m.window setFrameUsingName:@"BOXMetalWindow"]) {
+        [m.window center];
+    }
+    [m.window setFrameAutosaveName:@"BOXMetalWindow"];
 
     m.view = [[MetalView alloc] initWithFrame:frame];
     [m.view setWantsLayer:YES];

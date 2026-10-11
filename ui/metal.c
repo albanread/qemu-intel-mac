@@ -1752,6 +1752,9 @@ static void metal_display_init(DisplayState *ds, DisplayOptions *opts)
         metal_glue_video_opts(scaling, opts->u.metal.has_scanlines
                                       && opts->u.metal.scanlines);
     }
+    if (opts->u.metal.backdrop_dir) {
+        metal_glue_backdrop_dir(opts->u.metal.backdrop_dir);
+    }
     if (opts->u.metal.backdrop) {
         metal_glue_backdrop(opts->u.metal.backdrop);
     }

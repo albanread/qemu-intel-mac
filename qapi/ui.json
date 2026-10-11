@@ -1634,8 +1634,14 @@
 # @backdrop: a layer drawn by the host beneath the guest's desktop,
 #     showing through the pixels the guest tags as "below".  "off"
 #     (default) gates the feature out, with no Backdrop menu; "none",
-#     "acorn", "acorn-live", "tile:PATH" or "picture:PATH" (or a bare
-#     PATH) turn it on with that scene.
+#     "acorn", "acorn-live", "shader:PATH" (a Metal scene file),
+#     "tile:PATH", "picture:PATH" or "wallpaper:PATH" (an image or
+#     a RISC OS sprite file), or a bare PATH, turn it on with that
+#     scene.  A relative PATH is in @backdrop-dir.
+#
+# @backdrop-dir: the folder the Backdrop menu lists: sprite files and
+#     images, with scenes in its Shaders folder (default
+#     ~/Pictures/RISC OS Backdrops).  (Since 11.1)
 #
 # @zoom: the window's size when it is fitted to the guest's mode:
 #     this many of the screen's pixels to each of the guest's, 1 to
@@ -1649,6 +1655,7 @@
                 '*scaling' : 'DisplayMetalScaling',
                 '*scanlines' : 'bool',
                 '*backdrop' : 'str',
+                '*backdrop-dir' : 'str',
                 '*zoom' : 'int' },
   'if'      : 'CONFIG_METAL' }
 

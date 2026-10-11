@@ -162,10 +162,15 @@ void metal_glue_video_opts(int scaling, int scanlines);
 
 /* The layer beneath the guest's desktop, gated: "off" (the default) leaves
  * the feature and its Backdrop menu out; "none", "acorn", "acorn-live",
- * "tile:<file>" or "picture:<file>" turn it on with that scene (MACOS.md,
- * "The backdrop layer").  Once, after metal_backend_init; an unreadable
- * image falls back to acorn. */
+ * "shader:<file>", "tile:<file>", "picture:<file>" or "wallpaper:<file>"
+ * turn it on with that scene (MACOS.md, "The backdrop layer").  Once,
+ * after metal_backend_init; a file that cannot be read or compiled gives
+ * none. */
 void metal_glue_backdrop(const char *spec);
+/* The folder of wallpapers (sprite files, images) and, in its Shaders,
+ * scenes: the Backdrop menu lists it and a relative file is in it.
+ * Before metal_glue_backdrop. */
+void metal_glue_backdrop_dir(const char *dir);
 /* The window's fit to a mode: screen pixels to a guest pixel, 1 to 4 */
 void metal_glue_zoom(int zoom);
 

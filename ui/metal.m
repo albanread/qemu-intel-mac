@@ -29,13 +29,16 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreServices/CoreServices.h>
 
+#include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ui/metal.h"
@@ -103,18 +106,38 @@ static struct {
  * kernel's sprite plot and the Wimp's block copies keep all 32 bits. */
 enum MetalBackdrop { METAL_BACKDROP_OFF = 0, METAL_BACKDROP_ACORN,
                      METAL_BACKDROP_ACORN_LIVE, METAL_BACKDROP_PICTURE,
-                     METAL_BACKDROP_TILE };
+                     METAL_BACKDROP_TILE, METAL_BACKDROP_SHADER };
 #define METAL_BACKDROP_KEY   0x00B4C0B7u  /* 0x00BBGGRR: #B7C0B4 */
 #define METAL_ICONBAR_PX     66u          /* guest px, square-pixel modes */
+#define METAL_SCENE_MAX_FPS  15.0         /* animated backdrops, at most */
 static struct {
     bool enabled;                       /* the gate: backdrop= other than off */
     int mode;                           /* MetalBackdrop: the scene, OFF for none */
     id<MTLTexture> image;               /* PICTURE and TILE */
-    double image_scale;                 /* 2 for an @2x tile, else 1 */
+    double image_scale;                 /* image px per guest px: 2 for @2x or 180 dpi */
     NSString *spec;                     /* as given: the menu ticks it */
-    CFAbsoluteTime t0;                  /* acorn-live's clock */
+    CFAbsoluteTime t0;                  /* the scene's clock */
     NSMenuItem *menu_item;              /* Machine > Backdrop, hidden when gated off */
-} backdrop = { false, METAL_BACKDROP_OFF, nil, 1.0, nil, 0, nil };
+    NSString *dir;                      /* backdrop-dir=: the disc's Wallpapers */
+
+    /* SHADER: a scene from a .metal file, compiled at run time
+     * (backdrop_scene_load), drawn into a texture of its own at no more
+     * than its frame rate, and composited from there every frame */
+    id<MTLRenderPipelineState> scene_pipe;
+    id<MTLTexture> scene_tex[2];        /* [scene_cur] is the newest; two for feedback */
+    int scene_cur;
+    bool feedback;                      /* //! feedback: the last frame is an input */
+    double fps;                         /* //! fps: 0 draws once */
+    double resolution;                  /* //! resolution: of the window's pixels; 0 = guest */
+    uint32_t state_rows;                /* //! state: rows kept below the visible scene */
+    uint32_t scene_frame;               /* frames since the scene (or its size) began */
+    uint32_t scene_w, scene_h;          /* the visible scene, texels */
+    bool scene_valid;
+    CFAbsoluteTime scene_next;          /* when an animated scene is next due */
+    volatile bool scene_failed;         /* a GPU fault: drop to none */
+    int guest_shows;                    /* the newest frame has tagged pixels */
+    CFAbsoluteTime guest_checked;
+} backdrop = { .mode = METAL_BACKDROP_OFF, .image_scale = 1.0 };
 
 /* Machine > HostNet, the doorbell switch: shown when this machine has
  * the device, ticked when the doorbell is open.  Kept, not released,
@@ -217,6 +240,7 @@ typedef struct {
     uint32_t post[4];   /* view w, view h, scaling, scanlines */
     uint32_t bd[4];     /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */
     uint32_t bx[4];     /* backdrop: output px per tile px x1000, unused */
+    float bs[4];        /* backdrop shader scene: visible w, h in its texels */
 } MetalParams;
 
 /* The front end's log: a file next to the process, because a windowed
@@ -588,6 +612,7 @@ static NSString * const SHADER_SRC = @""
 "    uint4 post;    /* view w, view h, scaling, scanlines */\n"
 "    uint4 bd;      /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */\n"
 "    uint4 bx;      /* backdrop: output px per tile px x1000, unused */\n"
+"    float4 bs;     /* backdrop shader scene: visible w, h in its texels */\n"
 "};\n"
 "\n"
 "struct VSOut {\n"
@@ -777,7 +802,20 @@ static NSString * const SHADER_SRC = @""
 "    float3 bg;\n"
 "    if (BACKDROP_IMAGE) {\n"
 "        float2 isz = float2(bgimg.get_width(), bgimg.get_height());\n"
-"        if (BACKDROP == 4) {\n"
+"        if (BACKDROP == 5) {\n"
+"            /* a shader's scene, rendered at its own size (and no faster\n"
+"             * than its frame rate) into a texture: stretched over the\n"
+"             * view, bilinear by hand, since a feedback scene's float\n"
+"             * texture need not be filterable */\n"
+"            float2 sp = v.pos.xy / outPx * P.bs.xy - 0.5;\n"
+"            float2 i = floor(sp), f = sp - i;\n"
+"            int2 hi = int2(P.bs.xy) - 1;\n"
+"            uint2 a = uint2(clamp(int2(i), int2(0), hi));\n"
+"            uint2 b = uint2(clamp(int2(i) + 1, int2(0), hi));\n"
+"            float3 c00 = bgimg.read(a).rgb, c10 = bgimg.read(uint2(b.x, a.y)).rgb;\n"
+"            float3 c01 = bgimg.read(uint2(a.x, b.y)).rgb, c11 = bgimg.read(b).rgb;\n"
+"            bg = saturate(mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y));\n"
+"        } else if (BACKDROP == 4) {\n"
 "            /* tile: from the top left, each image pixel covering a\n"
 "             * point (a device pixel for an @2x tile) -- repeated by the\n"
 "             * sampler, so the seams filter like the rest */\n"
@@ -1080,34 +1118,416 @@ static bool fb_build_scale(void)
 
 /* The backdrop's share of the shader constants, for a frame or a
  * screenshot: the key, a clock on the scene's half-hour loop, the icon
- * bar the acorn is centred above, and whether the layer is on at all. */
-static void backdrop_params(MetalParams *p, double px_per_point)
+ * bar the acorn is centred above, whether the layer is on at all, the
+ * tile's size (output pixels per guest pixel over the image's own
+ * density), and a shader scene's visible size. */
+static void backdrop_params(MetalParams *p, double px_per_guest_px)
 {
     p->bd[0] = METAL_BACKDROP_KEY;
     p->bd[1] = (uint32_t)(fmod(CFAbsoluteTimeGetCurrent() - backdrop.t0,
                                1800.0) * 1000.0);
     p->bd[2] = METAL_ICONBAR_PX;
     p->bd[3] = backdrop.mode != METAL_BACKDROP_OFF;
-    p->bx[0] = (uint32_t)(px_per_point / backdrop.image_scale * 1000.0 + 0.5);
+    p->bx[0] = (uint32_t)(px_per_guest_px / backdrop.image_scale * 1000.0 + 0.5);
     p->bx[1] = p->bx[2] = p->bx[3] = 0;
+    p->bs[0] = (float)MAX(backdrop.scene_w, 1u);
+    p->bs[1] = (float)MAX(backdrop.scene_h, 1u);
+    p->bs[2] = p->bs[3] = 0.0f;
 }
 
-/* An image for backdrop=<file>: anything ImageIO reads, drawn over the
- * key colour (so a transparent PNG sits on sage) into an sRGB RGBA8
- * texture -- the same gamma-encoded space as the guest's pixels. */
-static id<MTLTexture> backdrop_load_image(const char *path)
+/* Whether the window is dense enough for a double-density image: two or
+ * more of the screen's pixels to a RISC OS pixel (a Retina window, as
+ * the app opens it). */
+static bool backdrop_dense(void)
+{
+    if (fb.up && fb.yres && m.layer.drawableSize.height > 0) {
+        return m.layer.drawableSize.height / (double)fb.yres >= 1.75;
+    }
+    return fit_zoom >= 2 || (m.layer && m.layer.contentsScale >= 2.0);
+}
+
+/* An RGBA8 image, gamma encoded as the guest's pixels are, as a texture */
+static id<MTLTexture> backdrop_texture(const uint8_t *rgba, size_t w, size_t h)
+{
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:w height:h mipmapped:NO];
+    id<MTLTexture> tex;
+
+    td.usage = MTLTextureUsageShaderRead;
+    tex = [m.device newTextureWithDescriptor:td];
+    [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+             withBytes:rgba bytesPerRow:w * 4];
+    return tex;
+}
+
+/* ---- RISC OS sprite files --------------------------------------------
+ *
+ * The disc's wallpapers (Resources/Wallpapers) are sprite files, ,ff9 on
+ * the Mac side, which ImageIO cannot read; so they are read here.  A
+ * sprite file is a sprite area without its first word: the count, the
+ * offset (+4) of the first sprite, the offset of the free space.  Each
+ * sprite is a 44-byte header -- next, name[12], width in words - 1,
+ * height - 1, first and last bit used, image and mask offsets, the mode
+ * -- then the palette, if any (pairs of &BBGGRR00 words), the image and
+ * the mask.  Read here:
+ *
+ *   - old sprites, whose mode is a screen mode number (its depth and its
+ *     pixel shape, 90 x 45 dpi for mode 12 or 15), with a mask as deep
+ *     as the image and a left-hand wastage;
+ *   - new sprites (RISC OS 3.5), whose mode word gives the type -- 1, 2,
+ *     4 or 8 bpp, 16 bpp 1:5:5:5 or 32 bpp -- and the dpi in x and y,
+ *     with a 1 bpp mask, or an 8 bpp alpha mask (RISC OS 5: bit 31);
+ *   - RISC OS 5's extended mode words (type 15): the type in bits 20-26
+ *     (adding 16 bpp 5:6:5 and 4:4:4:4), the pixel shape as eigen
+ *     factors, and the RGB-order and alpha flags;
+ *   - a sprite's own palette, else the desktop's default for its depth
+ *     (the Wimp's 16 colours, the 256-colour mode's).
+ *
+ * Masked pixels are laid on the key colour, as a transparent PNG is.
+ * The result has square pixels: a 90 x 45 dpi sprite has its rows
+ * doubled.  Its density is its dpi: 90 is a RISC OS pixel, 180 (as a
+ * theme's Sprites11 has) two to one. */
+
+static uint32_t spr_word(const uint8_t *b, size_t len, size_t off, bool *ok)
+{
+    if (off > len || len - off < 4) {
+        *ok = false;
+        return 0;
+    }
+    return (uint32_t)b[off] | (uint32_t)b[off + 1] << 8
+         | (uint32_t)b[off + 2] << 16 | (uint32_t)b[off + 3] << 24;
+}
+
+typedef struct {
+    int bpp;            /* 1, 2, 4, 8, 16 or 32 */
+    int type;           /* the sprite type: 1..6, 10 (5:6:5), 16 (4:4:4:4) */
+    int xdpi, ydpi;
+    bool old;           /* a mode number: mask as deep as the image */
+    bool alpha_mask;    /* an 8 bpp alpha mask */
+    bool rgb;           /* red in the low bits (RISC OS 5's RGB order) */
+    bool alpha;         /* the pixel's top bits are alpha, not transfer */
+} SprMode;
+
+static bool spr_mode(uint32_t mode, SprMode *sm)
+{
+    /* the numbered modes a sprite may name: depth, and eigen factors */
+    static const struct { uint8_t mode, bpp, xeig, yeig; } modes[] = {
+        { 0, 1, 1, 2 }, { 1, 2, 2, 2 }, { 2, 4, 3, 2 }, { 4, 1, 2, 2 },
+        { 5, 2, 3, 2 }, { 8, 2, 1, 2 }, { 9, 4, 2, 2 }, { 10, 8, 3, 2 },
+        { 12, 4, 1, 2 }, { 13, 8, 2, 2 }, { 15, 8, 1, 2 }, { 16, 4, 1, 2 },
+        { 17, 4, 1, 2 }, { 18, 1, 1, 1 }, { 19, 2, 1, 1 }, { 20, 4, 1, 1 },
+        { 21, 8, 1, 1 }, { 24, 8, 1, 2 }, { 25, 1, 1, 1 }, { 26, 2, 1, 1 },
+        { 27, 4, 1, 1 }, { 28, 8, 1, 1 }, { 31, 4, 1, 1 }, { 32, 8, 1, 1 },
+        { 33, 1, 1, 2 }, { 34, 2, 1, 2 }, { 35, 4, 1, 2 }, { 36, 8, 1, 2 },
+    };
+    int t;
+
+    memset(sm, 0, sizeof(*sm));
+    if (mode < 256) {
+        size_t i;
+
+        for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+            if (modes[i].mode == mode) {
+                sm->bpp = modes[i].bpp;
+                sm->type = sm->bpp == 1 ? 1 : sm->bpp == 2 ? 2 : sm->bpp == 4 ? 3 : 4;
+                sm->xdpi = 180 >> modes[i].xeig;
+                sm->ydpi = 180 >> modes[i].yeig;
+                sm->old = true;
+                return true;
+            }
+        }
+        return false;
+    }
+    sm->alpha_mask = (mode >> 31) & 1;
+    t = (mode >> 27) & 15;
+    if (t == 15) {                      /* RISC OS 5's extended mode word */
+        t = (mode >> 20) & 127;
+        sm->xdpi = 180 >> ((mode >> 4) & 3);
+        sm->ydpi = 180 >> ((mode >> 6) & 3);
+        sm->rgb = (mode >> 14) & 1;
+        sm->alpha = (mode >> 15) & 1;
+    } else {
+        sm->xdpi = (mode >> 1) & 0x1FFF;
+        sm->ydpi = (mode >> 14) & 0x1FFF;
+    }
+    sm->type = t;
+    switch (t) {
+    case 1: sm->bpp = 1; break;
+    case 2: sm->bpp = 2; break;
+    case 3: sm->bpp = 4; break;
+    case 4: sm->bpp = 8; break;
+    case 5: case 10: case 16: sm->bpp = 16; break;
+    case 6: sm->bpp = 32; break;
+    default: return false;              /* CMYK, 24 bpp packed, JPEG: not wallpapers */
+    }
+    if (sm->xdpi <= 0 || sm->ydpi <= 0) {
+        sm->xdpi = sm->ydpi = 90;
+    }
+    return true;
+}
+
+static uint32_t spr_default_colour(int bpp, uint32_t i)   /* 0x00RRGGBB */
+{
+    static const uint32_t wimp16[16] = {
+        0xFFFFFF, 0xDDDDDD, 0xBBBBBB, 0x999999, 0x777777, 0x555555, 0x333333,
+        0x000000, 0x004499, 0xEEEE00, 0x00CC00, 0xDD0000, 0xEEEEBB, 0x558800,
+        0xFFBB00, 0x00BBFF };
+    static const uint32_t grey4[4] = { 0xFFFFFF, 0xBBBBBB, 0x777777, 0x000000 };
+    uint32_t t, r, g, b;
+
+    switch (bpp) {
+    case 1: return i ? 0x000000 : 0xFFFFFF;
+    case 2: return grey4[i & 3];
+    case 4: return wimp16[i & 15];
+    default:
+        /* the 256-colour mode's: bits 0-1 a tint, 2 R2, 3 B2, 4 R3,
+         * 5 G2, 6 G3, 7 B3 */
+        t = i & 3;
+        r = (((i >> 2) & 1) | ((i >> 4) & 1) << 1) << 2 | t;
+        g = (((i >> 5) & 1) | ((i >> 6) & 1) << 1) << 2 | t;
+        b = (((i >> 3) & 1) | ((i >> 7) & 1) << 1) << 2 | t;
+        return (r * 17) << 16 | (g * 17) << 8 | (b * 17);
+    }
+}
+
+/* One sprite at offset at in the file, as RGBA8 with square pixels laid
+ * on the key colour; NULL if it cannot be read.  *dpi is its density. */
+static uint8_t *spr_decode(const uint8_t *f, size_t len, size_t at,
+                           size_t *ow, size_t *oh, int *dpi)
+{
+    bool ok = true;
+    uint32_t wwords = spr_word(f, len, at + 16, &ok);
+    uint32_t hm1 = spr_word(f, len, at + 20, &ok);
+    uint32_t fbit = spr_word(f, len, at + 24, &ok) & 31;
+    uint32_t lbit = spr_word(f, len, at + 28, &ok) & 31;
+    uint32_t img = spr_word(f, len, at + 32, &ok);
+    uint32_t msk = spr_word(f, len, at + 36, &ok);
+    uint32_t modew = spr_word(f, len, at + 40, &ok);
+    uint32_t pal[256];
+    SprMode sm;
+    size_t w, h, stride, mstride, x, y, rx = 1, ry = 1, outw, outh;
+    uint8_t *px, *out;
+    bool has_mask, has_pal = false;
+
+    if (!ok || !spr_mode(modew, &sm) || wwords >= 8192 || hm1 >= 8192) {
+        return NULL;
+    }
+    if (!sm.old) {
+        fbit = 0;
+    }
+    stride = ((size_t)wwords + 1) * 4;
+    w = (((size_t)wwords + 1) * 32 - fbit - (31 - lbit)) / (size_t)sm.bpp;
+    h = (size_t)hm1 + 1;
+    if (!w || at + img + stride * h > len) {
+        return NULL;
+    }
+    has_mask = msk != img;
+    if (sm.bpp <= 8) {
+        uint32_t entries = (MIN(img, has_mask ? msk : img) - MIN(img, 44u)) / 8;
+        uint32_t need = 1u << sm.bpp, i;
+
+        if (entries >= need) {
+            for (i = 0; i < need; i++) {
+                uint32_t c = spr_word(f, len, at + 44 + 8 * i, &ok);   /* &BBGGRR00 */
+
+                pal[i] = ((c >> 8) & 0xFF) << 16 | ((c >> 16) & 0xFF) << 8 | (c >> 24);
+            }
+            has_pal = ok;
+        }
+        if (!has_pal) {
+            for (i = 0; i < need; i++) {
+                pal[i] = spr_default_colour(sm.bpp, i);
+            }
+        }
+    }
+    mstride = sm.alpha_mask ? (w + 3) / 4 * 4 : sm.old ? stride : (w + 31) / 32 * 4;
+    if (has_mask && at + msk + mstride * h > len) {
+        has_mask = false;               /* a mask past the end: ignore it */
+    }
+
+    /* square the pixels: a 90 x 45 dpi sprite has each row twice */
+    if (sm.ydpi < sm.xdpi && sm.xdpi % sm.ydpi == 0) {
+        ry = (size_t)(sm.xdpi / sm.ydpi);
+    } else if (sm.xdpi < sm.ydpi && sm.ydpi % sm.xdpi == 0) {
+        rx = (size_t)(sm.ydpi / sm.xdpi);
+    }
+    if (rx > 4 || ry > 4) {
+        rx = ry = 1;
+    }
+    *dpi = MAX(sm.xdpi, sm.ydpi);
+    outw = w * rx;
+    outh = h * ry;
+    px = malloc(w * h * 4);
+    out = malloc(outw * outh * 4);
+    if (!px || !out) {
+        free(px);
+        free(out);
+        return NULL;
+    }
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = f + at + img + y * stride;
+        const uint8_t *mrow = f + at + msk + y * mstride;
+
+        for (x = 0; x < w; x++) {
+            size_t bit = fbit + x * (size_t)sm.bpp;
+            uint32_t word = (uint32_t)row[(bit >> 5) * 4] | (uint32_t)row[(bit >> 5) * 4 + 1] << 8
+                          | (uint32_t)row[(bit >> 5) * 4 + 2] << 16
+                          | (uint32_t)row[(bit >> 5) * 4 + 3] << 24;
+            uint32_t r, g, b, a = 255, v;
+            uint8_t *o = px + (y * w + x) * 4;
+
+            if (sm.bpp == 32) {
+                r = word & 0xFF;
+                g = (word >> 8) & 0xFF;
+                b = (word >> 16) & 0xFF;
+                if (sm.alpha) {
+                    a = word >> 24;
+                }
+            } else if (sm.bpp == 16) {
+                v = (word >> (bit & 31)) & 0xFFFF;
+                if (sm.type == 10) {            /* 5:6:5 */
+                    r = (v & 31) * 255 / 31;
+                    g = ((v >> 5) & 63) * 255 / 63;
+                    b = ((v >> 11) & 31) * 255 / 31;
+                } else if (sm.type == 16) {     /* 4:4:4:4 */
+                    r = (v & 15) * 17;
+                    g = ((v >> 4) & 15) * 17;
+                    b = ((v >> 8) & 15) * 17;
+                    if (sm.alpha) {
+                        a = ((v >> 12) & 15) * 17;
+                    }
+                } else {                        /* 1:5:5:5 */
+                    r = (v & 31) * 255 / 31;
+                    g = ((v >> 5) & 31) * 255 / 31;
+                    b = ((v >> 10) & 31) * 255 / 31;
+                    if (sm.alpha) {
+                        a = (v >> 15) ? 255 : 0;
+                    }
+                }
+            } else {
+                uint32_t c;
+
+                v = (word >> (bit & 31)) & ((1u << sm.bpp) - 1);
+                c = pal[v];
+                r = c >> 16;
+                g = (c >> 8) & 0xFF;
+                b = c & 0xFF;
+            }
+            if (sm.rgb && sm.bpp >= 16) {
+                uint32_t t = r;
+                r = b;
+                b = t;
+            }
+            if (has_mask) {
+                if (sm.alpha_mask) {
+                    a = mrow[x];
+                } else if (sm.old) {
+                    uint32_t mw = (uint32_t)mrow[(bit >> 5) * 4] | (uint32_t)mrow[(bit >> 5) * 4 + 1] << 8
+                                | (uint32_t)mrow[(bit >> 5) * 4 + 2] << 16
+                                | (uint32_t)mrow[(bit >> 5) * 4 + 3] << 24;
+                    uint32_t mm = sm.bpp == 32 ? 0xFFFFFFFFu : (1u << sm.bpp) - 1;
+
+                    a = (mw >> (bit & 31)) & mm ? 255 : 0;
+                } else {
+                    a = (mrow[x >> 3] >> (x & 7)) & 1 ? 255 : 0;
+                }
+            }
+            /* on the key colour, #B7C0B4 */
+            o[0] = (uint8_t)((r * a + 0xB7 * (255 - a)) / 255);
+            o[1] = (uint8_t)((g * a + 0xC0 * (255 - a)) / 255);
+            o[2] = (uint8_t)((b * a + 0xB4 * (255 - a)) / 255);
+            o[3] = 255;
+        }
+    }
+    for (y = 0; y < outh; y++) {
+        for (x = 0; x < outw; x++) {
+            memcpy(out + (y * outw + x) * 4, px + ((y / ry) * w + x / rx) * 4, 4);
+        }
+    }
+    free(px);
+    *ow = outw;
+    *oh = outh;
+    return out;
+}
+
+/* A sprite file's picture: its first sprite -- or, where the file holds
+ * the same sprite at several densities (NAME, NAME22, NAME11, as a
+ * theme's Tools file does), the one that suits the window: the densest
+ * up to 180 dpi on a Retina window, else the one nearest 90 dpi. */
+static uint8_t *spr_load(const char *path, size_t *w, size_t *h, int *dpi)
+{
+    NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+    const uint8_t *f = d.bytes;
+    size_t len = d.length, at, best_at = 0;
+    bool ok = true, dense = backdrop_dense();
+    uint32_t count, first, i;
+    char base[13] = "";
+    int best = -1;
+
+    if (!d || len < 12 + 44) {
+        return NULL;
+    }
+    count = spr_word(f, len, 0, &ok);
+    first = spr_word(f, len, 4, &ok);
+    if (!ok || !count || first < 16 || count > 100000) {
+        return NULL;
+    }
+    at = first - 4;
+    for (i = 0; i < count && at + 44 <= len; i++) {
+        uint32_t next = spr_word(f, len, at, &ok);
+        uint32_t modew = spr_word(f, len, at + 40, &ok);
+        char name[13];
+        SprMode sm;
+        size_t n;
+
+        memcpy(name, f + at + 4, 12);
+        name[12] = 0;
+        for (n = 0; name[n]; n++) {
+            name[n] = (char)tolower((unsigned char)name[n]);
+        }
+        if (i == 0) {
+            strcpy(base, name);
+            n = strlen(base);
+            if (n > 2 && (!strcmp(base + n - 2, "11") || !strcmp(base + n - 2, "22"))) {
+                base[n - 2] = 0;
+            }
+        }
+        if (spr_mode(modew, &sm)) {
+            size_t bl = strlen(base);
+            bool same = !strncmp(name, base, bl)
+                        && (!name[bl] || !strcmp(name + bl, "11") || !strcmp(name + bl, "22"));
+            int dp = MAX(sm.xdpi, sm.ydpi);
+            int score = dense ? (dp <= 180 ? dp : 0) : (dp <= 90 ? dp + 1000 : 1000 - dp);
+
+            if (same && score > best) {
+                best = score;
+                best_at = at;
+            }
+        }
+        if (!ok || next < 44) {
+            break;
+        }
+        at += next;
+    }
+    return best >= 0 ? spr_decode(f, len, best_at, w, h, dpi) : NULL;
+}
+
+/* An image file by ImageIO, as RGBA8 on the key colour; NULL if it
+ * cannot read it */
+static uint8_t *img_load(const char *path, size_t *ow, size_t *oh)
 {
     NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
     CGImageSourceRef src = CGImageSourceCreateWithURL((CFURLRef)url, NULL);
     CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
-    id<MTLTexture> tex = nil;
+    uint8_t *buf = NULL;
     size_t w, h;
 
     if (src) {
         CFRelease(src);
     }
     if (!img) {
-        return nil;
+        return NULL;
     }
     w = CGImageGetWidth(img);
     h = CGImageGetHeight(img);
@@ -1117,131 +1537,506 @@ static id<MTLTexture> backdrop_load_image(const char *path)
         h = MAX((size_t)(h * k), 1);
     }
     if (w && h) {
-        uint8_t *buf = calloc(w * h, 4);
         CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        CGContextRef ctx = buf ? CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
-                                     kCGImageAlphaPremultipliedLast
-                                     | kCGBitmapByteOrder32Big) : NULL;
+        CGContextRef ctx;
 
+        buf = calloc(w * h, 4);
+        ctx = buf ? CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+                                          kCGImageAlphaPremultipliedLast
+                                          | kCGBitmapByteOrder32Big) : NULL;
         if (ctx) {
-            MTLTextureDescriptor *td;
-
             CGContextSetRGBFillColor(ctx, 0xB7 / 255.0, 0xC0 / 255.0,
                                      0xB4 / 255.0, 1.0);
             CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
             CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
             CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
-            td = [MTLTextureDescriptor
-                  texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                               width:w
-                                              height:h
-                                           mipmapped:NO];
-            td.usage = MTLTextureUsageShaderRead;
-            tex = [m.device newTextureWithDescriptor:td];
-            [tex replaceRegion:MTLRegionMake2D(0, 0, w, h)
-                   mipmapLevel:0
-                     withBytes:buf
-                   bytesPerRow:w * 4];
             CGContextRelease(ctx);
+        } else {
+            free(buf);
+            buf = NULL;
         }
         CGColorSpaceRelease(cs);
-        free(buf);
     }
     CGImageRelease(img);
+    *ow = w;
+    *oh = h;
+    return buf;
+}
+
+/* Whether a leaf names a sprite file: ,ff9 (HostFS's name for a file of
+ * type Sprite), or .ff9 or .spr */
+static bool is_sprite_leaf(NSString *leaf)
+{
+    NSString *l = [leaf lowercaseString];
+
+    return [l hasSuffix:@",ff9"] || [l hasSuffix:@".ff9"] || [l hasSuffix:@".spr"];
+}
+
+/* A leaf without HostFS's ,xxx file type */
+static NSString *leaf_untyped(NSString *leaf)
+{
+    NSUInteger n = leaf.length;
+
+    if (n > 4 && [leaf characterAtIndex:n - 4] == ',') {
+        return [leaf substringToIndex:n - 4];
+    }
+    return leaf;
+}
+
+static bool is_shader_leaf(NSString *leaf)
+{
+    return [[[leaf_untyped(leaf) pathExtension] lowercaseString] isEqualToString:@"metal"];
+}
+
+static bool is_image_leaf(NSString *leaf)
+{
+    static NSSet *ext;
+
+    if (!ext) {
+        ext = [[NSSet alloc] initWithObjects:@"png", @"jpg", @"jpeg", @"heic", @"heif",
+                                             @"tif", @"tiff", @"gif", @"bmp", @"webp", nil];
+    }
+    return [ext containsObject:[[leaf_untyped(leaf) pathExtension] lowercaseString]];
+}
+
+/* The name a menu shows: the leaf with no file type and no extension */
+static NSString *leaf_title(NSString *leaf)
+{
+    NSString *t = leaf_untyped(leaf);
+
+    if (is_sprite_leaf(leaf) && ![t isEqualToString:leaf]) {
+        return t;                       /* Baize,ff9: Baize */
+    }
+    return [t stringByDeletingPathExtension];
+}
+
+/* The double-density sibling of an image or sprite file, if there is
+ * one: NAME@2x for either (Apple's name), NAME11 for a sprite file
+ * (RISC OS's, as in Sprites11) -- same folder, same type */
+static NSString *backdrop_dense_sibling(NSString *path)
+{
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    NSString *leaf = [path lastPathComponent];
+    NSString *untyped = leaf_untyped(leaf);
+    NSString *type = [leaf substringFromIndex:untyped.length];      /* ,ff9 or "" */
+    NSString *ext = [untyped pathExtension];
+    NSString *stem = [untyped stringByDeletingPathExtension];
+    NSString *dot = ext.length ? [@"." stringByAppendingString:ext] : @"";
+    NSMutableArray *names = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    [names addObject:[NSString stringWithFormat:@"%@@2x%@%@", stem, dot, type]];
+    if (is_sprite_leaf(leaf)) {
+        [names addObject:[NSString stringWithFormat:@"%@11%@%@", stem, dot, type]];
+    }
+    for (NSString *n in names) {
+        NSString *p = [dir stringByAppendingPathComponent:n];
+
+        if (![n isEqualToString:leaf] && [fm fileExistsAtPath:p]) {
+            return p;
+        }
+    }
+    return nil;
+}
+
+/* An image for a tile or a picture: a sprite file read here, anything
+ * else by ImageIO, drawn over the key colour (so a transparent PNG sits
+ * on sage) into an RGBA8 texture -- the same gamma-encoded space as the
+ * guest's pixels.  On a Retina window a double-density sibling is taken
+ * if there is one.  *scale is the image's pixels per RISC OS pixel:
+ * 2 for NAME@2x, dpi / 90 for a sprite; *w and *h its size. */
+static id<MTLTexture> backdrop_load_image(NSString *path, double *scale,
+                                          size_t *w, size_t *h)
+{
+    NSString *dense = backdrop_dense() ? backdrop_dense_sibling(path) : nil;
+    NSString *use = dense ? dense : path;
+    const char *p = [use fileSystemRepresentation];
+    uint8_t *rgba = NULL;
+    int dpi = 90;
+    id<MTLTexture> tex = nil;
+
+    *scale = 1.0;
+    if (is_sprite_leaf([use lastPathComponent])) {
+        rgba = spr_load(p, w, h, &dpi);
+        *scale = dpi / 90.0;
+    } else {
+        rgba = img_load(p, w, h);
+        if (!rgba) {
+            rgba = spr_load(p, w, h, &dpi);   /* a sprite file under another name */
+            *scale = dpi / 90.0;
+        } else if ([[[use lastPathComponent] stringByDeletingPathExtension] hasSuffix:@"@2x"]) {
+            *scale = 2.0;
+        }
+    }
+    if (*scale < 0.25 || *scale > 8.0) {
+        *scale = 1.0;
+    }
+    if (rgba) {
+        tex = backdrop_texture(rgba, *w, *h);
+        free(rgba);
+        if (dense) {
+            metal_log("backdrop: the double-density %s", [use fileSystemRepresentation]);
+        }
+    } else if (dense) {
+        return backdrop_load_image(path, scale, w, h);  /* the sibling did not read */
+    }
     return tex;
 }
 
-/* Whether a tile is double density: the leaf name carries @2x before
- * its extension, Apple-style (name@2x.png).  Only the leaf, not the
- * whole path: a plain tile in a folder called @2x is an ordinary tile
- * (ROS_PRIVATE#44). */
-static bool tile_is_2x(const char *path)
-{
-    const char *leaf = strrchr(path, '/');
-    const char *dot, *p;
-    size_t stem;
+/* ---- Shader scenes -------------------------------------------------
+ *
+ * A scene is a Metal shading language file in the backdrops folder's
+ * Shaders (the disc's Resources/Wallpapers/Shaders), compiled when it
+ * is chosen.  The file defines one function, which gives the colour of
+ * one pixel of the scene:
+ *
+ *     float3 scene(SceneIn in)
+ *
+ * SceneIn, and a few helpers (hash, noise, fbm, dither), are defined
+ * before the file; see SCENE_PRELUDE below and the ReadMe in Shaders.
+ * Lines beginning //! set how it is drawn:
+ *
+ *     //! fps 12            frames a second, at most 15; 0 draws it once
+ *     //! resolution 0.5    the scene's pixels as a fraction of the
+ *                           window's; "guest" is one per RISC OS pixel
+ *     //! feedback          the scene sees its last frame: then it is
+ *                           float4 scene(SceneIn in, texture2d<float> previous),
+ *                           kept as 32-bit floats; .rgb is shown, .a is
+ *                           the shader's own
+ *     //! state 1           with feedback, rows kept below the visible
+ *                           scene for the shader's own state
+ *
+ * A file that does not compile leaves the backdrop at none, with the
+ * compiler's message in the log; a scene that faults on the GPU does
+ * the same.  The display goes on either way. */
+static NSString * const SCENE_PRELUDE = @""
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"\n"
+"struct SceneIn {\n"
+"    float2 pos;      /* this pixel's centre, in scene pixels; (0,0) is the top left */\n"
+"    float2 size;     /* the visible scene, in scene pixels */\n"
+"    float  scale;    /* scene pixels to a RISC OS pixel */\n"
+"    float  time;     /* seconds since the scene was chosen (wraps after a day) */\n"
+"    float  daytime;  /* the Mac's local time of day, in hours, 0 to 24 */\n"
+"    uint   frame;    /* frames since the scene began, or its size changed: 0 is the first */\n"
+"    float3 key;      /* the backdrop key colour, #B7C0B4, the desktop's sage */\n"
+"    float  iconbar;  /* the icon bar's height, in scene pixels */\n"
+"    float2 guest;    /* the RISC OS screen, in its own pixels */\n"
+"    uint   rows;     /* the state rows below the visible scene (//! state) */\n"
+"};\n"
+"\n"
+"struct SceneU { float4 a, b, c; uint4 d; };\n"
+"struct SceneV { float4 pos [[position]]; };\n"
+"\n"
+"vertex SceneV scene_vs(uint id [[vertex_id]])\n"
+"{\n"
+"    SceneV o;\n"
+"    float2 t = float2((id << 1) & 2, id & 2);\n"
+"    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    return o;\n"
+"}\n"
+"\n"
+"/* a hash of a point: 0 to 1, the same for the same point */\n"
+"static float hash12(float2 p)\n"
+"{\n"
+"    uint2 q = uint2(int2(floor(p))) * uint2(1597334673u, 3812015801u);\n"
+"    uint n = (q.x ^ q.y) * 1597334673u;\n"
+"    return float(n >> 8) * (1.0 / 16777216.0);\n"
+"}\n"
+"static float2 hash22(float2 p)\n"
+"{\n"
+"    return float2(hash12(p), hash12(p + float2(37.0, 17.0)));\n"
+"}\n"
+"/* value noise, 0 to 1, smooth, a feature a unit across */\n"
+"static float noise(float2 p)\n"
+"{\n"
+"    float2 i = floor(p), f = fract(p);\n"
+"    float2 u = f * f * (3.0 - 2.0 * f);\n"
+"    return mix(mix(hash12(i), hash12(i + float2(1, 0)), u.x),\n"
+"               mix(hash12(i + float2(0, 1)), hash12(i + float2(1, 1)), u.x), u.y);\n"
+"}\n"
+"/* fractal noise: octaves of noise, each twice as fine and half as strong */\n"
+"static float fbm(float2 p, int octaves)\n"
+"{\n"
+"    float v = 0.0, a = 0.5;\n"
+"    for (int i = 0; i < octaves; i++) {\n"
+"        v += a * noise(p);\n"
+"        p = float2x2(1.6, 1.2, -1.2, 1.6) * p;\n"
+"        a *= 0.5;\n"
+"    }\n"
+"    return v;\n"
+"}\n"
+"/* less than one level of 8-bit noise, to add to a gentle gradient so it\n"
+" * does not band */\n"
+"static float3 dither(float2 pos)\n"
+"{\n"
+"    float n = fract(52.9829189 * fract(dot(pos, float2(0.06711056, 0.00583715))));\n"
+"    return float3((n - 0.5) / 255.0);\n"
+"}\n"
+"/* the previous frame's texel at a scene position (feedback scenes) */\n"
+"static float4 fetch(texture2d<float> t, float2 pos)\n"
+"{\n"
+"    int2 hi = int2(t.get_width(), t.get_height()) - 1;\n"
+"    return t.read(uint2(clamp(int2(floor(pos)), int2(0), hi)));\n"
+"}\n"
+"\n";
 
-    leaf = leaf ? leaf + 1 : path;
-    dot = strrchr(leaf, '.');
-    stem = (dot && dot != leaf) ? (size_t)(dot - leaf) : strlen(leaf);
-    for (p = leaf; p + 3 <= leaf + stem; p++) {
-        if (p[0] == '@' && p[1] == '2' && p[2] == 'x') {
-            return true;
-        }
+static NSString * const SCENE_POSTLUDE = @"\n"
+"#if BACKDROP_FEEDBACK\n"
+"fragment float4 scene_fs(SceneV v [[stage_in]], constant SceneU &U [[buffer(0)]],\n"
+"                         texture2d<float> previous [[texture(0)]])\n"
+"#else\n"
+"fragment float4 scene_fs(SceneV v [[stage_in]], constant SceneU &U [[buffer(0)]])\n"
+"#endif\n"
+"{\n"
+"    SceneIn in;\n"
+"    in.pos = v.pos.xy;\n"
+"    in.size = U.a.xy;\n"
+"    in.scale = U.a.z;\n"
+"    in.time = U.a.w;\n"
+"    in.daytime = U.b.x;\n"
+"    in.iconbar = U.b.y;\n"
+"    in.guest = U.b.zw;\n"
+"    in.key = U.c.xyz;\n"
+"    in.frame = U.d.x;\n"
+"    in.rows = U.d.y;\n"
+"#if BACKDROP_FEEDBACK\n"
+"    return scene(in, previous);\n"
+"#else\n"
+"    return float4(saturate(scene(in)), 1.0);\n"
+"#endif\n"
+"}\n";
+
+typedef struct {
+    float a[4];         /* size w, h; scale; time */
+    float b[4];         /* daytime; icon bar; guest w, h */
+    float c[4];         /* key r, g, b; unused */
+    uint32_t d[4];      /* frame; state rows; unused */
+} SceneParams;
+
+static void backdrop_scene_release(void)
+{
+    [backdrop.scene_pipe release];
+    backdrop.scene_pipe = nil;
+    for (int i = 0; i < 2; i++) {
+        [backdrop.scene_tex[i] release];
+        backdrop.scene_tex[i] = nil;
     }
-    return false;
+    backdrop.scene_cur = 0;
+    backdrop.scene_valid = false;
+    backdrop.scene_w = backdrop.scene_h = 0;
+    backdrop.scene_failed = false;
 }
 
-/* The scene: none, acorn, acorn-live, tile:<image file> or picture:<image
- * file> (a bare path is a picture).  An @2x tile covers a device pixel per
- * image pixel on a Retina screen, any other a point.  Only ever reached
- * with the feature gated on; UI thread only. */
-static void backdrop_set_scene(const char *spec)
+/* Compile a scene file; false (and the reason in the log) if it will not */
+static bool backdrop_scene_load(NSString *path)
 {
-    int mode = METAL_BACKDROP_OFF;
-    const char *path = NULL;
+    NSError *err = nil;
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding
+                                                  error:&err];
+    NSString *leaf = [path lastPathComponent], *src;
+    MTLCompileOptions *opts;
+    id<MTLLibrary> lib;
+    id<MTLFunction> vs, fs;
+    MTLRenderPipelineDescriptor *pd;
+    double fps = 12.0, resolution = 1.0;
+    bool feedback = false;
+    uint32_t rows = 0;
 
-    [backdrop.image release];
-    backdrop.image = nil;
-    backdrop.image_scale = 1.0;
-    if (!spec || !*spec || !strcmp(spec, "none") || !strcmp(spec, "off")) {
-        mode = METAL_BACKDROP_OFF;
-        spec = "none";
-    } else if (!strcmp(spec, "acorn")) {
-        mode = METAL_BACKDROP_ACORN;
-    } else if (!strcmp(spec, "acorn-live")) {
-        mode = METAL_BACKDROP_ACORN_LIVE;
-    } else if (!strncmp(spec, "tile:", 5)) {
-        mode = METAL_BACKDROP_TILE;
-        path = spec + 5;
-    } else if (!strncmp(spec, "picture:", 8)) {
-        mode = METAL_BACKDROP_PICTURE;
-        path = spec + 8;
-    } else {
-        mode = METAL_BACKDROP_PICTURE;
-        path = spec;
+    if (!text) {
+        text = [NSString stringWithContentsOfFile:path encoding:NSISOLatin1StringEncoding
+                                            error:&err];
     }
-    if (path) {
-        backdrop.image = backdrop_load_image(path);
-        if (backdrop.image) {
-            if (mode == METAL_BACKDROP_TILE && tile_is_2x(path)) {
-                backdrop.image_scale = 2.0;
+    if (!text || text.length > 512 * 1024) {
+        metal_log("backdrop: cannot read the shader %s", [path fileSystemRepresentation]);
+        return false;
+    }
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]];
+        NSArray *w;
+        NSString *key, *val;
+
+        if (![t hasPrefix:@"//!"]) {
+            continue;
+        }
+        w = [[[t substringFromIndex:3] stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceCharacterSet]]
+             componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        key = w.count ? [w[0] lowercaseString] : @"";
+        val = w.count > 1 ? w[1] : @"";
+        if ([key isEqualToString:@"fps"]) {
+            fps = MIN(MAX(val.doubleValue, 0.0), METAL_SCENE_MAX_FPS);
+        } else if ([key isEqualToString:@"feedback"]) {
+            feedback = true;
+        } else if ([key isEqualToString:@"resolution"]) {
+            resolution = [[val lowercaseString] isEqualToString:@"guest"]
+                         ? 0.0 : MIN(MAX(val.doubleValue, 0.125), 1.0);
+        } else if ([key isEqualToString:@"state"]) {
+            rows = (uint32_t)MIN(MAX(val.intValue, 0), 64);
+        }
+    }
+    if (!feedback) {
+        rows = 0;
+    }
+    src = [NSString stringWithFormat:@"%@#define BACKDROP_FEEDBACK %d\n#line 1 \"%@\"\n%@\n%@",
+           SCENE_PRELUDE, feedback ? 1 : 0, [leaf stringByReplacingOccurrencesOfString:@"\""
+                                                                            withString:@"'"],
+           text, SCENE_POSTLUDE];
+    opts = [[MTLCompileOptions alloc] init];
+    lib = [m.device newLibraryWithSource:src options:opts error:&err];
+    [opts release];
+    if (!lib) {
+        metal_log("backdrop: the shader %s does not compile, so none:\n%s",
+                  [path fileSystemRepresentation],
+                  [[err localizedDescription] UTF8String]);
+        return false;
+    }
+    vs = [lib newFunctionWithName:@"scene_vs"];
+    fs = [lib newFunctionWithName:@"scene_fs"];
+    [lib release];
+    if (!vs || !fs) {
+        metal_log("backdrop: the shader %s has no scene function", [path fileSystemRepresentation]);
+        [vs release];
+        [fs release];
+        return false;
+    }
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
+    pd.colorAttachments[0].pixelFormat = feedback ? MTLPixelFormatRGBA32Float
+                                                  : MTLPixelFormatRGBA8Unorm;
+    backdrop_scene_release();
+    backdrop.scene_pipe = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    [vs release];
+    [fs release];
+    if (!backdrop.scene_pipe) {
+        metal_log("backdrop: the shader %s: no pipeline, so none: %s",
+                  [path fileSystemRepresentation], [[err localizedDescription] UTF8String]);
+        return false;
+    }
+    backdrop.feedback = feedback;
+    backdrop.fps = fps;
+    backdrop.resolution = resolution;
+    backdrop.state_rows = rows;
+    metal_log("backdrop: shader %s: %.0f fps, resolution %s, feedback %d, state rows %u",
+              [path fileSystemRepresentation], fps,
+              resolution > 0 ? [[NSString stringWithFormat:@"%.3g of the window's", resolution]
+                                UTF8String] : "a RISC OS pixel's",
+              (int)feedback, rows);
+    return true;
+}
+
+/* The scene's size in texels for this window and this screen mode */
+static void backdrop_scene_size(CGSize target, uint32_t gw, uint32_t gh,
+                                uint32_t *w, uint32_t *h)
+{
+    if (backdrop.resolution <= 0) {
+        *w = gw;
+        *h = gh;
+    } else {
+        *w = (uint32_t)lround(target.width * backdrop.resolution);
+        *h = (uint32_t)lround(target.height * backdrop.resolution);
+    }
+    *w = MIN(MAX(*w, 1u), 8192u);
+    *h = MIN(MAX(*h, 1u), 8192u - backdrop.state_rows);
+}
+
+/* Draw the scene's next frame, in a command buffer of its own -- so a
+ * shader that faults on the GPU loses its own frame, never the desktop's
+ * -- committed ahead of the frame that shows it. */
+static void backdrop_scene_render(CGSize target, uint32_t gw, uint32_t gh)
+{
+    id<MTLCommandBuffer> cb;
+    MTLRenderPassDescriptor *rp;
+    id<MTLRenderCommandEncoder> enc;
+    SceneParams sp;
+    uint32_t w, h, n = backdrop.feedback ? 2 : 1;
+    double now = CFAbsoluteTimeGetCurrent();
+    time_t tt = time(NULL);
+    struct tm lt;
+
+    if (!backdrop.scene_pipe || !gw || !gh) {
+        return;
+    }
+    backdrop_scene_size(target, gw, gh, &w, &h);
+    cb = [m.queue commandBuffer];
+    if (!backdrop.scene_tex[0] || w != backdrop.scene_w || h != backdrop.scene_h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:backdrop.feedback ? MTLPixelFormatRGBA32Float
+                                                                 : MTLPixelFormatRGBA8Unorm
+                                         width:w height:h + backdrop.state_rows
+                                     mipmapped:NO];
+
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        for (uint32_t i = 0; i < 2; i++) {
+            [backdrop.scene_tex[i] release];
+            backdrop.scene_tex[i] = i < n ? [m.device newTextureWithDescriptor:td] : nil;
+            if (i < n && !backdrop.scene_tex[i]) {
+                metal_log("backdrop: no %ux%u scene texture", w, h);
+                return;
             }
-            metal_log("backdrop: %s %s (%lux%lu)",
-                      mode == METAL_BACKDROP_TILE ? "tile" : "picture", path,
-                      (unsigned long)backdrop.image.width,
-                      (unsigned long)backdrop.image.height);
-        } else {
-            mode = METAL_BACKDROP_ACORN;
-            spec = "acorn";
-            metal_log("backdrop: cannot read %s; using acorn", path);
+            if (i < n) {
+                /* a feedback scene's first "last frame" is zero, not junk */
+                rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = backdrop.scene_tex[i];
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+            }
         }
+        backdrop.scene_w = w;
+        backdrop.scene_h = h;
+        backdrop.scene_cur = 0;
+        backdrop.scene_frame = 0;
     }
-    [backdrop.spec release];
-    backdrop.spec = [[NSString alloc] initWithUTF8String:spec];
-    if (mode != backdrop.mode) {
-        backdrop.mode = mode;
-        fb_release_scale();
-    }
-    backdrop.t0 = CFAbsoluteTimeGetCurrent();
-    metal_log("backdrop: scene %s (mode %d)", spec, mode);
-}
+    localtime_r(&tt, &lt);
+    memset(&sp, 0, sizeof(sp));
+    sp.a[0] = (float)w;
+    sp.a[1] = (float)h;
+    sp.a[2] = (float)h / (float)gh;
+    sp.a[3] = (float)fmod(now - backdrop.t0, 86400.0);
+    sp.b[0] = (float)(lt.tm_hour + lt.tm_min / 60.0 + lt.tm_sec / 3600.0);
+    sp.b[1] = (float)METAL_ICONBAR_PX * sp.a[2];
+    sp.b[2] = (float)gw;
+    sp.b[3] = (float)gh;
+    sp.c[0] = 0xB7 / 255.0f;
+    sp.c[1] = 0xC0 / 255.0f;
+    sp.c[2] = 0xB4 / 255.0f;
+    sp.d[0] = backdrop.scene_frame;
+    sp.d[1] = backdrop.state_rows;
 
-/* -display metal,backdrop= -- the gate and the first scene, once, at init.
- * off (the default, and what an absent option means) leaves the feature
- * out entirely: the decode ignores the transfer byte, nothing is drawn
- * beneath the desktop, and the Backdrop menu is hidden.  Anything else
- * turns it on and names the scene; none is on with no scene. */
-void metal_glue_backdrop(const char *spec)
-{
-    backdrop.enabled = spec && *spec && strcmp(spec, "off") != 0;
-    [backdrop.menu_item setHidden:!backdrop.enabled];
-    if (backdrop.enabled) {
-        backdrop_set_scene(spec);
-    } else {
-        backdrop_set_scene("none");
-        metal_log("backdrop: gated off");
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = backdrop.scene_tex[backdrop.feedback ? backdrop.scene_cur ^ 1 : 0];
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:backdrop.scene_pipe];
+    [enc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
+    if (backdrop.feedback) {
+        [enc setFragmentTexture:backdrop.scene_tex[backdrop.scene_cur] atIndex:0];
     }
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.error) {
+            metal_log("backdrop: the shader faulted on the GPU: %ld (%s)",
+                      (long)done.error.code,
+                      done.error.localizedDescription.UTF8String ?: "");
+            backdrop.scene_failed = true;
+        }
+    }];
+    [cb commit];
+    if (backdrop.feedback) {
+        backdrop.scene_cur ^= 1;
+    }
+    backdrop.scene_frame++;
+    backdrop.scene_valid = true;
 }
 
 /* Whether RISC OS is painting the below tag in the key colour right now,
@@ -1275,27 +2070,227 @@ static int backdrop_guest_state(void)
     return 0;
 }
 
-/* The folder the Backdrop menu lists: Tiles and Pictures inside it. */
+/* Whether a moving scene wants a frame now: it is due, the window can be
+ * seen (not minimised, not covered) and RISC OS shows the backdrop at
+ * all -- looked at once a second -- so a hidden scene costs nothing. */
+static bool backdrop_scene_due(void)
+{
+    double now;
+
+    if (backdrop.mode == METAL_BACKDROP_SHADER) {
+        if (backdrop.fps <= 0 || !backdrop.scene_pipe) {
+            return false;
+        }
+    } else if (backdrop.mode != METAL_BACKDROP_ACORN_LIVE) {
+        return false;
+    }
+    if (!([m.window occlusionState] & NSWindowOcclusionStateVisible)) {
+        return false;
+    }
+    now = CFAbsoluteTimeGetCurrent();
+    if (now - backdrop.guest_checked >= 1.0) {
+        backdrop.guest_shows = backdrop_guest_state() == 1;
+        backdrop.guest_checked = now;
+    }
+    return backdrop.guest_shows && now >= backdrop.scene_next;
+}
+
+/* The folder the Backdrop menu lists and a relative scene names: the one
+ * chosen with Choose Backdrops Folder, else backdrop-dir= (the launcher
+ * gives the disc's Resources/Wallpapers), else ~/Pictures/RISC OS
+ * Backdrops. */
 static NSString *backdrop_folder(void)
 {
     NSString *f = [[NSUserDefaults standardUserDefaults] stringForKey:@"backdropFolder"];
+    BOOL isdir = NO;
 
-    return f.length ? f : [@"~/Pictures/RISC OS Backdrops" stringByExpandingTildeInPath];
+    if (f.length && [[NSFileManager defaultManager] fileExistsAtPath:f isDirectory:&isdir]
+        && isdir) {
+        return f;
+    }
+    if (backdrop.dir.length) {
+        return backdrop.dir;
+    }
+    return [@"~/Pictures/RISC OS Backdrops" stringByExpandingTildeInPath];
 }
 
-/* The images in a folder, by name as the Finder sorts them. */
-static NSArray *backdrop_images(NSString *dir, NSSet *extensions)
+/* A scene's path as the spec keeps it: relative to the folder when it is
+ * in it, so a choice follows the disc */
+static NSString *backdrop_relative(NSString *path)
+{
+    NSString *dir = [backdrop_folder() stringByAppendingString:@"/"];
+
+    return [path hasPrefix:dir] ? [path substringFromIndex:dir.length] : path;
+}
+
+static NSString *backdrop_resolve(NSString *path)
+{
+    path = [path stringByExpandingTildeInPath];
+    return [path isAbsolutePath] ? path
+                                 : [backdrop_folder() stringByAppendingPathComponent:path];
+}
+
+/* The scene, by its spec:
+ *
+ *   none            nothing drawn beneath (the default)
+ *   acorn           the Acorn mark, built in
+ *   acorn-live      the same with two drifting lights, built in
+ *   shader:FILE     a scene from a .metal file
+ *   tile:FILE       an image or sprite file, tiled from the top left
+ *   picture:FILE    an image or sprite file, filling the window, centred
+ *   wallpaper:FILE  a tile if it is 512 RISC OS pixels or less each way,
+ *                   else a picture -- what the menu's Wallpapers give
+ *   FILE            a .metal file is a shader, anything else a wallpaper
+ *
+ * A relative FILE is in the backdrops folder (backdrop_folder).  An
+ * image's density is its own (backdrop_load_image), so a tile has one
+ * image pixel to a RISC OS pixel, or two for a double-density one.
+ * Anything that cannot be read or compiled gives none.  Only ever
+ * reached with the feature gated on; UI thread only. */
+static void backdrop_set_scene(const char *spec_c)
+{
+    NSString *spec = spec_c ? [NSString stringWithUTF8String:spec_c] : @"none";
+    NSString *kind = nil, *file = nil;
+    int mode = METAL_BACKDROP_OFF;
+
+    if (!spec) {
+        spec = @"none";
+    }
+    [backdrop.image release];
+    backdrop.image = nil;
+    backdrop.image_scale = 1.0;
+    backdrop_scene_release();
+    if (!spec.length || [spec isEqualToString:@"none"] || [spec isEqualToString:@"off"]) {
+        spec = @"none";
+    } else if ([spec isEqualToString:@"acorn"]) {
+        mode = METAL_BACKDROP_ACORN;
+    } else if ([spec isEqualToString:@"acorn-live"]) {
+        mode = METAL_BACKDROP_ACORN_LIVE;
+    } else {
+        for (NSString *k in @[ @"shader", @"tile", @"picture", @"wallpaper" ]) {
+            if ([spec hasPrefix:[k stringByAppendingString:@":"]]) {
+                kind = k;
+                file = [spec substringFromIndex:k.length + 1];
+            }
+        }
+        if (!kind) {
+            file = spec;
+            kind = is_shader_leaf([spec lastPathComponent]) ? @"shader" : @"wallpaper";
+        }
+    }
+    if (file) {
+        NSString *path = backdrop_resolve(file);
+
+        if ([kind isEqualToString:@"shader"]) {
+            if (backdrop_scene_load(path)) {
+                mode = METAL_BACKDROP_SHADER;
+            }
+        } else {
+            size_t w = 0, h = 0;
+            double scale = 1.0;
+
+            backdrop.image = backdrop_load_image(path, &scale, &w, &h);
+            if (backdrop.image) {
+                backdrop.image_scale = scale;
+                if ([kind isEqualToString:@"tile"]) {
+                    mode = METAL_BACKDROP_TILE;
+                } else if ([kind isEqualToString:@"picture"]) {
+                    mode = METAL_BACKDROP_PICTURE;
+                } else {
+                    mode = (w <= 512 * scale && h <= 512 * scale) ? METAL_BACKDROP_TILE
+                                                                  : METAL_BACKDROP_PICTURE;
+                }
+                metal_log("backdrop: %s %s (%zux%zu, %.3g to a RISC OS pixel)",
+                          mode == METAL_BACKDROP_TILE ? "tile" : "picture",
+                          [path fileSystemRepresentation], w, h, scale);
+            } else {
+                metal_log("backdrop: cannot read %s, so none", [path fileSystemRepresentation]);
+            }
+        }
+        if (mode == METAL_BACKDROP_OFF) {
+            spec = @"none";
+        }
+    }
+    [backdrop.spec release];
+    backdrop.spec = [spec copy];
+    if (mode != backdrop.mode) {
+        backdrop.mode = mode;
+        fb_release_scale();
+    }
+    backdrop.t0 = CFAbsoluteTimeGetCurrent();
+    backdrop.scene_next = 0;
+    backdrop.guest_checked = 0;
+    frame_wanted = true;
+    metal_log("backdrop: scene %s (mode %d)", [spec UTF8String], mode);
+}
+
+/* -display metal,backdrop-dir= -- the folder of wallpapers and shaders,
+ * before backdrop= (ui/metal.c calls this first) */
+void metal_glue_backdrop_dir(const char *dir)
+{
+    [backdrop.dir release];
+    backdrop.dir = dir && *dir
+        ? [[[NSString stringWithUTF8String:dir] stringByExpandingTildeInPath] copy] : nil;
+    metal_log("backdrop: folder %s", dir ? dir : "(none)");
+}
+
+/* -display metal,backdrop= -- the gate and the first scene, once, at init.
+ * off (the default, and what an absent option means) leaves the feature
+ * out entirely: the decode ignores the transfer byte, nothing is drawn
+ * beneath the desktop, and the Backdrop menu is hidden.  Anything else
+ * turns it on and names the scene; none is on with no scene. */
+void metal_glue_backdrop(const char *spec)
+{
+    backdrop.enabled = spec && *spec && strcmp(spec, "off") != 0;
+    [backdrop.menu_item setHidden:!backdrop.enabled];
+    if (backdrop.enabled) {
+        backdrop_set_scene(spec);
+    } else {
+        backdrop_set_scene("none");
+        metal_log("backdrop: gated off");
+    }
+}
+
+/* The files of a folder the menu lists, by name as the Finder sorts
+ * them, leaving out a double-density sibling (NAME@2x, or NAME11 for a
+ * sprite file) when NAME is there too: it is drawn in NAME's place on a
+ * Retina window. */
+static NSArray *backdrop_files(NSString *dir, bool images, bool shaders)
 {
     NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:NULL];
     NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *titles = [NSMutableSet set];
 
+    for (NSString *n in names) {
+        if ((images && (is_image_leaf(n) || is_sprite_leaf(n))) || (shaders && is_shader_leaf(n))) {
+            [titles addObject:[leaf_title(n) lowercaseString]];
+        }
+    }
     for (NSString *n in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
-        if (![n hasPrefix:@"."]
-            && [extensions containsObject:[[n pathExtension] lowercaseString]]) {
-            [out addObject:[dir stringByAppendingPathComponent:n]];
-            if (out.count >= 200) {
-                break;
-            }
+        NSString *t = [leaf_title(n) lowercaseString];
+        BOOL isdir = NO;
+
+        if ([n hasPrefix:@"."]) {
+            continue;
+        }
+        if (!((images && (is_image_leaf(n) || is_sprite_leaf(n))) || (shaders && is_shader_leaf(n)))) {
+            continue;
+        }
+        if ([[NSFileManager defaultManager] fileExistsAtPath:[dir stringByAppendingPathComponent:n]
+                                                 isDirectory:&isdir] && isdir) {
+            continue;
+        }
+        if (images && t.length > 3 && [t hasSuffix:@"@2x"]
+            && [titles containsObject:[t substringToIndex:t.length - 3]]) {
+            continue;
+        }
+        if (images && is_sprite_leaf(n) && t.length > 2 && [t hasSuffix:@"11"]
+            && [titles containsObject:[t substringToIndex:t.length - 2]]) {
+            continue;
+        }
+        [out addObject:[dir stringByAppendingPathComponent:n]];
+        if (out.count >= 200) {
+            break;
         }
     }
     return out;
@@ -1612,8 +2607,28 @@ static bool metal_render_frame(void)
         params.post[1] = (uint32_t)target.height;
         params.post[2] = (uint32_t)video_opts.scaling;
         params.post[3] = video_opts.scanlines ? 1 : 0;
-        backdrop_params(&params, m.layer.contentsScale);
+        backdrop_params(&params, target.height / (double)MAX(v.yres, 1u));
         fb.xoff = v.xoffset;
+
+        /* a shader's scene: drawn when it is new, when the window's size
+         * or the mode changes it, and when it is due (main loop); in its
+         * own command buffer, ahead of this frame's */
+        if (backdrop.mode == METAL_BACKDROP_SHADER && backdrop.scene_pipe) {
+            uint32_t sw, sh;
+            double now = CFAbsoluteTimeGetCurrent();
+
+            backdrop_scene_size(target, v.xres, v.yres, &sw, &sh);
+            if (!backdrop.scene_valid || sw != backdrop.scene_w || sh != backdrop.scene_h
+                || (backdrop.fps > 0 && now >= backdrop.scene_next)) {
+                backdrop_scene_render(target, v.xres, v.yres);
+                if (backdrop.fps > 0) {
+                    backdrop.scene_next = now + 1.0 / backdrop.fps;
+                }
+            }
+            backdrop_params(&params, target.height / (double)MAX(v.yres, 1u));
+        } else if (backdrop.mode == METAL_BACKDROP_ACORN_LIVE) {
+            backdrop.scene_next = CFAbsoluteTimeGetCurrent() + 1.0 / 12.0;
+        }
         fb.yoff = v.yoffset;
         fb.pixo = v.pixo;
 
@@ -1642,12 +2657,18 @@ static bool metal_render_frame(void)
     if (have_fb && !fb.scale && !fb_build_scale()) {
         have_fb = false;                /* logged by metal_pipeline */
     }
+    if (have_fb && fb.scale && backdrop.mode == METAL_BACKDROP_SHADER
+        && !backdrop.scene_tex[backdrop.scene_cur]) {
+        have_fb = false;                /* no scene texture: nothing to bind */
+    }
     if (have_fb && fb.scale) {
         [enc setRenderPipelineState:fb.scale];
         [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
         [enc setFragmentTexture:fb.decoded atIndex:0];
         if (backdrop.mode >= METAL_BACKDROP_PICTURE) {
-            [enc setFragmentTexture:backdrop.image atIndex:1];
+            [enc setFragmentTexture:backdrop.mode == METAL_BACKDROP_SHADER
+                                    ? backdrop.scene_tex[backdrop.scene_cur] : backdrop.image
+                            atIndex:1];
             [enc setFragmentSamplerState:m.repeat atIndex:1];
         }
         [enc setFragmentSamplerState:m.linear atIndex:0];
@@ -1772,6 +2793,11 @@ static NSString *metal_shot_path(unsigned n)
     NSString *base = dirs.count
         ? [dirs[0] stringByAppendingPathComponent:@"RISCOSQEMU"]
         : NSTemporaryDirectory();
+    const char *dir = getenv("METAL_SHOT_DIR");     /* a test's own folder */
+
+    if (dir && *dir) {
+        base = [NSString stringWithUTF8String:dir];
+    }
 
     [[NSFileManager defaultManager] createDirectoryAtPath:base
                              withIntermediateDirectories:YES
@@ -1810,7 +2836,8 @@ static bool metal_screenshot_to(NSString *path)
     id<MTLTexture> source = fb.decoded;
     id<MTLTexture> composite = nil;
 
-    if (backdrop.mode != METAL_BACKDROP_OFF) {
+    if (backdrop.mode != METAL_BACKDROP_OFF
+        && (backdrop.mode != METAL_BACKDROP_SHADER || backdrop.scene_tex[backdrop.scene_cur])) {
         if (!fb.shot) {
             MTLFunctionConstantValues *scv = [[MTLFunctionConstantValues alloc] init];
             uint32_t nearest = METAL_SCALING_NEAREST;
@@ -1843,8 +2870,7 @@ static bool metal_screenshot_to(NSString *path)
             sp.post[1] = fb.yres;
             sp.post[2] = METAL_SCALING_NEAREST;
             /* the window's tile size, carried into guest pixels */
-            backdrop_params(&sp, m.layer.contentsScale * (double)fb.yres
-                                 / MAX(m.layer.drawableSize.height, 1.0));
+            backdrop_params(&sp, 1.0);   /* the tile's size in guest pixels */
             srp.colorAttachments[0].texture = composite;
             srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             srp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -1853,7 +2879,9 @@ static bool metal_screenshot_to(NSString *path)
             [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
             [senc setFragmentTexture:fb.decoded atIndex:0];
             if (backdrop.mode >= METAL_BACKDROP_PICTURE) {
-                [senc setFragmentTexture:backdrop.image atIndex:1];
+                [senc setFragmentTexture:backdrop.mode == METAL_BACKDROP_SHADER
+                                         ? backdrop.scene_tex[backdrop.scene_cur] : backdrop.image
+                                 atIndex:1];
                 [senc setFragmentSamplerState:m.repeat atIndex:1];
             }
             [senc setFragmentSamplerState:m.linear atIndex:0];
@@ -2339,12 +3367,24 @@ static void metal_buttons_release_all(void)
     [m.window toggleFullScreen:nil];
 }
 
-/* The Backdrop menu (MACOS.md, "The backdrop layer"): the Acorn scenes,
- * None, and Tiles and Pictures submenus listing the images in the
- * backdrops folder -- rebuilt each time it opens, so a file dropped into
- * the folder is there next time.  A choice applies at once and is kept
- * as the backdrop default, which the app's launcher passes next time.
- * The menu is there only when backdrop= gates the feature on. */
+/* The Backdrop menu (MACOS.md, "The backdrop layer"), rebuilt each time
+ * it opens, so a file dropped into the folder is there next time:
+ *
+ *   None
+ *   Shaders ▸     the .metal files in the folder's Shaders (the built-in
+ *                 Acorn scenes when there are none)
+ *   Wallpapers ▸  the sprite files and images in the folder itself,
+ *                 each a tile, or a picture if it is large
+ *   Tiles ▸, Pictures ▸  the folder's Tiles and Pictures, if it has
+ *                 them; Pictures has the Mac's own desktop pictures too
+ *   Open Backdrops Folder, Choose Backdrops Folder..., and Use the
+ *   Disc's Wallpapers when another folder has been chosen
+ *
+ * The folder is the disc's Resources/Wallpapers, which the launcher
+ * passes as backdrop-dir=, unless another has been chosen.  A choice
+ * applies at once and is kept as the backdrop default, which the app's
+ * launcher passes next time.  The menu is there only when backdrop=
+ * gates the feature on. */
 static NSMenuItem *backdrop_item(NSString *title, NSString *spec, id target)
 {
     NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title
@@ -2367,7 +3407,7 @@ static NSMenuItem *backdrop_note(NSString *title)
 }
 
 static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
-                             id target)
+                             NSString *empty, id target)
 {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
     bool any = false;
@@ -2378,25 +3418,35 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
             [menu addItem:[NSMenuItem separatorItem]];
         }
         for (NSString *path in group) {
-            [menu addItem:backdrop_item([[path lastPathComponent] stringByDeletingPathExtension],
-                                        [NSString stringWithFormat:@"%@:%@", kind, path],
+            [menu addItem:backdrop_item(leaf_title([path lastPathComponent]),
+                                        [NSString stringWithFormat:@"%@:%@", kind,
+                                                  backdrop_relative(path)],
                                         target)];
             any = true;
         }
     }
     if (!any) {
-        [menu addItem:backdrop_note([NSString stringWithFormat:
-            @"No images in the %@ folder", title])];
+        [menu addItem:backdrop_note(empty)];
     }
     return [menu autorelease];
 }
 
+static void backdrop_add_submenu(NSMenu *menu, NSString *title, NSMenu *sub)
+{
+    NSMenuItem *it = [[[NSMenuItem alloc] initWithTitle:title action:NULL
+                                          keyEquivalent:@""] autorelease];
+
+    [it setSubmenu:sub];
+    [menu addItem:it];
+}
+
 - (void)menuNeedsUpdate:(NSMenu *)menu
 {
-    NSSet *ext = [NSSet setWithObjects:@"png", @"jpg", @"jpeg", @"heic", @"heif",
-                                       @"tif", @"tiff", @"gif", @"bmp", @"webp", nil];
     NSString *dir = backdrop_folder();
-    NSMenuItem *sub;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *shaders;
+    NSString *sub;
+    BOOL isdir = NO;
 
     if ([[menu title] isEqualToString:@"Machine"]) {
         /* The doorbell switch: shown only where the device exists, and
@@ -2415,7 +3465,8 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
     [menu removeAllItems];
     switch (backdrop_guest_state()) {
     case 0:
-        [menu addItem:backdrop_note(@"RISC OS is not drawing a backdrop to show through")];
+        [menu addItem:backdrop_note(@"RISC OS is not drawing a backdrop to show through:")];
+        [menu addItem:backdrop_note(@"turn Composite on in Appearance's Wallpaper page")];
         [menu addItem:[NSMenuItem separatorItem]];
         break;
     case -1:
@@ -2425,21 +3476,37 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
     default:
         break;
     }
-    [menu addItem:backdrop_item(@"Acorn", @"acorn", self)];
-    [menu addItem:backdrop_item(@"Acorn, Moving", @"acorn-live", self)];
     [menu addItem:backdrop_item(@"None", @"none", self)];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    sub = [[[NSMenuItem alloc] initWithTitle:@"Tiles" action:NULL keyEquivalent:@""] autorelease];
-    [sub setSubmenu:backdrop_list(@"Tiles", @"tile",
-        @[ backdrop_images([dir stringByAppendingPathComponent:@"Tiles"], ext) ], self)];
-    [menu addItem:sub];
-    sub = [[[NSMenuItem alloc] initWithTitle:@"Pictures" action:NULL keyEquivalent:@""] autorelease];
-    [sub setSubmenu:backdrop_list(@"Pictures", @"picture",
-        @[ backdrop_images([dir stringByAppendingPathComponent:@"Pictures"], ext),
-           backdrop_images(@"/System/Library/Desktop Pictures", [NSSet setWithObject:@"heic"]) ],
-        self)];
-    [menu addItem:sub];
+    shaders = backdrop_files([dir stringByAppendingPathComponent:@"Shaders"], false, true);
+    if (shaders.count) {
+        backdrop_add_submenu(menu, @"Shaders",
+                             backdrop_list(@"Shaders", @"shader", @[ shaders ], @"", self));
+    } else {
+        NSMenu *b = [[[NSMenu alloc] initWithTitle:@"Shaders"] autorelease];
+
+        [b setAutoenablesItems:NO];
+        [b addItem:backdrop_item(@"Acorn", @"acorn", self)];
+        [b addItem:backdrop_item(@"Acorn, Moving", @"acorn-live", self)];
+        [b addItem:backdrop_note(@"No .metal files in the Shaders folder")];
+        backdrop_add_submenu(menu, @"Shaders", b);
+    }
+    backdrop_add_submenu(menu, @"Wallpapers",
+                         backdrop_list(@"Wallpapers", @"wallpaper",
+                                       @[ backdrop_files(dir, true, false) ],
+                                       @"No sprite files or images in the folder", self));
+    sub = [dir stringByAppendingPathComponent:@"Tiles"];
+    if ([fm fileExistsAtPath:sub isDirectory:&isdir] && isdir) {
+        backdrop_add_submenu(menu, @"Tiles",
+                             backdrop_list(@"Tiles", @"tile", @[ backdrop_files(sub, true, false) ],
+                                           @"No images in the Tiles folder", self));
+    }
+    backdrop_add_submenu(menu, @"Pictures",
+        backdrop_list(@"Pictures", @"picture",
+                      @[ backdrop_files([dir stringByAppendingPathComponent:@"Pictures"], true, false),
+                         backdrop_files(@"/System/Library/Desktop Pictures", true, false) ],
+                      @"No pictures", self));
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *open = [[[NSMenuItem alloc] initWithTitle:@"Open Backdrops Folder"
@@ -2447,11 +3514,18 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
                                             keyEquivalent:@""] autorelease];
     [open setTarget:self];
     [menu addItem:open];
-    NSMenuItem *choose = [[[NSMenuItem alloc] initWithTitle:@"Choose Backdrops Folder\u2026"
+    NSMenuItem *choose = [[[NSMenuItem alloc] initWithTitle:@"Choose Backdrops Folder…"
                                                      action:@selector(chooseBackdropsFolderAction:)
                                               keyEquivalent:@""] autorelease];
     [choose setTarget:self];
     [menu addItem:choose];
+    if (backdrop.dir.length && ![dir isEqualToString:backdrop.dir]) {
+        NSMenuItem *disc = [[[NSMenuItem alloc] initWithTitle:@"Use the Disc's Wallpapers"
+                                                       action:@selector(discBackdropsFolderAction:)
+                                                keyEquivalent:@""] autorelease];
+        [disc setTarget:self];
+        [menu addItem:disc];
+    }
 }
 
 - (void)backdropAction:(NSMenuItem *)sender
@@ -2460,7 +3534,10 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
 
     if (spec && backdrop.enabled) {
         backdrop_set_scene([spec UTF8String]);
+        /* what the launcher passes next time: what took, so a scene that
+         * would not compile is not tried again */
         [[NSUserDefaults standardUserDefaults] setObject:backdrop.spec forKey:@"backdrop"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
     }
 }
 
@@ -2512,14 +3589,17 @@ void metal_ui_hostnet_switch(bool on)
 - (void)openBackdropsFolderAction:(id)sender
 {
     NSString *dir = backdrop_folder();
-    NSFileManager *fm = [NSFileManager defaultManager];
 
     (void)sender;
-    [fm createDirectoryAtPath:[dir stringByAppendingPathComponent:@"Tiles"]
-  withIntermediateDirectories:YES attributes:nil error:NULL];
-    [fm createDirectoryAtPath:[dir stringByAppendingPathComponent:@"Pictures"]
-  withIntermediateDirectories:YES attributes:nil error:NULL];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                               attributes:nil error:NULL];
     [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir]];
+}
+
+- (void)discBackdropsFolderAction:(id)sender
+{
+    (void)sender;
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"backdropFolder"];
 }
 
 - (void)chooseBackdropsFolderAction:(id)sender
@@ -2531,7 +3611,8 @@ void metal_ui_hostnet_switch(bool on)
     panel.canChooseFiles = NO;
     panel.allowsMultipleSelection = NO;
     panel.prompt = @"Use Folder";
-    panel.message = @"Choose a folder with Tiles and Pictures folders inside it.";
+    panel.message = @"Choose a folder of wallpapers -- sprite files and pictures -- "
+                    @"with scenes in a Shaders folder inside it.";
     panel.directoryURL = [NSURL fileURLWithPath:backdrop_folder()];
     [panel beginSheetModalForWindow:m.window completionHandler:^(NSModalResponse r) {
         if (r == NSModalResponseOK && panel.URL) {
@@ -2782,6 +3863,13 @@ int metal_backend_main(void)
             if ([m.window isMiniaturized] || ![m.window isVisible]) {
                 usleep(50 * 1000);
                 continue;
+            }
+            /* a moving backdrop's next frame, or its fault: none */
+            if (backdrop.scene_failed) {
+                metal_log("backdrop: the scene failed, so none");
+                backdrop_set_scene("none");
+            } else if (backdrop_scene_due()) {
+                frame_wanted = true;
             }
             metal_render_frame();
             if (frame_skipped) {

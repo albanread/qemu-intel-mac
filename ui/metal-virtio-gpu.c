@@ -72,7 +72,8 @@ typedef struct VgBacking {
     const struct iovec *src;    /* likewise */
     struct iovec *iov;
     unsigned niov;
-    size_t total;
+    size_t total;               /* the backing's pages, whole */
+    size_t res_bytes;           /* the resource's own extent, unrounded */
     uint32_t scan_w, scan_h;    /* the scanout's own size */
 } VgBacking;
 
@@ -117,6 +118,14 @@ static bool vg_backing_sync(VirtIOGPU *g, VgBacking *b)
     b->res = res;
     b->res_id = res->resource_id;
     b->total = iov_size(b->iov, b->niov);
+    /* The screen block sits in the last 4 KB of the buffer the guest
+     * allocated -- a dumb buffer of this resource's own width x height,
+     * its bytes exactly width * height * 4 (Linux's virtio-gpu dumbs are
+     * 32 bpp).  The backing's pages are rounded up to whole pages beyond
+     * that, so the block is NOT in the backing's last 4 KB whenever the
+     * buffer's own end falls inside its last page (1280 x 800's is 3
+     * pages short); measure from the resource's extent, not the pages'. */
+    b->res_bytes = MIN((uint64_t)res->width * res->height * 4, b->total);
     return true;
 }
 
@@ -130,11 +139,28 @@ static bool vg_mode(const VgBacking *b, VgMode *m, uint32_t *pal)
     size_t need;
 
     memset(m, 0, sizeof(*m));
-    if (b->total > ROSGD_SCREEN_BLOCK
-        && iov_to_buf(b->iov, b->niov, b->total - ROSGD_SCREEN_BLOCK,
-                      &blk, sizeof(blk)) == sizeof(blk)
-        && le32_to_cpu(blk.magic) == ROSGD_SCREEN_MAGIC
-        && le32_to_cpu(blk.version) == 1) {
+    /* The block sits in the last 4 KB of the buffer the guest allocated:
+     * a dumb buffer of this resource's own width x height, whose bytes are
+     * exactly width * height * 4 (Linux's virtio-gpu dumbs are 32 bpp).
+     * The backing's pages run on to whole pages past that end, so the
+     * block is NOT at the backing's own last 4 KB whenever the buffer's
+     * end falls inside its last page (1280 x 800's is 3 pages short);
+     * measure from the resource's extent, falling back to the pages'. */
+    for (unsigned i = 0; i < 2; i++) {
+        size_t end = i == 0 ? b->res_bytes : b->total;
+
+        if (i == 1 && end == b->res_bytes) {
+            break;                  /* the same place twice */
+        }
+        if (end <= ROSGD_SCREEN_BLOCK) {
+            break;
+        }
+        if (iov_to_buf(b->iov, b->niov, end - ROSGD_SCREEN_BLOCK,
+                       &blk, sizeof(blk)) != sizeof(blk)
+            || le32_to_cpu(blk.magic) != ROSGD_SCREEN_MAGIC
+            || le32_to_cpu(blk.version) != 1) {
+            continue;
+        }
         m->xres = le32_to_cpu(blk.xres);
         m->yres = le32_to_cpu(blk.yres);
         m->pitch = le32_to_cpu(blk.pitch);
@@ -144,8 +170,8 @@ static bool vg_mode(const VgBacking *b, VgMode *m, uint32_t *pal)
         m->yoffset = le32_to_cpu(blk.yoffset);
         m->block_gen = le32_to_cpu(blk.generation);
         m->described = true;
-        for (unsigned i = 0; i < 256; i++) {
-            pal[i] = le32_to_cpu(blk.palette[i]);
+        for (unsigned j = 0; j < 256; j++) {
+            pal[j] = le32_to_cpu(blk.palette[j]);
         }
         need = (size_t)m->pitch * (m->yres + m->yoffset);
         switch (m->bpp) {
@@ -156,7 +182,7 @@ static bool vg_mode(const VgBacking *b, VgMode *m, uint32_t *pal)
         }
         return m->xres && m->yres && m->xres <= 16384 && m->yres <= 16384
                && (uint64_t)(m->xres + m->xoffset) * m->bpp <= (uint64_t)m->pitch * 8
-               && need <= b->total - ROSGD_SCREEN_BLOCK;
+               && need <= end - ROSGD_SCREEN_BLOCK;
     }
     /* Undescribed: what Linux declared, XRGB8888 -- blue in the low byte. */
     m->xres = b->scan_w;

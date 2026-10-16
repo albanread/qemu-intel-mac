@@ -2469,6 +2469,7 @@ static void metal_update_title(void)
         const char *sys, *mach;
 
         metal_glue_title(&sys, &mach);
+        metal_log("fps %u (%ux%u, %u bpp)", fps, fb.xres, fb.yres, fb.bpp);
         [m.window setTitle:
             [NSString stringWithFormat:
                 @"%s — %ux%u, %u bpp · %u fps — %s",

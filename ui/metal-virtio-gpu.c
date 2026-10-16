@@ -34,6 +34,9 @@
 #include "qemu/main-loop.h"
 #include "qom/object.h"
 #include "hw/virtio/virtio-gpu.h"
+#include "monitor/monitor.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "ui/console.h"
 #include "ui/metal-board.h"
 
@@ -62,7 +65,70 @@ typedef struct VgMode {
     uint32_t xres, yres, pitch, bpp, pixo, xoffset, yoffset;
     uint32_t block_gen;
     bool described;             /* from a screen block */
+    size_t block_off;           /* where the block is in the buffer */
 } VgMode;
+
+/*
+ * ---- block v2 and the backings region (design 39) ----------------------
+ *
+ * Block v2 is the Wimp's surfaces list (screen.h, design 37): its own
+ * area of the screen's buffer, found through the surfaces table's
+ * v2_offset, a seqlock round it.  Version 3 adds the backings region:
+ * one physically contiguous stretch of guest RAM, its base and size in
+ * the header, each window's pixels at an offset in it.  The host maps
+ * the region once and draws the backings where they lie.
+ *
+ * The host says it is there -- that it draws the surfaces -- in the
+ * block's presenter area (PRES): until it does, the Wimp makes no
+ * backings and draws to the screen as before.  Sprint 1 announces only
+ * when METAL_SURFACES=probe, to test the region without drawing it.
+ */
+#define ROSGD_SCREEN_PRESENT    3200u
+#define ROSGD_PRESENT_MAGIC     0x53455250u     /* "PRES" */
+#define ROSGD_PRESENT_SURFACES  1u
+#define ROSGD_SCREEN_SURF       (ROSGD_SCREEN_PRESENT + 16u)
+#define ROSGD_V2_MAGIC          0x32565352u     /* "RSV2" */
+#define ROSGD_V2_SIZE           65536u
+#define ROSGD_V2_DAMAGE         256u
+#define ROSGD_V2_SURFACES       128u
+#define ROSGD_V2_RECTS          2048u
+#define ROSGD_V2_SDAMAGE        1024u
+#define ROSGD_V2_NO_OFFSET      0xFFFFFFFFu
+#define ROSGD_SURF_WINDOW       3u
+#define ROSGD_SURF_PAGE         4u
+
+typedef struct RosgdPresent {
+    uint32_t magic, state, beat, caps;
+} RosgdPresent;
+
+typedef struct RosgdV2Rect {
+    int16_t x0, y0, x1, y1;
+} RosgdV2Rect;
+
+typedef struct RosgdV2Surface {
+    uint32_t kind, param, window, frame;
+    int16_t x, y, w, h;
+    uint32_t rects, nrects, damage, ndamage;
+    uint32_t backing, stride;
+    int16_t shadow_dx, shadow_dy, shadow_blur, shadow_strength;
+    uint32_t shadow_rects, shadow_nrects;
+    uint8_t data[32];
+} RosgdV2Surface;
+
+typedef struct RosgdV2 {
+    uint32_t magic, version, frame, full, ndamage, ack, nsurfaces, look;
+    RosgdV2Rect damage[ROSGD_V2_DAMAGE];
+    RosgdV2Surface surface[ROSGD_V2_SURFACES];
+    RosgdV2Rect rect[ROSGD_V2_RECTS];
+    RosgdV2Rect sdamage[ROSGD_V2_SDAMAGE];
+    uint64_t shm_base;          /* version 3: the region, guest-physical */
+    uint32_t shm_size, shm_used;
+    uint32_t offset[ROSGD_V2_SURFACES];
+} RosgdV2;
+
+QEMU_BUILD_BUG_ON(sizeof(RosgdV2Surface) != 96);
+QEMU_BUILD_BUG_ON(offsetof(RosgdV2, shm_base) != 38944);
+QEMU_BUILD_BUG_ON(sizeof(RosgdV2) > ROSGD_V2_SIZE);
 
 /* The backing of the resource scanout 0 shows: a copy of its iovec,
  * taken under the BQL whenever the resource or its pages change. */
@@ -170,6 +236,7 @@ static bool vg_mode(const VgBacking *b, VgMode *m, uint32_t *pal)
         m->yoffset = le32_to_cpu(blk.yoffset);
         m->block_gen = le32_to_cpu(blk.generation);
         m->described = true;
+        m->block_off = end - ROSGD_SCREEN_BLOCK;
         for (unsigned j = 0; j < 256; j++) {
             pal[j] = le32_to_cpu(blk.palette[j]);
         }
@@ -193,6 +260,96 @@ static bool vg_mode(const VgBacking *b, VgMode *m, uint32_t *pal)
     memset(pal, 0, 256 * 4);
     return m->xres && m->yres
            && (size_t)m->pitch * m->yres <= b->total;
+}
+
+/* Block v2's place in the buffer, from the surfaces table: 0 if none */
+static size_t vg_v2_offset(const VgBacking *b, const VgMode *m)
+{
+    uint32_t off = 0, magic = 0;
+
+    if (!m->described
+        || iov_to_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_SURF + 8,
+                      &off, 4) != 4) {
+        return 0;
+    }
+    off = le32_to_cpu(off);
+    if (!off || (size_t)off + ROSGD_V2_SIZE > m->block_off
+        || iov_to_buf(b->iov, b->niov, off, &magic, 4) != 4
+        || le32_to_cpu(magic) != ROSGD_V2_MAGIC) {
+        return 0;
+    }
+    return off;
+}
+
+/* The region, mapped to a host pointer once: guest RAM on the virt board
+ * is one block, so a contiguous guest-physical range is one host range.
+ * Remapped only if the box publishes another. */
+static struct {
+    uint64_t base, size;
+    void *host;
+} region;
+
+static void *vg_region(uint64_t base, uint64_t size)
+{
+    hwaddr len = size;
+
+    if (region.host && region.base == base && region.size == size) {
+        return region.host;
+    }
+    if (region.host) {
+        address_space_unmap(&address_space_memory, region.host, region.size,
+                            true, region.size);
+        region.host = NULL;
+    }
+    if (!base || !size) {
+        return NULL;
+    }
+    region.host = address_space_map(&address_space_memory, base, &len, true,
+                                    MEMTXATTRS_UNSPECIFIED);
+    if (region.host && len != size) {
+        address_space_unmap(&address_space_memory, region.host, len, true, 0);
+        region.host = NULL;
+    }
+    region.base = base;
+    region.size = size;
+    metal_log("box-v2: region &%" PRIx64 " +%" PRIu64 " MB -> host %p",
+              base, size >> 20, region.host);
+    return region.host;
+}
+
+/* Sprint 1's probe (METAL_SURFACES=probe): the presenter's area written,
+ * a beat each frame, and every list taken (the ack), so that the Wimp
+ * makes its backings in the region; nothing draws them yet */
+static void vg_probe_present(const VgBacking *b, const VgMode *m)
+{
+    static int probe = -1;
+    static uint32_t beat;
+    RosgdPresent p;
+    size_t v2;
+    uint32_t frame;
+
+    if (probe < 0) {
+        const char *e = getenv("METAL_SURFACES");
+        probe = e && !strcmp(e, "probe");
+        if (probe) {
+            metal_log("box-v2: METAL_SURFACES=probe: the presenter's area "
+                      "written, nothing drawn from the surfaces");
+        }
+    }
+    if (!probe || !m->described) {
+        return;
+    }
+    p.magic = cpu_to_le32(ROSGD_PRESENT_MAGIC);
+    p.state = cpu_to_le32(2);
+    p.beat = cpu_to_le32(++beat);
+    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES);
+    iov_from_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_PRESENT,
+                 &p, sizeof(p));
+    v2 = vg_v2_offset(b, m);
+    if (v2 && iov_to_buf(b->iov, b->niov, v2 + offsetof(RosgdV2, frame),
+                         &frame, 4) == 4 && !(le32_to_cpu(frame) & 1)) {
+        iov_from_buf(b->iov, b->niov, v2 + offsetof(RosgdV2, ack), &frame, 4);
+    }
 }
 
 /* ---- the frame's view (UI thread) --------------------------------------- */
@@ -259,6 +416,7 @@ static int vg_fb_view(MetalFbView *out)
     if (!ok || !vg_mode(&view.b, &m, view.pal)) {
         return 0;
     }
+    vg_probe_present(&view.b, &m);
 
     if (view.mode_res != view.b.res || m.xres != view.mode.xres
         || m.yres != view.mode.yres || m.pitch != view.mode.pitch
@@ -459,8 +617,102 @@ static const MetalBoard vg_board = {
     .capture        = vg_capture,
 };
 
+/* ---- info box-v2: the list, and the region read through the mapping ---- */
+
+static const char *vg_kind(uint32_t k)
+{
+    switch (k) {
+    case 1: return "clock";
+    case 2: return "monitor";
+    case ROSGD_SURF_WINDOW: return "window";
+    case ROSGD_SURF_PAGE: return "page";
+    default: return "?";
+    }
+}
+
+/*
+ * The header, the region, and each entry; for each entry with pixels in
+ * the region, its first four words read through the host's mapping and,
+ * beside them, through QEMU's memory API from the guest-physical
+ * address: the two views must agree, with nothing copied between them.
+ */
+static void hmp_info_box_v2(Monitor *mon, const QDict *qdict)
+{
+    VirtIOGPU *g = vg_device();
+    VgBacking b = { 0 };
+    uint32_t pal[256];
+    VgMode m;
+    size_t off;
+    RosgdV2 *v;
+    uint8_t *host;
+    unsigned agree = 0, differ = 0;
+
+    if (!g || !vg_backing_sync(g, &b) || !vg_mode(&b, &m, pal)) {
+        monitor_printf(mon, "box-v2: nothing is being scanned out\n");
+        g_free(b.iov);
+        return;
+    }
+    off = vg_v2_offset(&b, &m);
+    if (!off) {
+        monitor_printf(mon, "box-v2: no block v2 in the screen's buffer "
+                       "(%ux%u, %u bpp%s)\n", m.xres, m.yres, m.bpp,
+                       m.described ? "" : ", no screen block");
+        g_free(b.iov);
+        return;
+    }
+    v = g_malloc(sizeof(*v));
+    iov_to_buf(b.iov, b.niov, off, v, sizeof(*v));
+    monitor_printf(mon, "box-v2: version %u, frame %u, ack %u, %u surfaces, "
+                   "look &%x, damage %s%u\n",
+                   v->version, v->frame, v->ack, v->nsurfaces, v->look,
+                   v->full ? "full, " : "", v->ndamage);
+    host = v->version >= 3 ? vg_region(v->shm_base, v->shm_size) : NULL;
+    if (v->version >= 3 && v->shm_size) {
+        monitor_printf(mon, "region: &%" PRIx64 ", %u MB, %u KB carved, "
+                       "host %p\n", v->shm_base, v->shm_size >> 20,
+                       v->shm_used >> 10, host);
+    } else {
+        monitor_printf(mon, "region: none\n");
+    }
+    for (uint32_t k = 0; k < v->nsurfaces && k < ROSGD_V2_SURFACES; k++) {
+        const RosgdV2Surface *e = &v->surface[k];
+        uint32_t o = v->version >= 3 ? v->offset[k] : ROSGD_V2_NO_OFFSET;
+
+        monitor_printf(mon, "%3u %-7s win &%08x at %d,%d %dx%d", k,
+                       vg_kind(e->kind), e->window, e->x, e->y, e->w, e->h);
+        if (e->kind == ROSGD_SURF_WINDOW) {
+            monitor_printf(mon, " backing %u stride %u", e->backing,
+                           e->stride);
+        }
+        if (o != ROSGD_V2_NO_OFFSET && host && (uint64_t)o + 16 <= v->shm_size) {
+            uint32_t mapped[4], phys[4];
+
+            memcpy(mapped, host + o, sizeof(mapped));
+            address_space_read(&address_space_memory, v->shm_base + o,
+                               MEMTXATTRS_UNSPECIFIED, phys, sizeof(phys));
+            monitor_printf(mon, " offset &%x: %08x %08x %08x %08x %s", o,
+                           mapped[0], mapped[1], mapped[2], mapped[3],
+                           memcmp(mapped, phys, sizeof(mapped)) ? "DIFFER"
+                                                                 : "agree");
+            if (memcmp(mapped, phys, sizeof(mapped))) {
+                differ++;
+            } else {
+                agree++;
+            }
+        }
+        monitor_printf(mon, "\n");
+    }
+    if (agree || differ) {
+        monitor_printf(mon, "region reads: %u agree, %u differ\n", agree,
+                       differ);
+    }
+    g_free(v);
+    g_free(b.iov);
+}
+
 static void metal_virtio_gpu_register(void)
 {
     metal_board_register(&vg_board);
+    monitor_register_hmp("box-v2", true, hmp_info_box_v2);
 }
 type_init(metal_virtio_gpu_register);

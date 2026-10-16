@@ -231,6 +231,21 @@ SRST
     Show memory tree.
 ERST
 
+#if defined(CONFIG_METAL)
+    {
+        .name       = "box-v2",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show the ROSGD box's surfaces list and backings region",
+    },
+#endif
+
+SRST
+  ``info box-v2``
+    Show the ROSGD box's block v2: its header, the backings region and
+    each surface, the region read through the Metal window's mapping.
+ERST
+
 #if defined(CONFIG_TCG)
     {
         .name       = "jit",

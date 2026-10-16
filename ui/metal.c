@@ -111,6 +111,11 @@ int metal_glue_cursor_view(MetalCursorView *out)
     return board && board->cursor_view ? board->cursor_view(out) : 0;
 }
 
+int metal_glue_surfaces_view(MetalSurfacesView *out)
+{
+    return board && board->surfaces_view ? board->surfaces_view(out) : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Apple Events: the command table and the dispatch (SCRIPTING.md)     */
 

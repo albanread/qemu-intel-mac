@@ -80,12 +80,17 @@ typedef struct VgMode {
  *
  * The host says it is there -- that it draws the surfaces -- in the
  * block's presenter area (PRES): until it does, the Wimp makes no
- * backings and draws to the screen as before.  Sprint 1 announces only
- * when METAL_SURFACES=probe, to test the region without drawing it.
+ * backings and draws to the screen as before.  METAL_SURFACES says
+ * whether it does: on (the window composites the list), off (the screen
+ * as it is, as before design 39), or probe (PRES written and the lists
+ * taken, nothing drawn from them: sprint 1's test of the region).
  */
 #define ROSGD_SCREEN_PRESENT    3200u
 #define ROSGD_PRESENT_MAGIC     0x53455250u     /* "PRES" */
 #define ROSGD_PRESENT_SURFACES  1u
+#define ROSGD_PRESENT_WINDOWS_ONLY 2u           /* the clock's and the meter's faces are
+                                                   their tasks' own, not drawn here */
+#define ROSGD_PRESENT_REGION    4u              /* backings are drawn only from the region */
 #define ROSGD_SCREEN_SURF       (ROSGD_SCREEN_PRESENT + 16u)
 #define ROSGD_V2_MAGIC          0x32565352u     /* "RSV2" */
 #define ROSGD_V2_SIZE           65536u
@@ -317,34 +322,50 @@ static void *vg_region(uint64_t base, uint64_t size)
     return region.host;
 }
 
-/* Sprint 1's probe (METAL_SURFACES=probe): the presenter's area written,
- * a beat each frame, and every list taken (the ack), so that the Wimp
- * makes its backings in the region; nothing draws them yet */
-static void vg_probe_present(const VgBacking *b, const VgMode *m)
+/* METAL_SURFACES: 0 off, 1 probe, 2 on */
+enum { VG_SURF_OFF, VG_SURF_PROBE, VG_SURF_ON };
+
+static int vg_surfaces_mode(void)
 {
-    static int probe = -1;
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("METAL_SURFACES");
+
+        mode = !e || !strcmp(e, "off") ? VG_SURF_OFF
+             : !strcmp(e, "probe") ? VG_SURF_PROBE : VG_SURF_ON;
+        metal_log("box-v2: METAL_SURFACES=%s", mode == VG_SURF_ON ? "on: the window "
+                  "composites the surfaces" : mode == VG_SURF_PROBE ? "probe: PRES "
+                  "written, nothing drawn from the surfaces" : "off: the screen as it is");
+    }
+    return mode;
+}
+
+/* The presenter's area, written at every frame the window looks at (a
+ * beat each time); in probe mode every list is also taken (the ack), so
+ * that the Wimp makes its backings in the region with nothing drawing
+ * them -- in on mode the ack is the surfaces view's */
+static void vg_announce(const VgBacking *b, const VgMode *m)
+{
     static uint32_t beat;
+    int mode = vg_surfaces_mode();
     RosgdPresent p;
     size_t v2;
     uint32_t frame;
 
-    if (probe < 0) {
-        const char *e = getenv("METAL_SURFACES");
-        probe = e && !strcmp(e, "probe");
-        if (probe) {
-            metal_log("box-v2: METAL_SURFACES=probe: the presenter's area "
-                      "written, nothing drawn from the surfaces");
-        }
-    }
-    if (!probe || !m->described) {
+    if (mode == VG_SURF_OFF || !m->described) {
         return;
     }
     p.magic = cpu_to_le32(ROSGD_PRESENT_MAGIC);
     p.state = cpu_to_le32(2);
     p.beat = cpu_to_le32(++beat);
-    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES);
+    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION |
+                         (mode == VG_SURF_ON ? ROSGD_PRESENT_WINDOWS_ONLY : 0));
     iov_from_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_PRESENT,
                  &p, sizeof(p));
+    if (mode != VG_SURF_PROBE) {
+        return;
+    }
     v2 = vg_v2_offset(b, m);
     if (v2 && iov_to_buf(b->iov, b->niov, v2 + offsetof(RosgdV2, frame),
                          &frame, 4) == 4 && !(le32_to_cpu(frame) & 1)) {
@@ -416,7 +437,7 @@ static int vg_fb_view(MetalFbView *out)
     if (!ok || !vg_mode(&view.b, &m, view.pal)) {
         return 0;
     }
-    vg_probe_present(&view.b, &m);
+    vg_announce(&view.b, &m);
 
     if (view.mode_res != view.b.res || m.xres != view.mode.xres
         || m.yres != view.mode.yres || m.pitch != view.mode.pitch
@@ -483,6 +504,111 @@ static void vg_fb_done(void)
     g_free(view.stage);
     g_free(view.b.iov);
     memset(&view, 0, sizeof(view));
+}
+
+/* ---- the surfaces (design 39): block v2's list, for metal.m to draw ----- */
+
+/*
+ * The list, taken whole under its seqlock: a copy of block v2 while its
+ * frame is even and the same after.  Only a new frame is taken; a torn or
+ * odd one leaves `out` as the last good list.  Each window with its pixels
+ * in the region becomes a surface, its rectangles and its shadow's copied
+ * into the view's pool.  The frame taken is acked, which lets the Wimp
+ * begin its next list afresh: there is no upload to wait for, the window
+ * reading the backings where they lie.
+ */
+static int vg_surfaces_view(MetalSurfacesView *out)
+{
+    static RosgdV2 *v;
+    static uint32_t taken;
+    static int have;
+    uint32_t f0, f1;
+    size_t off;
+    void *host;
+
+    if (vg_surfaces_mode() != VG_SURF_ON || !view.g || !view.mode.described) {
+        return 0;
+    }
+    off = vg_v2_offset(&view.b, &view.mode);
+    if (!off) {
+        return have = 0;
+    }
+    if (iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, frame), &f0, 4) != 4) {
+        return have;
+    }
+    f0 = le32_to_cpu(f0);
+    if ((f0 & 1) || (have && f0 == taken)) {
+        return have;                    /* being written, or as it was */
+    }
+    if (!v) {
+        v = g_malloc(sizeof(*v));
+    }
+    iov_to_buf(view.b.iov, view.b.niov, off, v, sizeof(*v));
+    smp_rmb();
+    if (iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, frame), &f1, 4) != 4
+        || le32_to_cpu(f1) != f0 || v->frame != f0) {
+        return have;                    /* torn: the next frame's */
+    }
+    taken = f0;
+    iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, ack), &f0, 4);
+    host = NULL;
+    if (v->version >= 3 && v->shm_size) {
+        bool locked = !bql_locked();
+
+        if (locked) {
+            bql_lock();
+        }
+        host = vg_region(v->shm_base, v->shm_size);
+        if (locked) {
+            bql_unlock();
+        }
+    }
+    out->frame = f0;
+    out->region = host;
+    out->region_size = host ? v->shm_size : 0;
+    out->look = v->look;
+    out->n = 0;
+    out->nrects = 0;
+    for (uint32_t k = 0; k < v->nsurfaces && k < ROSGD_V2_SURFACES; k++) {
+        const RosgdV2Surface *e = &v->surface[k];
+        MetalSurface *d;
+        uint32_t o = v->offset[k];
+
+        if (e->kind != ROSGD_SURF_WINDOW || !e->backing || o == ROSGD_V2_NO_OFFSET || !host
+            || e->w <= 0 || e->h <= 0 || !e->stride
+            || (uint64_t)o + (uint64_t)e->stride * (uint64_t)e->h > v->shm_size) {
+            continue;
+        }
+        d = &out->s[out->n++];
+        d->x = e->x, d->y = e->y, d->w = e->w, d->h = e->h;
+        d->offset = o;
+        d->stride = e->stride;
+        d->radius = e->data[1];
+        d->shadow_dx = e->shadow_dx, d->shadow_dy = e->shadow_dy;
+        d->shadow_blur = e->shadow_blur, d->shadow_strength = e->shadow_strength;
+        d->rects = out->nrects;
+        for (uint32_t r = 0; r < e->nrects && e->rects + r < ROSGD_V2_RECTS
+             && out->nrects < METAL_SURF_RECTS; r++) {
+            const RosgdV2Rect *q = &v->rect[e->rects + r];
+
+            out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
+            out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+            out->nrects++;
+        }
+        d->nrects = out->nrects - d->rects;
+        d->shadow_rects = out->nrects;
+        for (uint32_t r = 0; e->shadow_strength > 0 && r < e->shadow_nrects
+             && e->shadow_rects + r < ROSGD_V2_RECTS && out->nrects < METAL_SURF_RECTS; r++) {
+            const RosgdV2Rect *q = &v->rect[e->shadow_rects + r];
+
+            out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
+            out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+            out->nrects++;
+        }
+        d->shadow_nrects = out->nrects - d->shadow_rects;
+    }
+    have = out->n > 0;
+    return have;
 }
 
 /* ---- the pointer: the scanout's cursor ---------------------------------- */
@@ -614,6 +740,7 @@ static const MetalBoard vg_board = {
     .fb_view        = vg_fb_view,
     .fb_done        = vg_fb_done,
     .cursor_view    = vg_cursor_view,
+    .surfaces_view  = vg_surfaces_view,
     .capture        = vg_capture,
 };
 

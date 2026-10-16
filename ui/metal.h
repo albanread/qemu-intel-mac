@@ -130,6 +130,44 @@ typedef struct MetalCursorView {
 int metal_glue_cursor_view(MetalCursorView *out);
 
 /*
+ * The surfaces the guest publishes for the host to composite (the ROSGD
+ * box's block v2, design 39): each window's backing, its pixels where
+ * they lie in the region of guest RAM the board has mapped once, drawn
+ * back to front over the backdrop, clipped to its visible rectangles,
+ * each after its shadow.  When there is a list the screen itself (the
+ * framebuffer view) is not drawn: everything shown is a surface.
+ */
+#define METAL_SURFACES      128
+#define METAL_SURF_RECTS    2048
+typedef struct MetalSurface {
+    int16_t x, y, w, h;             /* on the screen, guest pixels, y down */
+    uint32_t offset, stride;        /* its pixels in the region: R G B A bytes,
+                                       premultiplied, alpha &80 a hole */
+    uint32_t rects, nrects;         /* visible: a range of the view's rect pool */
+    uint32_t shadow_rects, shadow_nrects;   /* where its shadow shows */
+    int16_t shadow_dx, shadow_dy, shadow_blur, shadow_strength;
+    uint16_t radius;                /* its corners, guest pixels: the shadow's */
+} MetalSurface;
+typedef struct MetalSurfacesView {
+    uint32_t frame;                 /* the list's frame: moves when anything does */
+    void *region;                   /* the host's mapping of the region */
+    uint64_t region_size;
+    uint32_t look;                  /* the depth the desktop asked for (screen.h) */
+    uint32_t n;
+    MetalSurface s[METAL_SURFACES];
+    uint32_t nrects;
+    int16_t rect[METAL_SURF_RECTS][4];  /* x0 y0 x1 y1, half-open */
+} MetalSurfacesView;
+
+/*
+ * Fill `out` with the guest's current list, taken whole under its
+ * seqlock (a torn read keeps the last good one).  Returns 1 when there
+ * is a list to composite, 0 when the screen is to be drawn as it is.
+ * Thread: UI only, after metal_glue_fb_view.
+ */
+int metal_glue_surfaces_view(MetalSurfacesView *out);
+
+/*
  * Input, called from the UI thread's event handlers.  Each call takes the
  * BQL just long enough to run the QEMU input API, the way cocoa's
  * with_bql does; nothing else of QEMU is touched.

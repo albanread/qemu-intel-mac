@@ -56,6 +56,9 @@ typedef struct MetalBoard {
     /* The contract of metal_glue_cursor_view (metal.h). */
     int (*cursor_view)(MetalCursorView *out);
 
+    /* The contract of metal_glue_surfaces_view (metal.h); NULL: none. */
+    int (*surfaces_view)(MetalSurfacesView *out);
+
     /* BQL held.  0 with *c filled, or -1 with *errmsg a literal. */
     int (*capture)(MetalCapture *c, const char **errmsg);
 

@@ -2497,6 +2497,238 @@ static bool metal_pointer_is_echo(int32_t gx, int32_t gy)
     return abs(mouse.gx - gx) <= 1 && abs(mouse.gy - gy) <= 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* The surfaces pass (design 39): the box's windows, composited here   */
+
+/*
+ * The ROSGD box publishes its windows as surfaces (block v2): each a
+ * backing whose pixels lie in one region of guest RAM, which the board
+ * has mapped once and which is wrapped here, once, as an MTLBuffer with
+ * no copy.  Each frame with a list, the guest-sized texture the decode
+ * pass would fill is cleared to transparent and the surfaces are drawn
+ * into it, back to front: for each, its shadow (darkening what is
+ * already there, the PC presenter's rounded-box field), then its pixels,
+ * read where the Wimp drew them -- nothing is uploaded.  The scale pass
+ * then lays that over the backdrop as it lays the decoded screen.
+ */
+static NSString *const SURF_SRC = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct SQuad {\n"
+"    float4 rect;    /* where it draws: x0 y0 x1 y1, guest pixels */\n"
+"    float4 box;     /* the surface (or the shadow's dropped box): x y w h */\n"
+"    uint4 u;        /* offset, stride (bytes), kind (0 pixels, 1 shadow), 0 */\n"
+"    float4 sh;      /* shadow: radius, blur, strength 0..1, 0 */\n"
+"};\n"
+"struct SOut {\n"
+"    float4 pos [[position]];\n"
+"    uint inst [[flat]];\n"
+"};\n"
+"vertex SOut vs_surf(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
+"                    device const SQuad *q [[buffer(0)]],\n"
+"                    constant float2 &screen [[buffer(1)]])\n"
+"{\n"
+"    float4 r = q[iid].rect;\n"
+"    float2 c = float2((vid & 1) ? r.z : r.x, (vid & 2) ? r.w : r.y);\n"
+"    SOut o;\n"
+"    o.pos = float4(c.x / screen.x * 2.0 - 1.0, 1.0 - c.y / screen.y * 2.0, 0.0, 1.0);\n"
+"    o.inst = iid;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 ps_surf(SOut in [[stage_in]],\n"
+"                        device const SQuad *q [[buffer(0)]],\n"
+"                        device const uint *region [[buffer(1)]])\n"
+"{\n"
+"    SQuad Q = q[in.inst];\n"
+"    float2 p = in.pos.xy;\n"
+"    if (Q.u.z == 1) {\n"
+"        /* the shadow: strength falling off with the distance to the\n"
+"         * dropped box, rounded by the window's corners, over the blur */\n"
+"        float2 h = Q.box.zw * 0.5;\n"
+"        float r = min(Q.sh.x, min(h.x, h.y));\n"
+"        float2 d = abs(p - (Q.box.xy + h)) - (h - float2(r));\n"
+"        float dist = max(length(max(d, float2(0.0))) - r, 0.0);\n"
+"        float t = clamp(1.0 - dist / max(Q.sh.y, 1.0), 0.0, 1.0);\n"
+"        return float4(0.0, 0.0, 0.0, Q.sh.z * t * t * (3.0 - 2.0 * t));\n"
+"    }\n"
+"    int2 l = int2(floor(p - Q.box.xy));\n"
+"    if (l.x < 0 || l.y < 0 || l.x >= int(Q.box.z) || l.y >= int(Q.box.w)) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    uint w = region[(Q.u.x + uint(l.y) * Q.u.y) / 4 + uint(l.x)];\n"
+"    if ((w >> 24) == 0x80) {\n"
+"        return float4(0.0);     /* the below tag: a hole to the backdrop */\n"
+"    }\n"
+"    return float4(float(w & 255), float((w >> 8) & 255), float((w >> 16) & 255),\n"
+"                  float(w >> 24)) / 255.0;  /* premultiplied */\n"
+"}\n";
+
+typedef struct SQuad {
+    float rect[4];
+    float box[4];
+    uint32_t u[4];
+    float sh[4];
+} SQuad;
+
+#define SURF_QUADS 8192
+
+static struct {
+    bool tried;
+    id<MTLRenderPipelineState> pipe;
+    id<MTLBuffer> region;               /* the guest's region, no copy */
+    void *region_host;
+    uint64_t region_size;
+    id<MTLBuffer> quads[METAL_RING];
+    unsigned ring;
+    MetalSurfacesView view;
+    bool on;                            /* this frame composites the list */
+    uint32_t drawn_frame;
+    uint64_t frames, quads_drawn;
+} surf;
+
+static bool surf_build(void)
+{
+    NSError *err = nil;
+    MTLCompileOptions *opts;
+    id<MTLLibrary> lib;
+    id<MTLFunction> vs, fs;
+    MTLRenderPipelineDescriptor *pd;
+
+    if (surf.tried) {
+        return surf.pipe != nil;
+    }
+    surf.tried = true;
+    opts = [[MTLCompileOptions alloc] init];
+    lib = [m.device newLibraryWithSource:SURF_SRC options:opts error:&err];
+    [opts release];
+    if (!lib) {
+        metal_log("surfaces: shader compile failed: %s",
+                  [[err localizedDescription] UTF8String]);
+        return false;
+    }
+    vs = [lib newFunctionWithName:@"vs_surf"];
+    fs = [lib newFunctionWithName:@"ps_surf"];
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    surf.pipe = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    [vs release];
+    [fs release];
+    [lib release];
+    if (!surf.pipe) {
+        metal_log("surfaces: pipeline failed: %s", [[err localizedDescription] UTF8String]);
+        return false;
+    }
+    for (unsigned i = 0; i < METAL_RING; i++) {
+        surf.quads[i] = [m.device newBufferWithLength:SURF_QUADS * sizeof(SQuad)
+                                              options:MTLResourceStorageModeShared];
+    }
+    metal_log("surfaces: pipeline up");
+    return true;
+}
+
+/* The region as a buffer: made once, again only if the guest names another */
+static bool surf_region(void)
+{
+    MetalSurfacesView *v = &surf.view;
+
+    if (surf.region && surf.region_host == v->region && surf.region_size == v->region_size) {
+        return true;
+    }
+    [surf.region release];
+    surf.region = nil;
+    surf.region_host = v->region;
+    surf.region_size = v->region_size;
+    if (!v->region || !v->region_size) {
+        return false;
+    }
+    surf.region = [m.device newBufferWithBytesNoCopy:v->region length:v->region_size
+                                             options:MTLResourceStorageModeShared
+                                         deallocator:nil];
+    metal_log("surfaces: region %p +%llu MB %s", v->region,
+              (unsigned long long)(v->region_size >> 20),
+              surf.region ? "wrapped, no copy" : "NOT wrapped");
+    return surf.region != nil;
+}
+
+/* The list's quads into this frame's buffer: n of them */
+static uint32_t surf_quads(SQuad *q)
+{
+    const MetalSurfacesView *v = &surf.view;
+    uint32_t n = 0;
+
+    for (uint32_t i = 0; i < v->n; i++) {
+        const MetalSurface *e = &v->s[i];
+
+        for (uint32_t k = 0; k < e->shadow_nrects && n < SURF_QUADS; k++) {
+            const int16_t *r = v->rect[e->shadow_rects + k];
+            SQuad *o = &q[n++];
+
+            o->rect[0] = r[0], o->rect[1] = r[1], o->rect[2] = r[2], o->rect[3] = r[3];
+            o->box[0] = e->x + e->shadow_dx, o->box[1] = e->y + e->shadow_dy;
+            o->box[2] = e->w, o->box[3] = e->h;
+            o->u[0] = 0, o->u[1] = 0, o->u[2] = 1, o->u[3] = 0;
+            o->sh[0] = e->radius, o->sh[1] = e->shadow_blur;
+            o->sh[2] = e->shadow_strength / 255.0f, o->sh[3] = 0;
+        }
+        for (uint32_t k = 0; k < e->nrects && n < SURF_QUADS; k++) {
+            const int16_t *r = v->rect[e->rects + k];
+            SQuad *o = &q[n++];
+
+            o->rect[0] = r[0], o->rect[1] = r[1], o->rect[2] = r[2], o->rect[3] = r[3];
+            o->box[0] = e->x, o->box[1] = e->y, o->box[2] = e->w, o->box[3] = e->h;
+            o->u[0] = e->offset, o->u[1] = e->stride, o->u[2] = 0, o->u[3] = 0;
+            memset(o->sh, 0, sizeof(o->sh));
+        }
+    }
+    return n;
+}
+
+/* This frame's surfaces into fb.decoded, in place of the decode pass */
+static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLRenderCommandEncoder> enc;
+    id<MTLBuffer> qb = surf.quads[surf.ring];
+    float screen[2] = { (float)xres, (float)yres };
+    uint32_t n;
+
+    surf.ring = (surf.ring + 1) % METAL_RING;
+    n = surf_quads((SQuad *)[qb contents]);
+    rp.colorAttachments[0].texture = fb.decoded;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (n) {
+        [enc setRenderPipelineState:surf.pipe];
+        [enc setVertexBuffer:qb offset:0 atIndex:0];
+        [enc setVertexBytes:screen length:sizeof(screen) atIndex:1];
+        [enc setFragmentBuffer:qb offset:0 atIndex:0];
+        [enc setFragmentBuffer:surf.region offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+              instanceCount:n];
+    }
+    [enc endEncoding];
+    surf.frames++;
+    surf.quads_drawn += n;
+    if (surf.frames % 300 == 1) {
+        metal_log("surfaces: frame %u, %u surfaces, %u quads (%llu frames drawn)",
+                  surf.view.frame, surf.view.n, n, (unsigned long long)surf.frames);
+    }
+}
+
+static bool metal_screenshot_to(NSString *path);
+
 static bool metal_render_frame(void)
 {
     MetalFbView v;
@@ -2538,6 +2770,42 @@ static bool metal_render_frame(void)
         }
     }
 
+    /* METAL_SHOT_DIR/shot.request, a file a test writes with a name in
+     * it: a frame is drawn now, and on the next pass the composite goes
+     * to METAL_SHOT_DIR/<name>.png and the request is removed -- a picture
+     * of what the window shows, when asked, idle desktop or not */
+    {
+        static char want[256];
+        static int tick;
+        const char *dir = getenv("METAL_SHOT_DIR");
+
+        if (want[0]) {
+            NSString *path = [NSString stringWithFormat:@"%s/%s.png", dir, want];
+            bool ok = metal_screenshot_to(path);
+
+            metal_log("shot: %s.png %s", want, ok ? "written" : "FAILED");
+            want[0] = 0;
+        } else if (dir && *dir && ++tick % 6 == 0) {
+            char req[512];
+            FILE *f;
+
+            snprintf(req, sizeof(req), "%s/shot.request", dir);
+            f = fopen(req, "r");
+            if (f) {
+                if (!fgets(want, sizeof(want), f)) {
+                    snprintf(want, sizeof(want), "shot");
+                }
+                want[strcspn(want, "\r\n /")] = 0;
+                if (!want[0]) {
+                    snprintf(want, sizeof(want), "shot");
+                }
+                fclose(f);
+                unlink(req);
+                frame_wanted = true;
+            }
+        }
+    }
+
     have_fb = metal_glue_fb_view(&v) != 0;
     if (have_fb) {
         mouse.gxres = v.xres;           /* the mouse maps onto this screen */
@@ -2556,6 +2824,9 @@ static bool metal_render_frame(void)
     } else if (frame_count % 300 == 0) {
         metal_log("frame %u: no fb view yet", frame_count);
     }
+    /* the guest's surfaces, if it publishes a list: then they, and not the
+     * screen, are what is shown (design 39) */
+    surf.on = have_fb && metal_glue_surfaces_view(&surf.view) && surf_build() && surf_region();
 
     /* Power: nothing new, no frame (and nothing copied, decoded or
      * presented); the loop sleeps instead */
@@ -2571,11 +2842,13 @@ static bool metal_render_frame(void)
         }
         if (have_fb && v.content && !frame_wanted && v.content == drawn_content
             && v.generation == drawn_gen && pgen == ptr.generation
-            && size.width == drawn_size.width && size.height == drawn_size.height) {
+            && size.width == drawn_size.width && size.height == drawn_size.height
+            && (!surf.on || surf.view.frame == surf.drawn_frame)) {
             frame_skipped = true;
             return have_fb;
         }
         frame_wanted = false;
+        surf.drawn_frame = surf.on ? surf.view.frame : 0;
         drawn_content = have_fb ? v.content : 0;
         drawn_gen = have_fb ? v.generation : 0;
         drawn_size = size;
@@ -2593,7 +2866,9 @@ static bool metal_render_frame(void)
     cb = [m.queue commandBuffer];
 
     if (have_fb) {
-        fb_upload(&v);
+        if (!surf.on) {
+            fb_upload(&v);              /* the screen; a list's surfaces are read in place */
+        }
 
         target = m.layer.drawableSize;
         params.dim[0] = v.xres;
@@ -2633,7 +2908,11 @@ static bool metal_render_frame(void)
         fb.yoff = v.yoffset;
         fb.pixo = v.pixo;
 
-        /* decode pass: raw bytes -> linear RGB */
+        /* decode pass: raw bytes -> linear RGB; or, with a list, the
+         * surfaces in its place */
+        if (surf.on) {
+            surf_draw(cb, v.xres, v.yres);
+        } else {
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = fb.decoded;
         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -2646,6 +2925,7 @@ static bool metal_render_frame(void)
         [enc drawPrimitives:MTLPrimitiveTypeTriangle
                 vertexStart:0 vertexCount:3];
         [enc endEncoding];
+        }
     }
 
     /* scale pass: the decoded surface over the whole content view */

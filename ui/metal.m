@@ -2729,8 +2729,39 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
 
 static bool metal_screenshot_to(NSString *path);
 
+/* Pacing (design 39): frames presented each second, to metal-debug.txt
+ * for each second that presented any, and once when it falls idle -- an
+ * idle desktop is to present none */
+static uint32_t pace_presented;
+static uint32_t pace_why[6];            /* why: screen, mode, pointer, size, list, asked */
+
+static void metal_pace(void)
+{
+    static double t0;
+    static uint32_t last;
+    double now = CFAbsoluteTimeGetCurrent();
+
+    if (!t0) {
+        t0 = now;
+    }
+    if (now - t0 < 1.0) {
+        return;
+    }
+    if (pace_presented || last) {
+        metal_log("pace: %u frames presented in %.2f s%s (screen %u mode %u pointer %u "
+                  "size %u list %u asked %u)", pace_presented, now - t0,
+                  surf.on ? ", from the surfaces" : "", pace_why[0], pace_why[1],
+                  pace_why[2], pace_why[3], pace_why[4], pace_why[5]);
+    }
+    last = pace_presented;
+    pace_presented = 0;
+    memset(pace_why, 0, sizeof(pace_why));
+    t0 = now;
+}
+
 static bool metal_render_frame(void)
 {
+    metal_pace();
     MetalFbView v;
     id<CAMetalDrawable> drawable;
     id<MTLCommandBuffer> cb;
@@ -2846,6 +2877,24 @@ static bool metal_render_frame(void)
             && (!surf.on || surf.view.frame == surf.drawn_frame)) {
             frame_skipped = true;
             return have_fb;
+        }
+        if (!have_fb || !v.content || v.content != drawn_content) {
+            pace_why[0]++;
+        }
+        if (have_fb && v.generation != drawn_gen) {
+            pace_why[1]++;
+        }
+        if (pgen != ptr.generation) {
+            pace_why[2]++;
+        }
+        if (size.width != drawn_size.width || size.height != drawn_size.height) {
+            pace_why[3]++;
+        }
+        if (surf.on && surf.view.frame != surf.drawn_frame) {
+            pace_why[4]++;
+        }
+        if (frame_wanted) {
+            pace_why[5]++;
         }
         frame_wanted = false;
         surf.drawn_frame = surf.on ? surf.view.frame : 0;
@@ -3057,6 +3106,7 @@ static bool metal_render_frame(void)
     }];
     [cb presentDrawable:drawable];
     [cb commit];
+    pace_presented++;
     return have_fb;
 }
 

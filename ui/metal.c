@@ -118,6 +118,13 @@ int metal_glue_surfaces_view(MetalSurfacesView *out)
     return board && board->surfaces_view ? board->surfaces_view(out) : 0;
 }
 
+void metal_glue_beat(void)
+{
+    if (board && board->beat) {
+        board->beat();
+    }
+}
+
 bool metal_glue_surfaces_pending(void)
 {
     return board && board->surfaces_pending && board->surfaces_pending();

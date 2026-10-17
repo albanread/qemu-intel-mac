@@ -3187,10 +3187,15 @@ static void surf_take(void)
  */
 static void *surf_taker(void *arg)
 {
+    unsigned n = 0;
+
     (void)arg;
     for (;;) {
         usleep(500);
         pthread_mutex_lock(&surf.mx);
+        if (++n % 200 == 0) {
+            metal_glue_beat();          /* ten a second, a frame drawn or not */
+        }
         if (surf.on && metal_glue_surfaces_pending()) {
             metal_glue_surfaces_view(&surf.taken);
             @autoreleasepool {

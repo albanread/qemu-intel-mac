@@ -202,6 +202,7 @@ int metal_glue_surfaces_view(MetalSurfacesView *out);
  * into them again (block v2's ack) */
 void metal_glue_surfaces_ack(uint32_t frame);
 bool metal_glue_surfaces_pending(void);
+void metal_glue_beat(void);
 
 #ifdef __OBJC__
 /* metal-browser.m: the host channel and the browser's pages, for metal.m */

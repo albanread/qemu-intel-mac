@@ -444,6 +444,19 @@ static bool vg_stage_sync(size_t need)
     return changed;
 }
 
+/* The presenter's beat without a frame: the window's taker keeps it going
+ * while the render loop waits for a drawable (a window covered or
+ * minimised waits most of a second each time).  The Wimp makes a new
+ * window a surface only while the beat is fresh; stale, the windows a
+ * program opened then were left to the screen memory nobody shows, and
+ * came out black. */
+static void vg_beat(void)
+{
+    if (view.g && view.mode.described) {
+        vg_announce(&view.b, &view.mode);
+    }
+}
+
 static int vg_fb_view(MetalFbView *out)
 {
     bool locked = !bql_locked();
@@ -968,6 +981,7 @@ static const MetalBoard vg_board = {
     .surfaces_view  = vg_surfaces_view,
     .surfaces_ack   = vg_surfaces_ack,
     .surfaces_pending = vg_surfaces_pending,
+    .beat           = vg_beat,
     .capture        = vg_capture,
 };
 

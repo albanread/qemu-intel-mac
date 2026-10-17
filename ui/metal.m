@@ -3496,14 +3496,6 @@ static bool metal_render_frame(void)
     }
     if (surf.on) {
         surf.view = surf.taken;         /* this frame's list, and the copies are its */
-        if (!surf.taker) {
-            pthread_t t;
-
-            surf.taker = pthread_create(&t, NULL, surf_taker, NULL) == 0;
-            if (surf.taker) {
-                pthread_detach(t);
-            }
-        }
     }
     pthread_mutex_unlock(&surf.mx);
     /* the box's browser, the Mac's WebKit: its lines answered and its
@@ -4941,6 +4933,18 @@ int metal_backend_main(void)
              * uncovered), and allowsNextDrawableTimeout is what keeps an
              * unseen window from wedging the loop -- nextDrawable gives
              * up and returns nil rather than blocking for ever. */
+            if (!surf.taker) {
+                /* the taker from the first pass, frame or none: it keeps
+                 * the presenter's beat, which a window that is not drawing
+                 * (minimised, hidden) would otherwise leave stale or never
+                 * write -- and the Wimp would make no window a surface */
+                pthread_t t;
+
+                surf.taker = pthread_create(&t, NULL, surf_taker, NULL) == 0;
+                if (surf.taker) {
+                    pthread_detach(t);
+                }
+            }
             if ([m.window isMiniaturized] || ![m.window isVisible]) {
                 usleep(50 * 1000);
                 continue;

@@ -452,8 +452,24 @@ static bool vg_stage_sync(size_t need)
  * came out black. */
 static void vg_beat(void)
 {
-    if (view.g && view.mode.described) {
-        vg_announce(&view.b, &view.mode);
+    bool locked = !bql_locked();
+    bool ok;
+    VgMode m;
+
+    /* the screen's mode read here, not taken from a frame: a window that
+     * has never drawn one (hidden from the start) announces itself too */
+    if (locked) {
+        bql_lock();
+    }
+    if (!view.g) {
+        view.g = vg_device();
+    }
+    ok = view.g && vg_backing_sync(view.g, &view.b);
+    if (locked) {
+        bql_unlock();
+    }
+    if (ok && vg_mode(&view.b, &m, view.pal)) {
+        vg_announce(&view.b, &m);
     }
 }
 

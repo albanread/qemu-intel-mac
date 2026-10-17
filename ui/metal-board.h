@@ -58,6 +58,10 @@ typedef struct MetalBoard {
 
     /* The contract of metal_glue_surfaces_view (metal.h); NULL: none. */
     int (*surfaces_view)(MetalSurfacesView *out);
+    /* The list of that frame is copied: tell the guest (its ack). */
+    void (*surfaces_ack)(uint32_t frame);
+    /* A list published and not yet taken (cheap: the idle loop asks). */
+    bool (*surfaces_pending)(void);
 
     /* BQL held.  0 with *c filled, or -1 with *errmsg a literal. */
     int (*capture)(MetalCapture *c, const char **errmsg);

@@ -155,6 +155,7 @@ typedef struct MetalSurface {
      * pool from damage, in its own pixels -- for a window that keeps
      * copies of the backings in a GPU's own memory */
     uint32_t damage, ndamage;
+    uint32_t window;                /* the Wimp's handle: a backing's copy is its */
 } MetalSurface;
 #define METAL_DAMAGE_ALL 0xFFFFFFFFu
 /* An icon whose picture the window draws itself (screen.h's
@@ -197,6 +198,20 @@ typedef struct MetalSurfacesView {
  * Thread: UI only, after metal_glue_fb_view.
  */
 int metal_glue_surfaces_view(MetalSurfacesView *out);
+/* The list of that frame copied out of the backings: the guest may draw
+ * into them again (block v2's ack) */
+void metal_glue_surfaces_ack(uint32_t frame);
+bool metal_glue_surfaces_pending(void);
+
+#ifdef __OBJC__
+/* metal-browser.m: the host channel and the browser's pages, for metal.m */
+#import <Cocoa/Cocoa.h>
+void metal_browser_tick(NSWindow *win, NSView *view, const MetalSurfacesView *sv,
+                        uint32_t xres, uint32_t yres);
+bool metal_browser_shown(void);
+void metal_browser_place(void);
+bool metal_browser_covers(NSPoint p);
+#endif
 
 /* The directory the box's share is (its 9p fsdev "host"), or NULL: where
  * the host's browser saves downloads (metal-browser.m) */

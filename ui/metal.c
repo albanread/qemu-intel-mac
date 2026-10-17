@@ -118,6 +118,18 @@ int metal_glue_surfaces_view(MetalSurfacesView *out)
     return board && board->surfaces_view ? board->surfaces_view(out) : 0;
 }
 
+bool metal_glue_surfaces_pending(void)
+{
+    return board && board->surfaces_pending && board->surfaces_pending();
+}
+
+void metal_glue_surfaces_ack(uint32_t frame)
+{
+    if (board && board->surfaces_ack) {
+        board->surfaces_ack(frame);
+    }
+}
+
 const char *metal_glue_share_path(void)
 {
     QemuOptsList *l = qemu_find_opts_err("fsdev", NULL);

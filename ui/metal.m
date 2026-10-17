@@ -26,6 +26,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreServices/CoreServices.h>
 
@@ -447,6 +448,16 @@ static void metal_mouse_move(NSEvent *e)
          * measures up from the bottom of the view; the guest counts
          * rows down from the top. */
         p = [m.view convertPoint:[e locationInWindow] fromView:nil];
+        {
+            /* over a page the Mac's cursor is shown, in WebKit's shape;
+             * the guest's pointer is under the page there */
+            bool in = !metal_browser_covers(p) && NSPointInRect(p, b);
+
+            if (in != cursor.inside) {
+                cursor.inside = in;
+                metal_cursor_sync();
+            }
+        }
         metal_mouse_send_abs(
             (int)(p.x * (mouse.gxres - 1) / (NSWidth(b) - 1)),
             (int)((NSHeight(b) - p.y) * (mouse.gyres - 1) / (NSHeight(b) - 1)));
@@ -2583,9 +2594,18 @@ static bool metal_pointer_is_echo(int32_t gx, int32_t gy)
  * no copy.  Each frame with a list, the guest-sized texture the decode
  * pass would fill is cleared to transparent and the surfaces are drawn
  * into it, back to front: for each, its shadow (darkening what is
- * already there, the PC presenter's rounded-box field), then its pixels,
- * read where the Wimp drew them -- nothing is uploaded.  The scale pass
- * then lays that over the backdrop as it lays the decoded screen.
+ * already there, the PC presenter's rounded-box field), then its pixels.
+ * The scale pass then lays that over the backdrop as it lays the decoded
+ * screen.
+ *
+ * The pixels are never read where the Wimp draws them.  The Wimp
+ * publishes a list when every backing is whole (at Wimp_Poll), and the
+ * next task begins drawing at once: a frame read from the backings
+ * themselves showed windows cleared and half drawn, flickering.  So each
+ * new list's damage is copied, by the GPU, into a texture per backing,
+ * and the list is acked only when the copy is done; the Wimp draws into
+ * no backing till then (ROSGD_PRESENT_SNAPSHOT).  Every frame shown is a
+ * list exactly as it was published.
  */
 static NSString *const SURF_SRC = @
 "#include <metal_stdlib>\n"
@@ -2831,9 +2851,9 @@ typedef struct SQuad {
  * damage each new list carries; let go when unused a while */
 #define SURF_TEX 160
 static struct {
-    uint32_t offset, w, h, stride;
+    uint32_t window, offset, w, h, stride;
     id<MTLTexture> tex;
-    uint32_t idle;                      /* frames since it was last drawn */
+    uint32_t idle;                      /* lists since it was last in one */
 } stex[SURF_TEX];
 
 /* per surface of the frame: its quads in the buffer, shadow then pixels */
@@ -2853,11 +2873,12 @@ static struct {
     id<MTLRenderPipelineState> face;    /* the clock's and the meter's, into the drawable */
     id<MTLRenderPipelineState> tex_pipe;    /* the surfaces from their GPU copies */
     bool tex_mode;                      /* a GPU without unified memory: copies */
-    uint32_t uploaded_frame, uploaded_pages;    /* the list whose damage is in the copies */
+    uint32_t uploaded_frame;            /* the list whose damage is in the copies */
     id<MTLRenderPipelineState> face_shot;   /* the same, into a screenshot's RGBA texture */
     uint32_t drawn_frame, drawn_pages;
     double face_due;                    /* when a listed clock is next to be drawn */
     uint64_t frames, quads_drawn;
+    uint64_t copied, copies;            /* bytes copied out of the backings, lists copied */
 } surf;
 
 static bool surf_build(void)
@@ -2901,12 +2922,13 @@ static bool surf_build(void)
         surf.tex_pipe = tfs ? [m.device newRenderPipelineStateWithDescriptor:pd error:nil] : nil;
         [tfs release];
     }
-    /* copies in the GPU's memory where it has its own: reading guest RAM
-     * across the bus for every pixel of every frame drew 8 frames a second
-     * on the Mac Pro's Radeon (METAL_SURF_TEXTURES=1 forces it, to test) */
-    surf.tex_mode = surf.tex_pipe && (![m.device hasUnifiedMemory] || getenv("METAL_SURF_TEXTURES"));
-    metal_log("surfaces: %s", surf.tex_mode ? "copies of the backings in the GPU's memory, "
-              "kept by their damage" : "the backings read where they lie, no copy");
+    /* copies of the backings, on every GPU: a list as it was published,
+     * never the Wimp part way through its next (and on a GPU with memory
+     * of its own, not guest RAM read across the bus for every pixel of
+     * every frame, which drew 8 frames a second on the Mac Pro's Radeon) */
+    surf.tex_mode = surf.tex_pipe != nil;
+    metal_log("surfaces: %s", surf.tex_mode ? "copies of the backings, kept by their damage"
+                                            : "NO copies: the backings read where they lie");
     [pd release];
     [vs release];
     [fs release];
@@ -3015,58 +3037,139 @@ static uint32_t surf_quads(SQuad *q)
     return n;
 }
 
-/* A backing's copy: found or made (whole); brought up to date with the
- * damage when this is a list not yet taken into the copies */
-static id<MTLTexture> surf_texture(const MetalSurface *e, bool fresh_list)
+/* A backing's copy, found by its window and place in the region; made
+ * (and *whole set) when there is none.  nil: no room for another. */
+static id<MTLTexture> surf_texture(const MetalSurface *e, bool *whole)
 {
-    const MetalSurfacesView *v = &surf.view;
-    const uint8_t *src = (const uint8_t *)v->region + e->offset;
     int k, spare = -1;
-    bool whole = false;
 
+    *whole = false;
     for (k = 0; k < SURF_TEX; k++) {
-        if (stex[k].tex && stex[k].offset == e->offset && stex[k].w == (uint32_t)e->w
-            && stex[k].h == (uint32_t)e->h && stex[k].stride == e->stride) {
-            break;
+        if (stex[k].tex && stex[k].window == e->window && stex[k].offset == e->offset
+            && stex[k].w == (uint32_t)e->w && stex[k].h == (uint32_t)e->h
+            && stex[k].stride == e->stride) {
+            return stex[k].tex;
         }
         if (spare < 0 && (!stex[k].tex || stex[k].idle > 120)) {
             spare = k;
         }
     }
-    if (k == SURF_TEX) {
-        MTLTextureDescriptor *td;
-
-        if (spare < 0) {
-            return nil;
-        }
-        k = spare;
-        [stex[k].tex release];
-        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                width:e->w height:e->h
-                                                            mipmapped:NO];
-        td.usage = MTLTextureUsageShaderRead;
-        td.storageMode = [m.device hasUnifiedMemory] ? MTLStorageModeShared : MTLStorageModeManaged;
-        stex[k].tex = [m.device newTextureWithDescriptor:td];
-        stex[k].offset = e->offset, stex[k].w = e->w, stex[k].h = e->h, stex[k].stride = e->stride;
-        whole = true;
+    if (spare < 0) {
+        return nil;
     }
+    k = spare;
+    [stex[k].tex release];
+    {
+        MTLTextureDescriptor *td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:e->w height:e->h
+                                                           mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        stex[k].tex = [m.device newTextureWithDescriptor:td];
+    }
+    stex[k].window = e->window, stex[k].offset = e->offset;
+    stex[k].w = e->w, stex[k].h = e->h, stex[k].stride = e->stride;
     stex[k].idle = 0;
-    if (whole || (fresh_list && e->ndamage == METAL_DAMAGE_ALL)) {
-        [stex[k].tex replaceRegion:MTLRegionMake2D(0, 0, e->w, e->h) mipmapLevel:0
-                         withBytes:src bytesPerRow:e->stride];
-    } else if (fresh_list) {
-        for (uint32_t r = 0; r < e->ndamage; r++) {
-            const int16_t *q = v->rect[e->damage + r];
-            int x0 = MAX(q[0], 0), y0 = MAX(q[1], 0), x1 = MIN(q[2], e->w), y1 = MIN(q[3], e->h);
+    *whole = stex[k].tex != nil;
+    return stex[k].tex;
+}
 
-            if (x1 > x0 && y1 > y0) {
-                [stex[k].tex replaceRegion:MTLRegionMake2D(x0, y0, x1 - x0, y1 - y0) mipmapLevel:0
-                                 withBytes:src + (size_t)y0 * e->stride + (size_t)x0 * 4
-                               bytesPerRow:e->stride];
+/* A backing's copy if it has one */
+static id<MTLTexture> surf_texture_of(const MetalSurface *e)
+{
+    for (int k = 0; k < SURF_TEX; k++) {
+        if (stex[k].tex && stex[k].window == e->window && stex[k].offset == e->offset
+            && stex[k].w == (uint32_t)e->w && stex[k].h == (uint32_t)e->h
+            && stex[k].stride == e->stride) {
+            return stex[k].tex;
+        }
+    }
+    return nil;
+}
+
+/* The copy of one backing's rectangle into its texture */
+static void surf_blit(id<MTLBlitCommandEncoder> b, id<MTLTexture> t, const MetalSurface *e,
+                      int x0, int y0, int x1, int y1)
+{
+    x0 = MAX(x0, 0), y0 = MAX(y0, 0), x1 = MIN(x1, e->w), y1 = MIN(y1, e->h);
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    [b copyFromBuffer:surf.region
+         sourceOffset:e->offset + (NSUInteger)y0 * e->stride + (NSUInteger)x0 * 4
+    sourceBytesPerRow:e->stride
+  sourceBytesPerImage:(NSUInteger)e->stride * (NSUInteger)(y1 - y0)
+           sourceSize:MTLSizeMake(x1 - x0, y1 - y0, 1)
+            toTexture:t
+     destinationSlice:0
+     destinationLevel:0
+    destinationOrigin:MTLOriginMake(x0, y0, 0)];
+}
+
+/* A new list taken: its damage copied out of the backings into their
+ * textures, by the GPU, waited for, and then the list acked -- the Wimp
+ * draws into the backings again only after that.  Called at every pass of
+ * the loop, a frame presented or not (and with the window minimised), so
+ * that the Wimp is never kept waiting for a frame nobody sees. */
+static void surf_take(void)
+{
+    const MetalSurfacesView *v = &surf.view;
+    id<MTLCommandBuffer> cb;
+    id<MTLBlitCommandEncoder> b = nil;
+    uint64_t bytes = 0;
+
+    if (v->frame == surf.uploaded_frame) {
+        return;
+    }
+    if (surf.on && surf.tex_mode) {
+        for (int k = 0; k < SURF_TEX; k++) {
+            stex[k].idle++;
+        }
+        cb = [m.queue commandBuffer];
+        for (uint32_t i = 0; i < v->n; i++) {
+            const MetalSurface *e = &v->s[i];
+            bool whole;
+            id<MTLTexture> t;
+
+            if (e->format != 0 || !(t = surf_texture(e, &whole))) {
+                continue;
+            }
+            for (int k = 0; k < SURF_TEX; k++) {
+                if (stex[k].tex == t) {
+                    stex[k].idle = 0;
+                }
+            }
+            if (!whole && e->ndamage == 0) {
+                continue;
+            }
+            if (!b) {
+                b = [cb blitCommandEncoder];
+            }
+            if (whole || e->ndamage == METAL_DAMAGE_ALL) {
+                surf_blit(b, t, e, 0, 0, e->w, e->h);
+                bytes += (uint64_t)e->w * e->h * 4;
+            } else {
+                for (uint32_t r = 0; r < e->ndamage; r++) {
+                    const int16_t *q = v->rect[e->damage + r];
+
+                    surf_blit(b, t, e, q[0], q[1], q[2], q[3]);
+                    bytes += (uint64_t)MAX(q[2] - q[0], 0) * MAX(q[3] - q[1], 0) * 4;
+                }
             }
         }
+        if (b) {
+            [b endEncoding];
+            [cb commit];
+            /* the copy, and any frame still reading these textures, done:
+             * then the backings are the Wimp's again */
+            [cb waitUntilCompleted];
+            surf.copied += bytes;
+            surf.copies++;
+        }
     }
-    return stex[k].tex;
+    surf.uploaded_frame = v->frame;
+    metal_glue_surfaces_ack(v->frame);
 }
 
 typedef struct FaceU {
@@ -3177,12 +3280,7 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
               instanceCount:n];
     } else if (n) {
         /* each surface in turn: its shadow, then its pixels from its copy
-         * (a page, from guest RAM as before) */
-        bool fresh = surf.view.frame != surf.uploaded_frame || surf.view.pages != surf.uploaded_pages;
-
-        for (int k = 0; k < SURF_TEX; k++) {
-            stex[k].idle++;
-        }
+         * (surf_take made it this list's); a page from guest RAM */
         [enc setVertexBuffer:qb offset:0 atIndex:0];
         [enc setVertexBytes:screen length:sizeof(screen) atIndex:1];
         [enc setFragmentBuffer:qb offset:0 atIndex:0];
@@ -3199,7 +3297,7 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
             if (!sq_pxn[i]) {
                 continue;
             }
-            if (e->format == 0 && (t = surf_texture(e, fresh)) != nil) {
+            if (e->format == 0 && (t = surf_texture_of(e)) != nil) {
                 [enc setRenderPipelineState:surf.tex_pipe];
                 [enc setFragmentTexture:t atIndex:0];
             } else {
@@ -3209,8 +3307,6 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
             [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
                   instanceCount:sq_pxn[i] baseInstance:sq_px0[i]];
         }
-        surf.uploaded_frame = surf.view.frame;
-        surf.uploaded_pages = surf.view.pages;
     }
     [enc endEncoding];
     surf.frames++;
@@ -3223,8 +3319,6 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
 
 static bool metal_screenshot_to(NSString *path);
 /* metal-browser.m's: the host channel and the browser's panels */
-void metal_browser_tick(NSWindow *win, NSView *view, const MetalSurfacesView *sv,
-                        uint32_t xres, uint32_t yres);
 
 /* Pacing (design 39): frames presented each second, to metal-debug.txt
  * for each second that presented any, and once when it falls idle -- an
@@ -3361,6 +3455,9 @@ static bool metal_render_frame(void)
     /* the guest's surfaces, if it publishes a list: then they, and not the
      * screen, are what is shown (design 39) */
     surf.on = have_fb && metal_glue_surfaces_view(&surf.view) && surf_build() && surf_region();
+    if (have_fb) {
+        surf_take();                    /* a new list's damage copied, then acked */
+    }
     /* the box's browser, the Mac's WebKit: its lines answered and its
      * panels placed, a frame presented or not */
     metal_browser_tick(m.window, [m.window contentView], have_fb ? &surf.view : NULL,
@@ -3632,8 +3729,23 @@ static bool metal_render_frame(void)
                 destinationBytesPerImage:ww * wh * 4];
             [wb endEncoding];
         }
-        [cb presentDrawable:drawable];
-        [cb commit];
+        if (metal_browser_shown()) {
+            /* a page on the screen: presented in one transaction with the
+             * pages' places and masks, so that a page and the desktop round
+             * it change in the same refresh */
+            m.layer.presentsWithTransaction = YES;
+            [cb commit];
+            [cb waitUntilScheduled];
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            metal_browser_place();
+            [drawable present];
+            [CATransaction commit];
+        } else {
+            m.layer.presentsWithTransaction = NO;
+            [cb presentDrawable:drawable];
+            [cb commit];
+        }
         if (wbuf) {
             NSString *path = [NSString stringWithFormat:@"%s/%s.png", wdir, want_window];
             CGColorSpaceRef wcs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -4127,8 +4239,26 @@ static void metal_buttons_release_all(void)
     }
 }
 
+/* A click on the desktop takes the keyboard back from a page */
+static void metal_view_take_keys(void)
+{
+    if ([m.window firstResponder] != m.view) {
+        [m.window makeFirstResponder:m.view];
+    }
+}
+
+/* The keyboard gone to a page: the guest hears every key it holds go up,
+ * or RISC OS repeats one for ever */
+- (BOOL)resignFirstResponder
+{
+    metal_release_modifiers();
+    metal_release_keys();
+    return YES;
+}
+
 - (void)mouseDown:(NSEvent *)e
 {
+    metal_view_take_keys();
     mouse.held_left = metal_button_for(e, 0);
     if (metal_debug()) {
         metal_log("view: mouseDown -> button %d (flags %#lx)",
@@ -4145,6 +4275,7 @@ static void metal_buttons_release_all(void)
 
 - (void)rightMouseDown:(NSEvent *)e
 {
+    metal_view_take_keys();
     mouse.held_right = metal_button_for(e, 2);
     if (metal_debug()) {
         metal_log("view: rightMouseDown -> button %d (flags %#lx)",
@@ -4170,6 +4301,7 @@ static void metal_buttons_release_all(void)
     if ([e buttonNumber] != 2) {
         return;
     }
+    metal_view_take_keys();
     metal_button(1, true);
 }
 
@@ -4773,7 +4905,12 @@ int metal_backend_main(void)
             metal_render_frame();
             if (frame_skipped) {
                 frame_skipped = false;
-                usleep(8 * 1000);       /* nothing new: half a frame's wait */
+                /* nothing new: half a frame's wait -- but a list the box
+                 * publishes meanwhile is taken at once, since the Wimp
+                 * draws nothing more till it is (ROSGD_PRESENT_SNAPSHOT) */
+                for (int i = 0; i < 8 && !metal_glue_surfaces_pending(); i++) {
+                    usleep(1000);
+                }
             }
         }
     }

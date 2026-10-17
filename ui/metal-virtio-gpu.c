@@ -92,6 +92,8 @@ typedef struct VgMode {
 #define ROSGD_PRESENT_WINDOWS_ONLY 2u           /* the clock's and the meter's faces are
                                                    their tasks' own, not drawn here */
 #define ROSGD_PRESENT_REGION    4u              /* backings are drawn only from the region */
+#define ROSGD_PRESENT_SNAPSHOT  8u              /* the ack once the damage is copied: the Wimp
+                                                   draws into no backing till then */
 #define ROSGD_SCREEN_SURF       (ROSGD_SCREEN_PRESENT + 16u)
 #define ROSGD_V2_MAGIC          0x32565352u     /* "RSV2" */
 #define ROSGD_V2_SIZE           65536u
@@ -379,7 +381,8 @@ static void vg_announce(const VgBacking *b, const VgMode *m)
     p.magic = cpu_to_le32(ROSGD_PRESENT_MAGIC);
     p.state = cpu_to_le32(2);
     p.beat = cpu_to_le32(++beat);
-    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION);
+    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION
+                         | (mode == VG_SURF_ON ? ROSGD_PRESENT_SNAPSHOT : 0));
     iov_from_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_PRESENT,
                  &p, sizeof(p));
     if (mode != VG_SURF_PROBE) {
@@ -539,9 +542,10 @@ static void vg_fb_done(void)
  * frame is even and the same after.  Only a new frame is taken; a torn or
  * odd one leaves `out` as the last good list.  Each window with its pixels
  * in the region becomes a surface, its rectangles and its shadow's copied
- * into the view's pool.  The frame taken is acked, which lets the Wimp
- * begin its next list afresh: there is no upload to wait for, the window
- * reading the backings where they lie.
+ * into the view's pool.  The frame is not acked here: the window acks it
+ * (vg_surfaces_ack) once it has copied the list's damage out of the
+ * backings, and till then the Wimp draws into none of them
+ * (ROSGD_PRESENT_SNAPSHOT) -- so what is copied is the list as published.
  */
 /* A page as a surface: at x, y, clipped to the n rectangles at r */
 static void vg_page_surface(MetalSurfacesView *out, const RosgdPage *p, int x, int y,
@@ -599,11 +603,42 @@ static bool vg_pages(void *host, uint64_t size, RosgdPages *t)
     return qatomic_read(&src->seq) == s0 && t->seq == s0;
 }
 
+/* The list of frame `frame` copied: the Wimp may draw into the backings */
+static void vg_surfaces_ack(uint32_t frame)
+{
+    size_t off;
+    uint32_t le = cpu_to_le32(frame);
+
+    if (!view.g || !view.mode.described || !(off = vg_v2_offset(&view.b, &view.mode))) {
+        return;
+    }
+    iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, ack), &le, 4);
+}
+
+static uint32_t vg_taken;              /* the list last taken */
+
+/* Whether the guest has published a list not yet taken: the window's idle
+ * loop looks every millisecond, so that a list waits for no frame */
+static bool vg_surfaces_pending(void)
+{
+    size_t off;
+    uint32_t f;
+
+    if (vg_surfaces_mode() != VG_SURF_ON || !view.g || !view.mode.described
+        || !(off = vg_v2_offset(&view.b, &view.mode))
+        || iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, frame), &f, 4) != 4) {
+        return false;
+    }
+    f = le32_to_cpu(f);
+    return !(f & 1) && f != vg_taken;
+}
+
 static int vg_surfaces_view(MetalSurfacesView *out)
 {
     static RosgdV2 *v;
     static RosgdPages pages;
-    static uint32_t taken, taken_pages;
+    static uint32_t taken_pages;
+#define taken vg_taken
     static bool have_v2, have_pages;
     static int have;
     uint32_t f0, f1, ps;
@@ -649,7 +684,6 @@ static int vg_surfaces_view(MetalSurfacesView *out)
         }
         taken = f0;
         have_v2 = true;
-        iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, ack), &f0, 4);
     } else if (have && ps == taken_pages) {
         return have;                    /* as it was */
     }
@@ -745,6 +779,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
         d->x = e->x, d->y = e->y, d->w = e->w, d->h = e->h;
         d->offset = o;
         d->stride = e->stride;
+        d->window = e->window;
         d->radius = e->data[1];
         d->shadow_dx = e->shadow_dx, d->shadow_dy = e->shadow_dy;
         d->shadow_blur = e->shadow_blur, d->shadow_strength = e->shadow_strength;
@@ -798,6 +833,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
     have = out->n > 0 || out->nplaces > 0;
     view.wimp_only = have;
     return have;
+#undef taken
 }
 
 /* ---- the pointer: the scanout's cursor ---------------------------------- */
@@ -930,6 +966,8 @@ static const MetalBoard vg_board = {
     .fb_done        = vg_fb_done,
     .cursor_view    = vg_cursor_view,
     .surfaces_view  = vg_surfaces_view,
+    .surfaces_ack   = vg_surfaces_ack,
+    .surfaces_pending = vg_surfaces_pending,
     .capture        = vg_capture,
 };
 

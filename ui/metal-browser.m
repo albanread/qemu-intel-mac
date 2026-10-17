@@ -12,11 +12,17 @@
  * the compositor would, the window makes each browser window ("wm new"),
  * and answers each one's lines as the engine would.
  *
- * Each view is in a borderless child window of the QEMU window, placed at
- * frame time where the Wimp puts the window's page (its ROS_SURF_PAGE
- * entry in block v2) and masked to what of it can be seen, so a RISC OS
- * window in front of it covers it.  The child window is a real window:
- * clicks, keys and scrolling go to the page natively.
+ * Each view is a subview of the window's own view, over the Metal layer,
+ * placed where the Wimp puts the window's page (its ROS_SURF_PAGE entry in
+ * block v2) and masked to what of it can be seen, so a RISC OS window in
+ * front of it covers it.  It is placed in the same Core Animation
+ * transaction as the frame drawn from that list is presented
+ * (metal_browser_place, presentsWithTransaction): the page and the
+ * desktop round it move together, in the same refresh.  A child window,
+ * as it was, moved on its own clock, a frame or more ahead of the desktop,
+ * and the black the Wimp leaves for the page showed round it.  Clicks and
+ * scrolling where the page is seen go to it natively, keys while it is
+ * first responder.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -143,23 +149,36 @@ static NSString *const hb_js =
 static void hb_close(HBWindow *w, bool tell);
 static HBWindow *hb_new(NSString *url, WKWebViewConfiguration *cfg);
 
-/* a borderless window that takes the keyboard when the page is clicked */
-@interface HBPanel : NSWindow
+/* the page's box: hit only where the page is seen, so that a click on a
+ * RISC OS window in front of the page goes to the desktop's view */
+@interface HBBox : NSView
+@property(nonatomic) CGPathRef seen;                /* in the box's coordinates */
 @end
-@implementation HBPanel
-- (BOOL)canBecomeKeyWindow { return YES; }
-- (BOOL)canBecomeMainWindow { return NO; }
+@implementation HBBox
+- (NSView *)hitTest:(NSPoint)p
+{
+    NSPoint q = [self convertPoint:p fromView:self.superview];
+
+    if (self.hidden || !self.seen || !CGPathContainsPoint(self.seen, NULL, q, false)) {
+        return nil;
+    }
+    return [super hitTest:p];
+}
+- (void)dealloc
+{
+    CGPathRelease(self.seen);
+    [super dealloc];
+}
 @end
 
 @interface HBWindow : NSObject <WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
                                 WKDownloadDelegate>
 @property(nonatomic) uint32_t ident;
-@property(nonatomic, retain) HBPanel *panel;
-@property(nonatomic, retain) NSView *box;           /* the panel's content: the mask's */
+@property(nonatomic, retain) HBBox *box;            /* the page's box: the mask's */
 @property(nonatomic, retain) WKWebView *view;
 @property(nonatomic, retain) CAShapeLayer *mask;
 @property(nonatomic) bool shown;
-@property(nonatomic) NSRect placed;                 /* the panel's frame last set */
+@property(nonatomic) NSRect placed;                 /* the box's frame last set */
 @property(nonatomic) uint32_t mask_sig;             /* the mask's rectangles, hashed */
 @property(nonatomic, copy) NSString *scroll;        /* the page's last report */
 @property(nonatomic, copy) NSString *wanted;        /* the address asked for */
@@ -169,6 +188,9 @@ static HBWindow *hb_new(NSString *url, WKWebViewConfiguration *cfg);
 static NSMutableArray<HBWindow *> *windows;
 static uint32_t next_id = HB_FIRST_ID;
 static NSWindow *parent_window;
+static NSView *parent_view;
+static const MetalSurfacesView *place_sv;
+static uint32_t place_xres, place_yres;
 
 static HBWindow *hb_by_id(uint32_t id)
 {
@@ -400,19 +422,12 @@ static HBWindow *hb_new(NSString *url, WKWebViewConfiguration *cfg)
     [js release];
 
     w.ident = next_id++;
-    w.panel = [[[HBPanel alloc] initWithContentRect:NSMakeRect(0, 0, 640, 480)
-                                          styleMask:NSWindowStyleMaskBorderless
-                                            backing:NSBackingStoreBuffered
-                                              defer:NO] autorelease];
-    w.panel.releasedWhenClosed = NO;
-    w.panel.hasShadow = NO;
-    w.panel.opaque = NO;
-    w.panel.backgroundColor = [NSColor clearColor];
-    w.box = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 640, 480)] autorelease];
+    w.box = [[[HBBox alloc] initWithFrame:NSMakeRect(0, 0, 640, 480)] autorelease];
     w.box.wantsLayer = YES;
+    w.box.hidden = YES;
     w.mask = [CAShapeLayer layer];
     w.box.layer.mask = w.mask;
-    w.panel.contentView = w.box;
+    [parent_view addSubview:w.box];
     w.view = [[[WKWebView alloc] initWithFrame:w.box.bounds configuration:c] autorelease];
     w.view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     w.view.navigationDelegate = w;
@@ -457,11 +472,10 @@ static void hb_close(HBWindow *w, bool tell)
     [w.view stopLoading];
     w.view.navigationDelegate = nil;
     w.view.UIDelegate = nil;
-    if (w.panel.parentWindow) {
-        [w.panel.parentWindow removeChildWindow:w.panel];
+    if ([parent_window firstResponder] == w.view) {
+        [parent_window makeFirstResponder:parent_view];
     }
-    [w.panel orderOut:nil];
-    [w.panel close];
+    [w.box removeFromSuperview];
     [windows removeObject:w];
     metal_log("browser: window %u closed", id);
     if (tell) {
@@ -496,12 +510,11 @@ static void hb_line(char *l)
             /* the Wimp gave the window the caret (a click on its page, or
              * its title): the page takes the keyboard */
             if (w.shown) {
-                [w.panel makeKeyWindow];
-                [w.panel makeFirstResponder:w.view];
+                [parent_window makeFirstResponder:w.view];
             }
         }
-        /* configure, motion, button, axis, key, leave: the panel is a real
-         * window, its input its own, and its size follows its place */
+        /* configure, motion, button, axis, key, leave: the page takes its
+         * input natively, and its size follows its place */
         return;
     }
     if (l[0] != 'b') {
@@ -585,12 +598,11 @@ static void hb_line(char *l)
 
 /* ---- each frame -------------------------------------------------------------- */
 
-/* The panels where the Wimp puts the pages: guest pixels, over the view's
- * points (the scale pass stretches the screen over the whole view), to
- * the screen; each masked to what of its page is seen, and hidden while
- * its page is not on the screen at all */
-static void hb_place(NSWindow *win, NSView *view, const MetalSurfacesView *sv,
-                     uint32_t xres, uint32_t yres)
+/* The boxes where the Wimp puts the pages: guest pixels, over the view's
+ * points (the scale pass stretches the screen over the whole view); each
+ * masked to what of its page is seen, and hidden while its page is not on
+ * the screen at all.  In the caller's Core Animation transaction. */
+static void hb_place(NSView *view, const MetalSurfacesView *sv, uint32_t xres, uint32_t yres)
 {
     NSRect vb = view.bounds;
     double sx = vb.size.width / MAX(xres, 1u), sy = vb.size.height / MAX(yres, 1u);
@@ -605,25 +617,25 @@ static void hb_place(NSWindow *win, NSView *view, const MetalSurfacesView *sv,
         }
         if (pi < 0 || !sv->place[pi].nrects || sv->place[pi].w <= 0 || sv->place[pi].h <= 0) {
             if (w.shown) {
-                [win removeChildWindow:w.panel];
-                [w.panel orderOut:nil];
+                w.box.hidden = YES;
                 w.shown = false;
+                if ([parent_window firstResponder] == w.view) {
+                    [parent_window makeFirstResponder:view];
+                }
             }
             continue;
         }
         double gx = sv->place[pi].x, gy = sv->place[pi].y;
         double gw = sv->place[pi].w, gh = sv->place[pi].h;
         NSRect r = NSMakeRect(gx * sx, vb.size.height - (gy + gh) * sy, gw * sx, gh * sy);
-        NSRect onwin = [view convertRect:r toView:nil];
-        NSRect screen = [win convertRectToScreen:onwin];
         uint32_t sig = 2166136261u;
 
-        if (!NSEqualRects(screen, w.placed)) {
-            [w.panel setFrame:screen display:NO];
-            w.placed = screen;
+        if (!NSEqualRects(r, w.placed)) {
+            w.box.frame = r;
+            w.placed = r;
             sig = 0;                    /* the mask again, at the new size */
         }
-        /* the mask: the seen rectangles, in the panel's points, y up */
+        /* the mask: the seen rectangles, in the box's points, y up */
         for (uint32_t k = 0; k < sv->place[pi].nrects; k++) {
             const int16_t *q = sv->rect[sv->place[pi].rects + k];
 
@@ -641,20 +653,49 @@ static void hb_place(NSWindow *win, NSView *view, const MetalSurfacesView *sv,
 
                 CGPathAddRect(path, NULL, c);
             }
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
             w.mask.frame = w.box.layer.bounds;
             w.mask.path = path;
-            [CATransaction commit];
-            CGPathRelease(path);
+            CGPathRelease(w.box.seen);
+            w.box.seen = path;          /* the box's now */
             w.mask_sig = sig;
         }
         if (!w.shown) {
-            [win addChildWindow:w.panel ordered:NSWindowAbove];
-            [w.panel orderFront:nil];
+            w.box.hidden = NO;
             w.shown = true;
         }
     }
+}
+
+/* Whether any page is on the screen: then the frame is presented in a
+ * transaction with the boxes' places (metal.m) */
+bool metal_browser_shown(void)
+{
+    return windows.count > 0;
+}
+
+/* The boxes placed for the list the frame being presented was drawn from:
+ * called by metal.m inside the transaction that presents it */
+void metal_browser_place(void)
+{
+    if (parent_view && windows.count) {
+        hb_place(parent_view, place_sv, place_xres, place_yres);
+    }
+}
+
+/* Whether a page is seen at p, in the window's view's points: the host's
+ * own cursor is shown there, and WebKit's shape for it */
+bool metal_browser_covers(NSPoint p)
+{
+    for (HBWindow *w in windows) {
+        if (w.shown && w.box.seen) {
+            NSPoint q = [w.box convertPoint:p fromView:parent_view];
+
+            if (CGPathContainsPoint(w.box.seen, NULL, q, false)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /*
@@ -670,6 +711,9 @@ void metal_browser_tick(NSWindow *win, NSView *view, const MetalSurfacesView *sv
     HostChan *c;
 
     parent_window = win;
+    parent_view = view;
+    place_sv = sv;
+    place_xres = xres, place_yres = yres;
     if (!sv || !sv->region || sv->region_size < (128u << 20) + HC_SIZE) {
         return;
     }
@@ -693,5 +737,5 @@ void metal_browser_tick(NSWindow *win, NSView *view, const MetalSurfacesView *sv
     for (int n = 0; n < 64 && hc_take(line, sizeof(line)); n++) {
         hb_line(line);
     }
-    hb_place(win, view, sv, xres, yres);
+    /* the boxes are placed when the frame is presented (metal_browser_place) */
 }

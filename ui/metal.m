@@ -608,7 +608,7 @@ static NSString * const SHADER_SRC = @""
 "\n"
 "struct Params {\n"
 "    uint4 dim;     /* xres, yres, pitch(bytes), bpp */\n"
-"    uint4 misc;    /* xoffset(px), yoffset(rows), pixo, unused */\n"
+"    uint4 misc;    /* xoffset(px), yoffset(rows), pixo, the desktop's look */\n"
 "    uint4 post;    /* view w, view h, scaling, scanlines */\n"
 "    uint4 bd;      /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */\n"
 "    uint4 bx;      /* backdrop: output px per tile px x1000, unused */\n"
@@ -770,6 +770,56 @@ static NSString * const SHADER_SRC = @""
 "    return c;\n"
 "}\n"
 "\n"
+/* The desktop's look (design 37, Sprint 6; design 39): a desktop asked
+ * for fewer colours is drawn at 32 bpp and shown in the colours of the
+ * depth asked for -- the PC presenter's quantising pass.  Nearest colour,
+ * as ColourTrans picks it (its weights, green most), no dither: 2 colours
+ * by brightness, 4 greys, the Wimp's 16 colours, RISC OS's 256 (each gun
+ * two bits and a tint shared by all three), 16 or 256 greys, and 4096,
+ * 32K or 64K colours by truncating the guns.  look is block v2's: the
+ * Log2BPP asked for plus one in its low four bits, &200 grey, &4000 64K,
+ * &10000 4096 colours. */
+"constant float3 wimp16[16] = {\n"
+"    float3(1.0), float3(0.866667), float3(0.733333), float3(0.6), float3(0.466667), float3(0.333333),\n"
+"    float3(0.2), float3(0.0), float3(0.0, 0.266667, 0.6), float3(0.933333, 0.933333, 0.0),\n"
+"    float3(0.0, 0.8, 0.0), float3(0.866667, 0.0, 0.0), float3(0.933333, 0.933333, 0.733333),\n"
+"    float3(0.333333, 0.533333, 0.0), float3(1.0, 0.733333, 0.0), float3(0.0, 0.733333, 1.0) };\n"
+"static float lum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+"static float3 look_of(float3 c, uint lk)\n"
+"{\n"
+"    int l2 = int(lk & 15u) - 1;\n"
+"    if (l2 < 0) return c;\n"
+"    bool grey = (lk & 0x200u) != 0;\n"
+"    int fmt = (lk & 0x10000u) ? 2 : (lk & 0x4000u) ? 1 : 0;\n"
+"    const float3 W = float3(2.0, 4.0, 1.0);\n"
+"    float3 q = c;\n"
+"    if (l2 >= 4) {\n"
+"        float3 n = fmt == 1 ? float3(31.0, 63.0, 31.0) : fmt == 2 ? float3(15.0) : float3(31.0);\n"
+"        q = floor(c * n + 0.5) / n;\n"
+"    } else if (l2 == 0) {\n"
+"        q = float3(lum(c) >= 0.5 ? 1.0 : 0.0);\n"
+"    } else if (l2 == 1 || grey) {\n"
+"        float n = l2 == 1 ? 3.0 : l2 == 2 ? 15.0 : 255.0;\n"
+"        q = float3(floor(lum(c) * n + 0.5) / n);\n"
+"    } else if (l2 == 2) {\n"
+"        float best = 1e9;\n"
+"        for (int i = 0; i < 16; i++) {\n"
+"            float3 d = c - wimp16[i];\n"
+"            float e = dot(d * d, W);\n"
+"            if (e < best) { best = e; q = wimp16[i]; }\n"
+"        }\n"
+"    } else {\n"
+"        float best = 1e9;\n"
+"        for (int t = 0; t < 4; t++) {\n"
+"            float3 hi = clamp(floor((c * 15.0 - float(t)) / 4.0 + 0.5), 0.0, 3.0);\n"
+"            float3 p = (hi * 4.0 + float(t)) / 15.0, d = c - p;\n"
+"            float e = dot(d * d, W);\n"
+"            if (e < best) { best = e; q = p; }\n"
+"        }\n"
+"    }\n"
+"    return q;\n"
+"}\n"
+"\n"
 "fragment float4 ps_scale(VSOut v [[stage_in]],\n"
 "                         constant Params &P [[buffer(0)]],\n"
 "                         texture2d<float> src [[texture(0)]],\n"
@@ -797,7 +847,7 @@ static NSString * const SHADER_SRC = @""
 "        }\n"
 "    }\n"
 "    if (BACKDROP == 0) {\n"
-"        return float4(c.rgb, 1.0);\n"
+"        return float4(look_of(c.rgb, P.misc.w), 1.0);\n"
 "    }\n"
 "    float3 bg;\n"
 "    if (BACKDROP_IMAGE) {\n"
@@ -830,7 +880,7 @@ static NSString * const SHADER_SRC = @""
 "    } else {\n"
 "        bg = backdrop_scene(v.pos.xy, outPx, srcPx, P);\n"
 "    }\n"
-"    return float4(c.rgb + bg * (1.0 - c.a), 1.0);\n"
+"    return float4(look_of(c.rgb + bg * (1.0 - c.a), P.misc.w), 1.0);\n"
 "}\n"
 "\n"
 "vertex VSOut vs_quad(uint id [[vertex_id]], constant float4 &R [[buffer(0)]])\n"
@@ -3190,7 +3240,7 @@ static bool metal_render_frame(void)
         params.misc[0] = v.xoffset;
         params.misc[1] = v.yoffset;
         params.misc[2] = v.pixo;
-        params.misc[3] = 0;
+        params.misc[3] = surf.on ? surf.view.look : 0;     /* the desktop's look */
         params.post[0] = (uint32_t)target.width;
         params.post[1] = (uint32_t)target.height;
         params.post[2] = (uint32_t)video_opts.scaling;
@@ -3467,6 +3517,7 @@ static bool metal_screenshot_to(NSString *path)
             sp.post[0] = fb.xres;
             sp.post[1] = fb.yres;
             sp.post[2] = METAL_SCALING_NEAREST;
+            sp.misc[3] = surf.on ? surf.view.look : 0;
             /* the window's tile size, carried into guest pixels */
             backdrop_params(&sp, 1.0);   /* the tile's size in guest pixels */
             srp.colorAttachments[0].texture = composite;

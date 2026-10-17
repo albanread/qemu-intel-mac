@@ -150,7 +150,13 @@ typedef struct MetalSurface {
     uint16_t format;                /* 0 a backing (R G B A); a Linux program's
                                        page: 1 B G R A premultiplied, 2 B G R x */
     uint32_t bw, bh;                /* a page's own pixels, scaled to w x h */
+    /* what of its pixels changed since the last list: ndamage 0 none,
+     * METAL_DAMAGE_ALL all of them, else that many rectangles of the rect
+     * pool from damage, in its own pixels -- for a window that keeps
+     * copies of the backings in a GPU's own memory */
+    uint32_t damage, ndamage;
 } MetalSurface;
+#define METAL_DAMAGE_ALL 0xFFFFFFFFu
 /* An icon whose picture the window draws itself (screen.h's
  * ROS_SURF_CLOCK, ROS_SURF_MONITOR): DeskClock's face and DeskMeter's
  * graph, at the window's own resolution */

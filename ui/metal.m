@@ -2621,6 +2621,23 @@ static NSString *const SURF_SRC = @
 "    return float4(float(w & 255), float((w >> 8) & 255), float((w >> 16) & 255),\n"
 "                  float(w >> 24)) / 255.0;  /* premultiplied */\n"
 "}\n"
+/* the same, from a copy of the backing in the GPU's own memory (a GPU
+ * without unified memory, which reads guest RAM across its bus) */
+"fragment float4 ps_surf_tex(SOut in [[stage_in]],\n"
+"                            device const SQuad *q [[buffer(0)]],\n"
+"                            texture2d<float> t [[texture(0)]])\n"
+"{\n"
+"    SQuad Q = q[in.inst];\n"
+"    int2 l = int2(floor(in.pos.xy - Q.box.xy));\n"
+"    if (l.x < 0 || l.y < 0 || l.x >= int(Q.box.z) || l.y >= int(Q.box.w)) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    float4 c = t.read(uint2(l));\n"
+"    if (uint(round(c.a * 255.0)) == 0x80) {\n"
+"        return float4(0.0);     /* the below tag: a hole to the backdrop */\n"
+"    }\n"
+"    return c;                   /* premultiplied */\n"
+"}\n"
 /* The icons whose pictures this window draws (ROS_SURF_CLOCK and
  * ROS_SURF_MONITOR): the PC presenter's shaders, in MSL, drawn at the
  * window's own resolution.  DeskClock's face: its styles' colours (face,
@@ -2783,6 +2800,20 @@ typedef struct SQuad {
 
 #define SURF_QUADS 8192
 
+/* The backings' copies in the GPU's own memory (tex_mode): by their place
+ * in the region and their size; made whole, then kept up to date by the
+ * damage each new list carries; let go when unused a while */
+#define SURF_TEX 160
+static struct {
+    uint32_t offset, w, h, stride;
+    id<MTLTexture> tex;
+    uint32_t idle;                      /* frames since it was last drawn */
+} stex[SURF_TEX];
+
+/* per surface of the frame: its quads in the buffer, shadow then pixels */
+static uint32_t sq_sh0[METAL_SURFACES], sq_shn[METAL_SURFACES];
+static uint32_t sq_px0[METAL_SURFACES], sq_pxn[METAL_SURFACES];
+
 static struct {
     bool tried;
     id<MTLRenderPipelineState> pipe;
@@ -2794,6 +2825,9 @@ static struct {
     MetalSurfacesView view;
     bool on;                            /* this frame composites the list */
     id<MTLRenderPipelineState> face;    /* the clock's and the meter's, into the drawable */
+    id<MTLRenderPipelineState> tex_pipe;    /* the surfaces from their GPU copies */
+    bool tex_mode;                      /* a GPU without unified memory: copies */
+    uint32_t uploaded_frame, uploaded_pages;    /* the list whose damage is in the copies */
     id<MTLRenderPipelineState> face_shot;   /* the same, into a screenshot's RGBA texture */
     uint32_t drawn_frame, drawn_pages;
     double face_due;                    /* when a listed clock is next to be drawn */
@@ -2834,6 +2868,19 @@ static bool surf_build(void)
     pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     surf.pipe = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    {
+        id<MTLFunction> tfs = [lib newFunctionWithName:@"ps_surf_tex"];
+
+        pd.fragmentFunction = tfs;
+        surf.tex_pipe = tfs ? [m.device newRenderPipelineStateWithDescriptor:pd error:nil] : nil;
+        [tfs release];
+    }
+    /* copies in the GPU's memory where it has its own: reading guest RAM
+     * across the bus for every pixel of every frame drew 8 frames a second
+     * on the Mac Pro's Radeon (METAL_SURF_TEXTURES=1 forces it, to test) */
+    surf.tex_mode = surf.tex_pipe && (![m.device hasUnifiedMemory] || getenv("METAL_SURF_TEXTURES"));
+    metal_log("surfaces: %s", surf.tex_mode ? "copies of the backings in the GPU's memory, "
+              "kept by their damage" : "the backings read where they lie, no copy");
     [pd release];
     [vs release];
     [fs release];
@@ -2913,6 +2960,7 @@ static uint32_t surf_quads(SQuad *q)
     for (uint32_t i = 0; i < v->n; i++) {
         const MetalSurface *e = &v->s[i];
 
+        sq_sh0[i] = n;
         for (uint32_t k = 0; k < e->shadow_nrects && n < SURF_QUADS; k++) {
             const int16_t *r = v->rect[e->shadow_rects + k];
             SQuad *o = &q[n++];
@@ -2924,6 +2972,8 @@ static uint32_t surf_quads(SQuad *q)
             o->sh[0] = e->radius, o->sh[1] = e->shadow_blur;
             o->sh[2] = e->shadow_strength / 255.0f, o->sh[3] = 0;
         }
+        sq_shn[i] = n - sq_sh0[i];
+        sq_px0[i] = n;
         for (uint32_t k = 0; k < e->nrects && n < SURF_QUADS; k++) {
             const int16_t *r = v->rect[e->rects + k];
             SQuad *o = &q[n++];
@@ -2934,8 +2984,63 @@ static uint32_t surf_quads(SQuad *q)
             memset(o->sh, 0, sizeof(o->sh));
             o->sh[0] = e->bw, o->sh[1] = e->bh;
         }
+        sq_pxn[i] = n - sq_px0[i];
     }
     return n;
+}
+
+/* A backing's copy: found or made (whole); brought up to date with the
+ * damage when this is a list not yet taken into the copies */
+static id<MTLTexture> surf_texture(const MetalSurface *e, bool fresh_list)
+{
+    const MetalSurfacesView *v = &surf.view;
+    const uint8_t *src = (const uint8_t *)v->region + e->offset;
+    int k, spare = -1;
+    bool whole = false;
+
+    for (k = 0; k < SURF_TEX; k++) {
+        if (stex[k].tex && stex[k].offset == e->offset && stex[k].w == (uint32_t)e->w
+            && stex[k].h == (uint32_t)e->h && stex[k].stride == e->stride) {
+            break;
+        }
+        if (spare < 0 && (!stex[k].tex || stex[k].idle > 120)) {
+            spare = k;
+        }
+    }
+    if (k == SURF_TEX) {
+        MTLTextureDescriptor *td;
+
+        if (spare < 0) {
+            return nil;
+        }
+        k = spare;
+        [stex[k].tex release];
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                width:e->w height:e->h
+                                                            mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = [m.device hasUnifiedMemory] ? MTLStorageModeShared : MTLStorageModeManaged;
+        stex[k].tex = [m.device newTextureWithDescriptor:td];
+        stex[k].offset = e->offset, stex[k].w = e->w, stex[k].h = e->h, stex[k].stride = e->stride;
+        whole = true;
+    }
+    stex[k].idle = 0;
+    if (whole || (fresh_list && e->ndamage == METAL_DAMAGE_ALL)) {
+        [stex[k].tex replaceRegion:MTLRegionMake2D(0, 0, e->w, e->h) mipmapLevel:0
+                         withBytes:src bytesPerRow:e->stride];
+    } else if (fresh_list) {
+        for (uint32_t r = 0; r < e->ndamage; r++) {
+            const int16_t *q = v->rect[e->damage + r];
+            int x0 = MAX(q[0], 0), y0 = MAX(q[1], 0), x1 = MIN(q[2], e->w), y1 = MIN(q[3], e->h);
+
+            if (x1 > x0 && y1 > y0) {
+                [stex[k].tex replaceRegion:MTLRegionMake2D(x0, y0, x1 - x0, y1 - y0) mipmapLevel:0
+                                 withBytes:src + (size_t)y0 * e->stride + (size_t)x0 * 4
+                               bytesPerRow:e->stride];
+            }
+        }
+    }
+    return stex[k].tex;
 }
 
 typedef struct FaceU {
@@ -3036,7 +3141,7 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     enc = [cb renderCommandEncoderWithDescriptor:rp];
-    if (n) {
+    if (n && !surf.tex_mode) {
         [enc setRenderPipelineState:surf.pipe];
         [enc setVertexBuffer:qb offset:0 atIndex:0];
         [enc setVertexBytes:screen length:sizeof(screen) atIndex:1];
@@ -3044,6 +3149,42 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
         [enc setFragmentBuffer:surf.region offset:0 atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
               instanceCount:n];
+    } else if (n) {
+        /* each surface in turn: its shadow, then its pixels from its copy
+         * (a page, from guest RAM as before) */
+        bool fresh = surf.view.frame != surf.uploaded_frame || surf.view.pages != surf.uploaded_pages;
+
+        for (int k = 0; k < SURF_TEX; k++) {
+            stex[k].idle++;
+        }
+        [enc setVertexBuffer:qb offset:0 atIndex:0];
+        [enc setVertexBytes:screen length:sizeof(screen) atIndex:1];
+        [enc setFragmentBuffer:qb offset:0 atIndex:0];
+        for (uint32_t i = 0; i < surf.view.n; i++) {
+            const MetalSurface *e = &surf.view.s[i];
+            id<MTLTexture> t = nil;
+
+            if (sq_shn[i]) {
+                [enc setRenderPipelineState:surf.pipe];
+                [enc setFragmentBuffer:surf.region offset:0 atIndex:1];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+                      instanceCount:sq_shn[i] baseInstance:sq_sh0[i]];
+            }
+            if (!sq_pxn[i]) {
+                continue;
+            }
+            if (e->format == 0 && (t = surf_texture(e, fresh)) != nil) {
+                [enc setRenderPipelineState:surf.tex_pipe];
+                [enc setFragmentTexture:t atIndex:0];
+            } else {
+                [enc setRenderPipelineState:surf.pipe];
+                [enc setFragmentBuffer:surf.region offset:0 atIndex:1];
+            }
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+                  instanceCount:sq_pxn[i] baseInstance:sq_px0[i]];
+        }
+        surf.uploaded_frame = surf.view.frame;
+        surf.uploaded_pages = surf.view.pages;
     }
     [enc endEncoding];
     surf.frames++;

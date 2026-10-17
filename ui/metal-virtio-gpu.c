@@ -768,6 +768,25 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             out->nrects++;
         }
         d->shadow_nrects = out->nrects - d->shadow_rects;
+        /* its damage since the last list taken (the Wimp keeps adding to
+         * it until the ack) */
+        d->damage = out->nrects;
+        if (e->ndamage == 0xFFFFFFFFu) {
+            d->ndamage = METAL_DAMAGE_ALL;
+        } else {
+            for (uint32_t r = 0; r < e->ndamage && e->damage + r < ROSGD_V2_SDAMAGE
+                 && out->nrects < METAL_SURF_RECTS; r++) {
+                const RosgdV2Rect *q = &v->sdamage[e->damage + r];
+
+                out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
+                out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+                out->nrects++;
+            }
+            d->ndamage = out->nrects - d->damage;
+            if (d->ndamage < e->ndamage) {
+                d->ndamage = METAL_DAMAGE_ALL;  /* the pool ran out: all of it */
+            }
+        }
     }
     /* popups (window 0): where the table says, over everything */
     for (uint32_t i = 0; host && have_pages && i < pages.n && i < ROSGD_PAGES; i++) {

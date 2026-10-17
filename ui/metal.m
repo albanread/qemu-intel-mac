@@ -3051,6 +3051,9 @@ static void surf_draw(id<MTLCommandBuffer> cb, uint32_t xres, uint32_t yres)
 }
 
 static bool metal_screenshot_to(NSString *path);
+/* metal-browser.m's: the host channel and the browser's panels */
+void metal_browser_tick(NSWindow *win, NSView *view, const MetalSurfacesView *sv,
+                        uint32_t xres, uint32_t yres);
 
 /* Pacing (design 39): frames presented each second, to metal-debug.txt
  * for each second that presented any, and once when it falls idle -- an
@@ -3187,6 +3190,10 @@ static bool metal_render_frame(void)
     /* the guest's surfaces, if it publishes a list: then they, and not the
      * screen, are what is shown (design 39) */
     surf.on = have_fb && metal_glue_surfaces_view(&surf.view) && surf_build() && surf_region();
+    /* the box's browser, the Mac's WebKit: its lines answered and its
+     * panels placed, a frame presented or not */
+    metal_browser_tick(m.window, [m.window contentView], have_fb ? &surf.view : NULL,
+                       have_fb ? v.xres : 0, have_fb ? v.yres : 0);
 
     /* Power: nothing new, no frame (and nothing copied, decoded or
      * presented); the loop sleeps instead */

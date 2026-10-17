@@ -174,6 +174,14 @@ typedef struct MetalSurfacesView {
     int16_t rect[METAL_SURF_RECTS][4];  /* x0 y0 x1 y1, half-open */
     uint32_t nicons;
     MetalIcon icon[METAL_ICONS];
+    /* Every external window's page place (ROS_SURF_PAGE), whoever draws
+     * it: where the host's own browser views go (metal-browser.m) */
+    uint32_t nplaces;
+    struct {
+        uint32_t id;                /* the window's id (the host's, for its views) */
+        int16_t x, y, w, h;         /* the page's box, guest pixels */
+        uint32_t rects, nrects;     /* what is seen of it: the rect pool */
+    } place[16];
 } MetalSurfacesView;
 
 /*
@@ -183,6 +191,10 @@ typedef struct MetalSurfacesView {
  * Thread: UI only, after metal_glue_fb_view.
  */
 int metal_glue_surfaces_view(MetalSurfacesView *out);
+
+/* The directory the box's share is (its 9p fsdev "host"), or NULL: where
+ * the host's browser saves downloads (metal-browser.m) */
+const char *metal_glue_share_path(void);
 
 /*
  * Input, called from the UI thread's event handlers.  Each call takes the

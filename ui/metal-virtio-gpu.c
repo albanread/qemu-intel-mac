@@ -676,11 +676,30 @@ static int vg_surfaces_view(MetalSurfacesView *out)
     out->n = 0;
     out->nrects = 0;
     out->nicons = 0;
+    out->nplaces = 0;
     for (uint32_t k = 0; k < v->nsurfaces && k < ROSGD_V2_SURFACES; k++) {
         const RosgdV2Surface *e = &v->surface[k];
         MetalSurface *d;
         uint32_t o = v->offset[k];
 
+        if (e->kind == ROSGD_SURF_PAGE && e->param && out->nplaces < 16) {
+            /* its place, for a view the host draws itself */
+            uint32_t pi = out->nplaces++;
+
+            out->place[pi].id = e->param;
+            out->place[pi].x = e->x, out->place[pi].y = e->y;
+            out->place[pi].w = e->w, out->place[pi].h = e->h;
+            out->place[pi].rects = out->nrects;
+            for (uint32_t r = 0; r < e->nrects && e->rects + r < ROSGD_V2_RECTS
+                 && out->nrects < METAL_SURF_RECTS; r++) {
+                const RosgdV2Rect *q = &v->rect[e->rects + r];
+
+                out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
+                out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+                out->nrects++;
+            }
+            out->place[pi].nrects = out->nrects - out->place[pi].rects;
+        }
         if (e->kind == ROSGD_SURF_PAGE && host && have_pages && e->param) {
             /* a Linux program's window: the compositor's page for it, at
              * the Wimp's place for it, seen where the Wimp says */
@@ -755,7 +774,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
                             v->shm_size);
         }
     }
-    have = out->n > 0;
+    have = out->n > 0 || out->nplaces > 0;
     view.wimp_only = have;
     return have;
 }

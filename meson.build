@@ -1243,7 +1243,7 @@ metal = not_found
 if host_os == 'darwin'
   metal = dependency('appleframeworks',
                      modules: ['Cocoa', 'Metal', 'QuartzCore', 'ImageIO',
-                               'CoreGraphics'],
+                               'CoreGraphics', 'WebKit'],
                      required: get_option('metal'))
 endif
 

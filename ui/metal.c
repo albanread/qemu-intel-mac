@@ -33,6 +33,8 @@
 #include "qom/object.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
+#include "qemu/config-file.h"
+#include "qemu/option.h"
 #include "system/reset.h"
 #include "system/hw_accel.h"
 #include "block/snapshot.h"
@@ -114,6 +116,14 @@ int metal_glue_cursor_view(MetalCursorView *out)
 int metal_glue_surfaces_view(MetalSurfacesView *out)
 {
     return board && board->surfaces_view ? board->surfaces_view(out) : 0;
+}
+
+const char *metal_glue_share_path(void)
+{
+    QemuOptsList *l = qemu_find_opts_err("fsdev", NULL);
+    QemuOpts *o = l ? qemu_opts_find(l, "host") : NULL;
+
+    return o ? qemu_opt_get(o, "path") : NULL;
 }
 
 /* ------------------------------------------------------------------ */

@@ -987,6 +987,28 @@ static void hmp_info_box_v2(Monitor *mon, const QDict *qdict)
         monitor_printf(mon, "region reads: %u agree, %u differ\n", agree,
                        differ);
     }
+    if (host) {
+        RosgdPages t;
+        uint32_t used = 0;
+
+        if (vg_pages(host, v->shm_size, &t)) {
+            for (uint32_t i = 0; i < t.n && i < ROSGD_PAGES; i++) {
+                used += t.page[i].id != 0;
+            }
+            monitor_printf(mon, "pages: %u in the table (seq %u)\n", used, t.seq);
+            for (uint32_t i = 0; i < t.n && i < ROSGD_PAGES; i++) {
+                const RosgdPage *p = &t.page[i];
+
+                if (p->id) {
+                    monitor_printf(mon, "  page %u window %u at %d,%d %ux%u (%ux%u pixels) "
+                                   "offset &%x frame %u\n", p->id, p->window, p->x, p->y,
+                                   p->w, p->h, p->bw, p->bh, p->offset, p->frame);
+                }
+            }
+        } else {
+            monitor_printf(mon, "pages: no table\n");
+        }
+    }
     g_free(v);
     g_free(b.iov);
 }

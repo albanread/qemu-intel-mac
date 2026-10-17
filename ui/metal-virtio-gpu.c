@@ -81,9 +81,10 @@ typedef struct VgMode {
  * The host says it is there -- that it draws the surfaces -- in the
  * block's presenter area (PRES): until it does, the Wimp makes no
  * backings and draws to the screen as before.  METAL_SURFACES says
- * whether it does: on (the window composites the list), off (the screen
- * as it is, as before design 39), or probe (PRES written and the lists
- * taken, nothing drawn from them: sprint 1's test of the region).
+ * whether it does: on, the default (the window composites the list), off
+ * (the screen as it is, as before design 39), or probe (PRES written and
+ * the lists taken, nothing drawn from them: sprint 1's test of the
+ * region).
  */
 #define ROSGD_SCREEN_PRESENT    3200u
 #define ROSGD_PRESENT_MAGIC     0x53455250u     /* "PRES" */
@@ -350,8 +351,9 @@ static int vg_surfaces_mode(void)
     if (mode < 0) {
         const char *e = getenv("METAL_SURFACES");
 
-        mode = !e || !strcmp(e, "off") ? VG_SURF_OFF
-             : !strcmp(e, "probe") ? VG_SURF_PROBE : VG_SURF_ON;
+        /* on unless asked otherwise (design 39, sprint 6) */
+        mode = e && !strcmp(e, "off") ? VG_SURF_OFF
+             : e && !strcmp(e, "probe") ? VG_SURF_PROBE : VG_SURF_ON;
         metal_log("box-v2: METAL_SURFACES=%s", mode == VG_SURF_ON ? "on: the window "
                   "composites the surfaces" : mode == VG_SURF_PROBE ? "probe: PRES "
                   "written, nothing drawn from the surfaces" : "off: the screen as it is");

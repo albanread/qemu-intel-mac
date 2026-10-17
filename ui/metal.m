@@ -3004,7 +3004,11 @@ static bool surf_face_due(void)
     }
     for (uint32_t i = 0; i < v->nicons; i++) {
         if (v->icon[i].kind == 1 && v->icon[i].nrects) {
-            double s = v->icon[i].rate > 1 ? 1.0 / MIN(v->icon[i].rate, 60u) : 1.0;
+            /* the rate the clock asks (a smooth second hand) while the
+             * window has the keyboard; once a second behind other
+             * windows, where 30 frames a second would only cost power */
+            double s = v->icon[i].rate > 1 && [m.window isKeyWindow]
+                       ? 1.0 / MIN(v->icon[i].rate, 60u) : 1.0;
 
             step = step ? MIN(step, s) : s;
         }
@@ -3555,7 +3559,9 @@ static bool metal_screenshot_to(NSString *path)
     id<MTLTexture> source = fb.decoded;
     id<MTLTexture> composite = nil;
 
-    if (backdrop.mode != METAL_BACKDROP_OFF
+    /* (and with the box's surfaces, whatever the backdrop: the pass is
+     * where the window's own icons -- the clock, the meter -- go in) */
+    if ((backdrop.mode != METAL_BACKDROP_OFF || surf.on)
         && (backdrop.mode != METAL_BACKDROP_SHADER || backdrop.scene_tex[backdrop.scene_cur])) {
         if (!fb.shot) {
             MTLFunctionConstantValues *scv = [[MTLFunctionConstantValues alloc] init];

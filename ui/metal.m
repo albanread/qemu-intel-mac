@@ -41,6 +41,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "ui/metal.h"
 
@@ -2868,7 +2869,11 @@ static struct {
     uint64_t region_size;
     id<MTLBuffer> quads[METAL_RING];
     unsigned ring;
-    MetalSurfacesView view;
+    MetalSurfacesView view;             /* the frame's: a copy of taken, the render loop's own */
+    MetalSurfacesView taken;            /* the list last taken, its damage copied (under mx) */
+    pthread_mutex_t mx;                 /* taken, the copies, the board's view: the taker's and
+                                           the render loop's in turn */
+    bool taker;                         /* the taking thread is running */
     bool on;                            /* this frame composites the list */
     id<MTLRenderPipelineState> face;    /* the clock's and the meter's, into the drawable */
     id<MTLRenderPipelineState> tex_pipe;    /* the surfaces from their GPU copies */
@@ -2879,7 +2884,7 @@ static struct {
     double face_due;                    /* when a listed clock is next to be drawn */
     uint64_t frames, quads_drawn;
     uint64_t copied, copies;            /* bytes copied out of the backings, lists copied */
-} surf;
+} surf = { .mx = PTHREAD_MUTEX_INITIALIZER };
 
 static bool surf_build(void)
 {
@@ -2978,7 +2983,7 @@ static bool surf_build(void)
 /* The region as a buffer: made once, again only if the guest names another */
 static bool surf_region(void)
 {
-    MetalSurfacesView *v = &surf.view;
+    MetalSurfacesView *v = &surf.taken;
 
     if (surf.region && surf.region_host == v->region && surf.region_size == v->region_size) {
         return true;
@@ -3114,7 +3119,7 @@ static void surf_blit(id<MTLBlitCommandEncoder> b, id<MTLTexture> t, const Metal
  * that the Wimp is never kept waiting for a frame nobody sees. */
 static void surf_take(void)
 {
-    const MetalSurfacesView *v = &surf.view;
+    const MetalSurfacesView *v = &surf.taken;
     id<MTLCommandBuffer> cb;
     id<MTLBlitCommandEncoder> b = nil;
     uint64_t bytes = 0;
@@ -3170,6 +3175,31 @@ static void surf_take(void)
     }
     surf.uploaded_frame = v->frame;
     metal_glue_surfaces_ack(v->frame);
+}
+
+/*
+ * The taker: a list the box publishes is taken, its damage copied and the
+ * list acked within a millisecond, whatever the render loop is doing.  The
+ * loop takes lists too, but only at each pass, and a pass may wait most of
+ * a frame for a drawable; meanwhile the Wimp, which draws into no backing
+ * until its last list is acked, stood still -- a drag spent most of its
+ * time so (17 Oct).
+ */
+static void *surf_taker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        usleep(500);
+        pthread_mutex_lock(&surf.mx);
+        if (surf.on && metal_glue_surfaces_pending()) {
+            metal_glue_surfaces_view(&surf.taken);
+            @autoreleasepool {
+                surf_take();
+            }
+        }
+        pthread_mutex_unlock(&surf.mx);
+    }
+    return NULL;
 }
 
 typedef struct FaceU {
@@ -3434,6 +3464,7 @@ static bool metal_render_frame(void)
         }
     }
 
+    pthread_mutex_lock(&surf.mx);       /* the board's view and the list: the taker's too */
     have_fb = metal_glue_fb_view(&v) != 0;
     if (have_fb) {
         mouse.gxres = v.xres;           /* the mouse maps onto this screen */
@@ -3454,10 +3485,22 @@ static bool metal_render_frame(void)
     }
     /* the guest's surfaces, if it publishes a list: then they, and not the
      * screen, are what is shown (design 39) */
-    surf.on = have_fb && metal_glue_surfaces_view(&surf.view) && surf_build() && surf_region();
+    surf.on = have_fb && metal_glue_surfaces_view(&surf.taken) && surf_build() && surf_region();
     if (have_fb) {
         surf_take();                    /* a new list's damage copied, then acked */
     }
+    if (surf.on) {
+        surf.view = surf.taken;         /* this frame's list, and the copies are its */
+        if (!surf.taker) {
+            pthread_t t;
+
+            surf.taker = pthread_create(&t, NULL, surf_taker, NULL) == 0;
+            if (surf.taker) {
+                pthread_detach(t);
+            }
+        }
+    }
+    pthread_mutex_unlock(&surf.mx);
     /* the box's browser, the Mac's WebKit: its lines answered and its
      * panels placed, a frame presented or not */
     metal_browser_tick(m.window, [m.window contentView], have_fb ? &surf.view : NULL,
@@ -3518,6 +3561,7 @@ static bool metal_render_frame(void)
         dispatch_semaphore_signal(m.inflight);
         return false;                   /* occluded, or no free surface */
     }
+    pthread_mutex_lock(&surf.mx);       /* the copies stay as this frame's list has them */
     cb = [m.queue commandBuffer];
 
     if (have_fb) {
@@ -3777,6 +3821,7 @@ static bool metal_render_frame(void)
             want_window[0] = 0;
         }
     }
+    pthread_mutex_unlock(&surf.mx);
     pace_presented++;
     return have_fb;
 }

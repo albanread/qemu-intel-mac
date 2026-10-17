@@ -131,6 +131,24 @@ typedef struct RosgdV2 {
     uint32_t offset[ROSGD_V2_SURFACES];
 } RosgdV2;
 
+/* The compositor's pages in the region (rosgd/include/rosgd/presentwire.h) */
+#define ROSGD_PAGES_OFFSET  (128u << 20)
+#define ROSGD_PAGES_MAGIC   0x53475052u     /* "RPGS" */
+#define ROSGD_PAGES         64u
+#define ROSGD_PAGE_XRGB     2u
+
+typedef struct RosgdPage {
+    uint32_t id, window;
+    int32_t x, y;
+    uint32_t w, h, bw, bh, stride, format, offset, frame;
+} RosgdPage;
+
+typedef struct RosgdPages {
+    uint32_t magic, seq, n, reserved;
+    RosgdPage page[ROSGD_PAGES];
+} RosgdPages;
+
+QEMU_BUILD_BUG_ON(sizeof(RosgdPage) != 48);
 QEMU_BUILD_BUG_ON(sizeof(RosgdV2Surface) != 96);
 QEMU_BUILD_BUG_ON(offsetof(RosgdV2, shm_base) != 38944);
 QEMU_BUILD_BUG_ON(sizeof(RosgdV2) > ROSGD_V2_SIZE);
@@ -523,12 +541,70 @@ static void vg_fb_done(void)
  * begin its next list afresh: there is no upload to wait for, the window
  * reading the backings where they lie.
  */
+/* A page as a surface: at x, y, clipped to the n rectangles at r */
+static void vg_page_surface(MetalSurfacesView *out, const RosgdPage *p, int x, int y,
+                            const RosgdV2Rect *r, uint32_t n, uint64_t region_size)
+{
+    MetalSurface *d;
+
+    if (out->n >= METAL_SURFACES || !p->offset || !p->bw || !p->bh || !p->w || !p->h
+        || (uint64_t)p->offset + (uint64_t)p->stride * p->bh > region_size) {
+        return;
+    }
+    d = &out->s[out->n++];
+    memset(d, 0, sizeof(*d));
+    d->x = x, d->y = y, d->w = p->w, d->h = p->h;
+    d->offset = p->offset;
+    d->stride = p->stride;
+    d->format = p->format == ROSGD_PAGE_XRGB ? 2 : 1;
+    d->bw = p->bw, d->bh = p->bh;
+    d->rects = out->nrects;
+    if (r) {
+        for (uint32_t k = 0; k < n && out->nrects < METAL_SURF_RECTS; k++) {
+            out->rect[out->nrects][0] = r[k].x0, out->rect[out->nrects][1] = r[k].y0;
+            out->rect[out->nrects][2] = r[k].x1, out->rect[out->nrects][3] = r[k].y1;
+            out->nrects++;
+        }
+    } else if (out->nrects < METAL_SURF_RECTS) {
+        out->rect[out->nrects][0] = x, out->rect[out->nrects][1] = y;
+        out->rect[out->nrects][2] = x + p->w, out->rect[out->nrects][3] = y + p->h;
+        out->nrects++;
+    }
+    d->nrects = out->nrects - d->rects;
+    d->shadow_rects = out->nrects, d->shadow_nrects = 0;
+}
+
+/* The compositor's page table, taken whole under its seqlock: false if
+ * there is none, or it was being written */
+static bool vg_pages(void *host, uint64_t size, RosgdPages *t)
+{
+    const RosgdPages *src;
+    uint32_t s0;
+
+    if (!host || size < ROSGD_PAGES_OFFSET + sizeof(*t)) {
+        return false;
+    }
+    src = (const RosgdPages *)((const uint8_t *)host + ROSGD_PAGES_OFFSET);
+    if (qatomic_load_acquire(&src->magic) != ROSGD_PAGES_MAGIC) {
+        return false;
+    }
+    s0 = qatomic_load_acquire(&src->seq);
+    if (s0 & 1) {
+        return false;
+    }
+    memcpy(t, src, sizeof(*t));
+    smp_rmb();
+    return qatomic_read(&src->seq) == s0 && t->seq == s0;
+}
+
 static int vg_surfaces_view(MetalSurfacesView *out)
 {
     static RosgdV2 *v;
-    static uint32_t taken;
+    static RosgdPages pages;
+    static uint32_t taken, taken_pages;
+    static bool have_v2, have_pages;
     static int have;
-    uint32_t f0, f1;
+    uint32_t f0, f1, ps;
     size_t off;
     void *host;
 
@@ -544,20 +620,37 @@ static int vg_surfaces_view(MetalSurfacesView *out)
         return have;
     }
     f0 = le32_to_cpu(f0);
-    if ((f0 & 1) || (have && f0 == taken)) {
-        return have;                    /* being written, or as it was */
+    /* the compositor's pages move on by themselves, the list need not */
+    ps = have_pages ? taken_pages : 0;
+    if (have_v2 && region.host && v->shm_size == region.size) {
+        RosgdPages t;
+
+        if (vg_pages(region.host, region.size, &t)) {
+            ps = t.seq;
+            if (ps != taken_pages) {
+                pages = t;
+            }
+        }
     }
-    if (!v) {
-        v = g_malloc(sizeof(*v));
+    if ((f0 & 1) || !have_v2 || f0 != taken) {
+        if (f0 & 1) {
+            return have;                /* being written: as it was */
+        }
+        if (!v) {
+            v = g_malloc(sizeof(*v));
+        }
+        iov_to_buf(view.b.iov, view.b.niov, off, v, sizeof(*v));
+        smp_rmb();
+        if (iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, frame), &f1, 4) != 4
+            || le32_to_cpu(f1) != f0 || v->frame != f0) {
+            return have;                /* torn: the next frame's */
+        }
+        taken = f0;
+        have_v2 = true;
+        iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, ack), &f0, 4);
+    } else if (have && ps == taken_pages) {
+        return have;                    /* as it was */
     }
-    iov_to_buf(view.b.iov, view.b.niov, off, v, sizeof(*v));
-    smp_rmb();
-    if (iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, frame), &f1, 4) != 4
-        || le32_to_cpu(f1) != f0 || v->frame != f0) {
-        return have;                    /* torn: the next frame's */
-    }
-    taken = f0;
-    iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, ack), &f0, 4);
     host = NULL;
     if (v->version >= 3 && v->shm_size) {
         bool locked = !bql_locked();
@@ -570,7 +663,13 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             bql_unlock();
         }
     }
+    if (host && vg_pages(host, v->shm_size, &pages)) {
+        have_pages = true;
+        ps = pages.seq;
+    }
+    taken_pages = ps;
     out->frame = f0;
+    out->pages = ps;
     out->region = host;
     out->region_size = host ? v->shm_size : 0;
     out->look = v->look;
@@ -582,6 +681,19 @@ static int vg_surfaces_view(MetalSurfacesView *out)
         MetalSurface *d;
         uint32_t o = v->offset[k];
 
+        if (e->kind == ROSGD_SURF_PAGE && host && have_pages && e->param) {
+            /* a Linux program's window: the compositor's page for it, at
+             * the Wimp's place for it, seen where the Wimp says */
+            for (uint32_t i = 0; i < pages.n && i < ROSGD_PAGES; i++) {
+                const RosgdPage *p = &pages.page[i];
+
+                if (p->id && p->window == e->param && e->rects + e->nrects <= ROSGD_V2_RECTS) {
+                    vg_page_surface(out, p, e->x + p->x, e->y + p->y, &v->rect[e->rects],
+                                    e->nrects, v->shm_size);
+                }
+            }
+            continue;
+        }
         if ((e->kind == 1 || e->kind == 2) && out->nicons < METAL_ICONS && e->w > 0 && e->h > 0) {
             /* the clock's face, the meter's graph: drawn by the window */
             MetalIcon *ic = &out->icon[out->nicons++];
@@ -608,6 +720,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             continue;
         }
         d = &out->s[out->n++];
+        memset(d, 0, sizeof(*d));
         d->x = e->x, d->y = e->y, d->w = e->w, d->h = e->h;
         d->offset = o;
         d->stride = e->stride;
@@ -634,6 +747,13 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             out->nrects++;
         }
         d->shadow_nrects = out->nrects - d->shadow_rects;
+    }
+    /* popups (window 0): where the table says, over everything */
+    for (uint32_t i = 0; host && have_pages && i < pages.n && i < ROSGD_PAGES; i++) {
+        if (pages.page[i].id && !pages.page[i].window) {
+            vg_page_surface(out, &pages.page[i], pages.page[i].x, pages.page[i].y, NULL, 0,
+                            v->shm_size);
+        }
     }
     have = out->n > 0;
     view.wimp_only = have;

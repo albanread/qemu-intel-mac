@@ -2567,8 +2567,8 @@ static NSString *const SURF_SRC = @
 "struct SQuad {\n"
 "    float4 rect;    /* where it draws: x0 y0 x1 y1, guest pixels */\n"
 "    float4 box;     /* the surface (or the shadow's dropped box): x y w h */\n"
-"    uint4 u;        /* offset, stride (bytes), kind (0 pixels, 1 shadow), 0 */\n"
-"    float4 sh;      /* shadow: radius, blur, strength 0..1, 0 */\n"
+"    uint4 u;        /* offset, stride (bytes), kind (0 pixels, 1 shadow), format */\n"
+"    float4 sh;      /* shadow: radius, blur, strength 0..1, 0; a page: its pixels w, h */\n"
 "};\n"
 "struct SOut {\n"
 "    float4 pos [[position]];\n"
@@ -2604,6 +2604,15 @@ static NSString *const SURF_SRC = @
 "    int2 l = int2(floor(p - Q.box.xy));\n"
 "    if (l.x < 0 || l.y < 0 || l.x >= int(Q.box.z) || l.y >= int(Q.box.w)) {\n"
 "        discard_fragment();\n"
+"    }\n"
+"    if (Q.u.w != 0) {\n"
+"        /* a Linux program's page: B G R A bytes, its own size scaled to\n"
+"         * the window's, premultiplied (format 1) or opaque (2) */\n"
+"        uint2 b = uint2(float2(l) * Q.sh.xy / Q.box.zw);\n"
+"        uint w = region[(Q.u.x + b.y * Q.u.y) / 4 + b.x];\n"
+"        float4 c = float4(float((w >> 16) & 255), float((w >> 8) & 255), float(w & 255),\n"
+"                          float(w >> 24)) / 255.0;\n"
+"        return Q.u.w == 2 ? float4(c.rgb, 1.0) : c;\n"
 "    }\n"
 "    uint w = region[(Q.u.x + uint(l.y) * Q.u.y) / 4 + uint(l.x)];\n"
 "    if ((w >> 24) == 0x80) {\n"
@@ -2786,7 +2795,7 @@ static struct {
     bool on;                            /* this frame composites the list */
     id<MTLRenderPipelineState> face;    /* the clock's and the meter's, into the drawable */
     id<MTLRenderPipelineState> face_shot;   /* the same, into a screenshot's RGBA texture */
-    uint32_t drawn_frame;
+    uint32_t drawn_frame, drawn_pages;
     double face_due;                    /* when a listed clock is next to be drawn */
     uint64_t frames, quads_drawn;
 } surf;
@@ -2921,8 +2930,9 @@ static uint32_t surf_quads(SQuad *q)
 
             o->rect[0] = r[0], o->rect[1] = r[1], o->rect[2] = r[2], o->rect[3] = r[3];
             o->box[0] = e->x, o->box[1] = e->y, o->box[2] = e->w, o->box[3] = e->h;
-            o->u[0] = e->offset, o->u[1] = e->stride, o->u[2] = 0, o->u[3] = 0;
+            o->u[0] = e->offset, o->u[1] = e->stride, o->u[2] = 0, o->u[3] = e->format;
             memset(o->sh, 0, sizeof(o->sh));
+            o->sh[0] = e->bw, o->sh[1] = e->bh;
         }
     }
     return n;
@@ -3193,7 +3203,8 @@ static bool metal_render_frame(void)
         if (have_fb && v.content && !frame_wanted && v.content == drawn_content
             && v.generation == drawn_gen && pgen == ptr.generation
             && size.width == drawn_size.width && size.height == drawn_size.height
-            && (!surf.on || surf.view.frame == surf.drawn_frame) && !surf_face_due()) {
+            && (!surf.on || (surf.view.frame == surf.drawn_frame
+                             && surf.view.pages == surf.drawn_pages)) && !surf_face_due()) {
             frame_skipped = true;
             return have_fb;
         }
@@ -3217,6 +3228,7 @@ static bool metal_render_frame(void)
         }
         frame_wanted = false;
         surf.drawn_frame = surf.on ? surf.view.frame : 0;
+        surf.drawn_pages = surf.on ? surf.view.pages : 0;
         drawn_content = have_fb ? v.content : 0;
         drawn_gen = have_fb ? v.generation : 0;
         drawn_size = size;

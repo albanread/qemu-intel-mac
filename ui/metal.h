@@ -147,6 +147,9 @@ typedef struct MetalSurface {
     uint32_t shadow_rects, shadow_nrects;   /* where its shadow shows */
     int16_t shadow_dx, shadow_dy, shadow_blur, shadow_strength;
     uint16_t radius;                /* its corners, guest pixels: the shadow's */
+    uint16_t format;                /* 0 a backing (R G B A); a Linux program's
+                                       page: 1 B G R A premultiplied, 2 B G R x */
+    uint32_t bw, bh;                /* a page's own pixels, scaled to w x h */
 } MetalSurface;
 /* An icon whose picture the window draws itself (screen.h's
  * ROS_SURF_CLOCK, ROS_SURF_MONITOR): DeskClock's face and DeskMeter's
@@ -161,6 +164,7 @@ typedef struct MetalIcon {
 } MetalIcon;
 typedef struct MetalSurfacesView {
     uint32_t frame;                 /* the list's frame: moves when anything does */
+    uint32_t pages;                 /* the compositor's page table's seq: likewise */
     void *region;                   /* the host's mapping of the region */
     uint64_t region_size;
     uint32_t look;                  /* the depth the desktop asked for (screen.h) */

@@ -591,6 +591,32 @@ static void metal_release_modifiers(void)
     mod_state = 0;
 }
 
+/* Every other key the guest has been told is down, by macOS key code.
+ * The key-up goes to whichever window has the keyboard when the key is
+ * let go: when the browser's page takes it (a Return in !Browser's
+ * address field opens a window), or a Command-Tab leaves, the guest
+ * never hears the key go up and RISC OS repeats it for ever. */
+static uint8_t keys_held[128];
+
+static void metal_key_held(uint32_t code, bool down)
+{
+    if (code < sizeof(keys_held)) {
+        keys_held[code] = down;
+    }
+}
+
+static void metal_release_keys(void)
+{
+    uint32_t i;
+
+    for (i = 0; i < sizeof(keys_held); i++) {
+        if (keys_held[i]) {
+            keys_held[i] = 0;
+            metal_glue_key(false, i);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* The shaders.  One source, compiled once; the decode pass is          */
 /* specialised on the guest's bits per pixel and the scale pass on the  */
@@ -3998,6 +4024,7 @@ bool metal_ui_screenshot(const char *path)
         return;
     }
     m.keys++;
+    metal_key_held([e keyCode], true);
     metal_glue_key(true, [e keyCode]);
 }
 
@@ -4006,6 +4033,7 @@ bool metal_ui_screenshot(const char *path)
     if ([e keyCode] == 105) {
         return;
     }
+    metal_key_held([e keyCode], false);
     metal_glue_key(false, [e keyCode]);
 }
 
@@ -4195,6 +4223,7 @@ static void metal_buttons_release_all(void)
     (void)n;
     metal_set_grab(false);          /* never hold the host pointer hostage */
     metal_release_modifiers();
+    metal_release_keys();           /* and no key it will never see go up */
     metal_buttons_release_all();    /* nor a button it will never release */
     cursor.inside = false;          /* and never a cursor, either */
     metal_cursor_sync();

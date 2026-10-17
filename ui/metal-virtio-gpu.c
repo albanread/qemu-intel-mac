@@ -395,6 +395,11 @@ static struct {
     uint32_t copied_gen;        /* the mode generation it was copied in */
     uint32_t drawn_pal[256];    /* the palette last seen: a change is new */
     unsigned still, tick;
+    /* The surfaces view has a list (design 39): the screen is not shown,
+     * so it is neither compared nor copied -- 4 MB a frame at 1280 x 800
+     * was most of the window's time in a drag.  When the list goes, the
+     * stage is copied whole again. */
+    bool wimp_only;
 } view;
 
 /* the stage brought up to date with the guest's bytes; whether any changed */
@@ -461,7 +466,9 @@ static int vg_fb_view(MetalFbView *out)
         view.content_res = NULL;        /* all of it copied, below */
     }
     view.tick++;
-    if (view.content_res != view.b.res || view.copied_gen != view.generation) {
+    if (view.wimp_only) {
+        view.content_res = NULL;        /* all of it, when it shows again */
+    } else if (view.content_res != view.b.res || view.copied_gen != view.generation) {
         /* another resource: a compositor's new frame, or a new mode */
         iov_to_buf(view.b.iov, view.b.niov, 0, view.stage, need);
         view.content_res = view.b.res;
@@ -530,6 +537,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
     }
     off = vg_v2_offset(&view.b, &view.mode);
     if (!off) {
+        view.wimp_only = false;
         return have = 0;
     }
     if (iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, frame), &f0, 4) != 4) {
@@ -628,6 +636,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
         d->shadow_nrects = out->nrects - d->shadow_rects;
     }
     have = out->n > 0;
+    view.wimp_only = have;
     return have;
 }
 

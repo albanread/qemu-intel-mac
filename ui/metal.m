@@ -3046,6 +3046,7 @@ static bool metal_screenshot_to(NSString *path);
  * for each second that presented any, and once when it falls idle -- an
  * idle desktop is to present none */
 static uint32_t pace_presented;
+static char want_window[256];           /* a "window:NAME" shot request: the drawable */
 static uint32_t pace_why[6];            /* why: screen, mode, pointer, size, list, asked */
 
 static void metal_pace(void)
@@ -3142,6 +3143,11 @@ static bool metal_render_frame(void)
                 want[strcspn(want, "\r\n /")] = 0;
                 if (!want[0]) {
                     snprintf(want, sizeof(want), "shot");
+                }
+                if (!strncmp(want, "window:", 7)) {
+                    /* the drawable as the window shows it, this frame */
+                    snprintf(want_window, sizeof(want_window), "%s", want + 7);
+                    want[0] = 0;
                 }
                 fclose(f);
                 unlink(req);
@@ -3421,8 +3427,54 @@ static bool metal_render_frame(void)
         }
         dispatch_semaphore_signal(m.inflight);
     }];
-    [cb presentDrawable:drawable];
-    [cb commit];
+    {
+        id<MTLBuffer> wbuf = nil;
+        NSUInteger ww = drawable.texture.width, wh = drawable.texture.height;
+        const char *wdir = getenv("METAL_SHOT_DIR");
+
+        if (want_window[0] && wdir && !m.layer.framebufferOnly) {
+            id<MTLBlitCommandEncoder> wb = [cb blitCommandEncoder];
+
+            wbuf = [m.device newBufferWithLength:ww * wh * 4 options:MTLResourceStorageModeShared];
+            [wb copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0
+                   sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(ww, wh, 1)
+                       toBuffer:wbuf destinationOffset:0 destinationBytesPerRow:ww * 4
+                destinationBytesPerImage:ww * wh * 4];
+            [wb endEncoding];
+        }
+        [cb presentDrawable:drawable];
+        [cb commit];
+        if (wbuf) {
+            NSString *path = [NSString stringWithFormat:@"%s/%s.png", wdir, want_window];
+            CGColorSpaceRef wcs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            CGContextRef wctx;
+            CGImageRef wimg;
+            CGImageDestinationRef wdst;
+
+            [cb waitUntilCompleted];        /* a test's, now and then: worth the wait */
+            wctx = CGBitmapContextCreate([wbuf contents], ww, wh, 8, ww * 4, wcs,
+                                         kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+            wimg = wctx ? CGBitmapContextCreateImage(wctx) : NULL;
+            wdst = wimg ? CGImageDestinationCreateWithURL((CFURLRef)[NSURL fileURLWithPath:path],
+                                                          CFSTR("public.png"), 1, NULL) : NULL;
+            if (wdst) {
+                CGImageDestinationAddImage(wdst, wimg, NULL);
+                CGImageDestinationFinalize(wdst);
+                CFRelease(wdst);
+            }
+            metal_log("shot: window %s.png (%lux%lu) %s", want_window, (unsigned long)ww,
+                      (unsigned long)wh, wdst ? "written" : "FAILED");
+            if (wimg) {
+                CGImageRelease(wimg);
+            }
+            if (wctx) {
+                CGContextRelease(wctx);
+            }
+            CGColorSpaceRelease(wcs);
+            [wbuf release];
+            want_window[0] = 0;
+        }
+    }
     pace_presented++;
     return have_fb;
 }
@@ -3678,7 +3730,8 @@ bool metal_ui_screenshot(const char *path)
 
     l.device = m.device;
     l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    l.framebufferOnly = YES;
+    /* a test's pictures of the window itself read the drawable back */
+    l.framebufferOnly = getenv("METAL_SHOT_DIR") ? NO : YES;
     l.maximumDrawableCount = METAL_RING;
     l.displaySyncEnabled = YES;      /* the present is the pacing */
     l.allowsNextDrawableTimeout = YES;

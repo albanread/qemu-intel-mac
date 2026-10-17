@@ -376,6 +376,9 @@ static HBWindow *hb_new(NSString *url, WKWebViewConfiguration *cfg)
     if (!cfg) {
         c.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
         c.preferences.javaScriptCanOpenWindowsAutomatically = NO;
+        /* a video starts when its page says, as in Safari with autoplay
+         * allowed: the reader has asked for the page */
+        c.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
         if (@available(macOS 11.0, *)) {
             c.defaultWebpagePreferences.allowsContentJavaScript = YES;
         }

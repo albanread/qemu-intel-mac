@@ -148,6 +148,17 @@ typedef struct MetalSurface {
     int16_t shadow_dx, shadow_dy, shadow_blur, shadow_strength;
     uint16_t radius;                /* its corners, guest pixels: the shadow's */
 } MetalSurface;
+/* An icon whose picture the window draws itself (screen.h's
+ * ROS_SURF_CLOCK, ROS_SURF_MONITOR): DeskClock's face and DeskMeter's
+ * graph, at the window's own resolution */
+#define METAL_ICONS         6
+typedef struct MetalIcon {
+    uint32_t kind, style;           /* 1 the clock, 2 the meter; the task's style */
+    uint32_t rate;                  /* the rate it asks to be drawn again at, Hz (0: as it changes) */
+    int16_t x, y, w, h;             /* its box, guest pixels */
+    uint32_t rects, nrects;         /* visible: a range of the rect pool */
+    uint8_t data[32];               /* the meter's last 24 seconds, 0-255, oldest first */
+} MetalIcon;
 typedef struct MetalSurfacesView {
     uint32_t frame;                 /* the list's frame: moves when anything does */
     void *region;                   /* the host's mapping of the region */
@@ -157,6 +168,8 @@ typedef struct MetalSurfacesView {
     MetalSurface s[METAL_SURFACES];
     uint32_t nrects;
     int16_t rect[METAL_SURF_RECTS][4];  /* x0 y0 x1 y1, half-open */
+    uint32_t nicons;
+    MetalIcon icon[METAL_ICONS];
 } MetalSurfacesView;
 
 /*

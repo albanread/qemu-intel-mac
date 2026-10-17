@@ -2561,6 +2561,158 @@ static NSString *const SURF_SRC = @
 "    }\n"
 "    return float4(float(w & 255), float((w >> 8) & 255), float((w >> 16) & 255),\n"
 "                  float(w >> 24)) / 255.0;  /* premultiplied */\n"
+"}\n"
+/* The icons whose pictures this window draws (ROS_SURF_CLOCK and
+ * ROS_SURF_MONITOR): the PC presenter's shaders, in MSL, drawn at the
+ * window's own resolution.  DeskClock's face: its styles' colours (face,
+ * hour, minute, second, centre, tick, rim, inner, &00BBGGRR), dots and
+ * digits; 4 x 4 samples a pixel, premultiplied.  DeskMeter's graph:
+ * pixel art, a block for each of its 52 x 34 pixels. */
+"struct FaceU {\n"
+"    float4 box;     /* the icon on the drawable: x, y down, w, h */\n"
+"    float4 clip;    /* this draw's rectangle: x0 y0 x1 y1 */\n"
+"    float2 target;  /* the drawable's size */\n"
+"    uint style, kind;\n"
+"    float4 hms;     /* hours, minutes, seconds */\n"
+"    float hist[24]; /* the meter's, 0-255, oldest first */\n"
+"};\n"
+"struct FOut { float4 pos [[position]]; };\n"
+"vertex FOut vs_face(uint vid [[vertex_id]], constant FaceU &U [[buffer(0)]])\n"
+"{\n"
+"    float2 c = float2((vid & 1) ? U.clip.z : U.clip.x, (vid & 2) ? U.clip.w : U.clip.y);\n"
+"    FOut o;\n"
+"    o.pos = float4(c.x / U.target.x * 2.0 - 1.0, 1.0 - c.y / U.target.y * 2.0, 0.0, 1.0);\n"
+"    return o;\n"
+"}\n"
+"constant uint ST[40] = {\n"
+"  0x00E0F2F8u, 0x00202020u, 0x00A08040u, 0x002020C0u, 0x00202020u, 0x00202020u, 0x00201A10u, 0x00C0A070u,\n"
+"  0x001F1410u, 0x00F0F0F0u, 0x00E0D0B0u, 0x002A8AFFu, 0x00F0F0F0u, 0x00CFF4C4u, 0x00443C2Eu, 0x00A8C56Fu,\n"
+"  0x000E1014u, 0x00E5FF00u, 0x007F3DFFu, 0x004DE9FFu, 0x00FFFFFFu, 0x00E5FF00u, 0x007F3DFFu, 0x00FFE500u,\n"
+"  0x00EEF6EAu, 0x002B3124u, 0x007B8A7Bu, 0x004D67E8u, 0x002B3124u, 0x002F6B4Fu, 0x002F6B4Fu, 0x00BFDCCBu,\n"
+"  0x00181212u, 0x002020F0u, 0x002020F0u, 0x002020F0u, 0x002020F0u, 0x00504040u, 0x00504040u, 0x00504040u };\n"
+"constant int DOTS[5] = { 0, 0, 0, 1, 1 };\n"
+"constant int DIGI[5] = { 0, 0, 0, 0, 1 };\n"
+"constant int SEGS[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };\n"
+"static float3 fc_rgb(uint c) { return float3(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u)) / 255.0; }\n"
+"static float capsule(float2 p, float2 a, float2 b, float r) {\n"
+"    float2 pa = p - a, v = b - a;\n"
+"    float t = clamp(dot(pa, v) / dot(v, v), 0.0, 1.0);\n"
+"    return length(pa - v * t) - r;\n"
+"}\n"
+"static float disc(float2 p, float2 c, float r) { return length(p - c) - r; }\n"
+"static float hand(float2 p, float c, float a, float t0, float t1, float hw) {\n"
+"    float s = sin(a), k = cos(a);\n"
+"    return capsule(p, float2(c + t0 * s, c - t0 * k), float2(c + t1 * s, c - t1 * k), hw);\n"
+"}\n"
+"static bool digit_at(float2 p, int d, float x0, float y0, float wd, float ht) {\n"
+"    const float hw = 0.75;\n"
+"    float m = y0 + ht / 2.0, x1 = x0 + wd, y1 = y0 + ht;\n"
+"    float4 seg[7] = { float4(x0, y0, x1, y0), float4(x1, y0, x1, m), float4(x1, m, x1, y1),\n"
+"                      float4(x0, y1, x1, y1), float4(x0, m, x0, y1), float4(x0, y0, x0, m),\n"
+"                      float4(x0, m, x1, m) };\n"
+"    for (int i = 0; i < 7; i++)\n"
+"        if (((SEGS[d] >> i) & 1) != 0 && capsule(p, seg[i].xy, seg[i].zw, hw) < 0.0)\n"
+"            return true;\n"
+"    return false;\n"
+"}\n"
+"static int face_at(float2 p, int style, float3 hms) {\n"
+"    const float c = 17.0, R = 17.0 - 0.6, PI = 3.14159265358979;\n"
+"    float2 cc = float2(c);\n"
+"    if (disc(p, cc, R) >= 0.0) return -1;\n"
+"    if (disc(p, cc, R - 1.7) >= 0.0) return 6;\n"
+"    float h = hms.x, m = hms.y, s = hms.z;\n"
+"    if (DIGI[style] != 0) {\n"
+"        float wd = 5.0, ht = 9.0, gap = 2.6;\n"
+"        float x0 = c - (4.0 * wd + 3.0 * gap + 1.2) / 2.0, y0 = c - ht / 2.0;\n"
+"        int ih = int(h), im = int(m);\n"
+"        int dg[4] = { ih / 10, ih % 10, im / 10, im % 10 };\n"
+"        for (int i = 0; i < 4; i++) {\n"
+"            float dx = x0 + float(i) * (wd + gap) + (i >= 2 ? 1.2 : 0.0);\n"
+"            if (digit_at(p, dg[i], dx, y0, wd, ht)) return 1;\n"
+"        }\n"
+"        float kx = c + 0.1;\n"
+"        if ((int(s) & 1) == 0 && (disc(p, float2(kx, c - 2.2), 0.8) < 0.0 ||\n"
+"                                  disc(p, float2(kx, c + 2.2), 0.8) < 0.0)) return 1;\n"
+"        return 0;\n"
+"    }\n"
+"    float ha = (fmod(h, 12.0) + m / 60.0 + s / 3600.0) / 12.0 * 2.0 * PI;\n"
+"    float ma = (m + s / 60.0) / 60.0 * 2.0 * PI;\n"
+"    float sa = s / 60.0 * 2.0 * PI;\n"
+"    if (disc(p, cc, 1.0) < 0.0) return 3;\n"
+"    if (disc(p, cc, 1.9) < 0.0) return 4;\n"
+"    if (hand(p, c, sa, -3.8, R - 3.0, 0.42) < 0.0) return 3;\n"
+"    if (hand(p, c, ma, -1.5, R - 3.4, 0.95) < 0.0) return 2;\n"
+"    if (hand(p, c, ha, -1.5, R * 0.55, 1.35) < 0.0) return 1;\n"
+"    for (int i = 0; i < 12; i++) {\n"
+"        float a = float(i) / 12.0 * 2.0 * PI;\n"
+"        bool major = i % 3 == 0;\n"
+"        if (DOTS[style] != 0) {\n"
+"            if (major && disc(p, float2(c + (R - 4.6) * sin(a), c - (R - 4.6) * cos(a)), 1.3) < 0.0)\n"
+"                return 5;\n"
+"        } else if (hand(p, c, a, R - (major ? 5.6 : 4.4), R - 2.9, major ? 0.8 : 0.45) < 0.0) {\n"
+"            return major ? 6 : 5;\n"
+"        }\n"
+"    }\n"
+"    if (disc(p, cc, R - 2.3) >= 0.0) return 7;\n"
+"    return 0;\n"
+"}\n"
+"static float3 mt_pal(uint st, int c) {\n"
+"    if (st == 0) {\n"
+"        float3 t[8] = { float3(0, 10, 0), float3(32, 192, 32), float3(224, 192, 32), float3(224, 64, 32),\n"
+"                        float3(32, 192, 32), float3(32, 80, 32), float3(68, 192, 32), float3(32, 192, 32) };\n"
+"        return t[c];\n"
+"    }\n"
+"    if (st == 1) {\n"
+"        float3 t[8] = { float3(20, 20, 30), float3(32, 192, 96), float3(224, 192, 32), float3(224, 64, 64),\n"
+"                        float3(32, 192, 96), float3(48, 48, 48), float3(96, 96, 96), float3(32, 192, 96) };\n"
+"        return t[c];\n"
+"    }\n"
+"    return float3(255, 0, 255);   /* a style it does not know */\n"
+"}\n"
+"static int mt_pixel(int x, int y, constant float *hist) {\n"
+"    const int W = 52, H = 34;\n"
+"    int cx = min(x, W - 1 - x), cy = min(y, H - 1 - y);\n"
+"    if (cx + cy < 2 && cx < 2 && cy < 2) return -1;   /* the cut corners */\n"
+"    if (y < 2 || y >= H - 2 || x < 2 || x >= W - 2) return 6;\n"
+"    int gh = H - 6;\n"
+"    int up = H - 1 - y - 3;\n"
+"    int i = (x - 4) / 2;\n"
+"    if (x >= 4 && x < W - 3 && i < 24) {\n"
+"        float frac = floor(hist[i] * 1000.0 / 255.0);\n"
+"        int h = int(floor((float(gh) * frac + 500.0) / 1000.0));\n"
+"        if (frac > 0.0 && up >= 0 && up < h)\n"
+"            return frac < 500.0 ? 1 : frac < 750.0 ? 2 : 3;\n"
+"    }\n"
+"    bool inside = y >= 3 && y < H - 3 && x >= 3 && x < W - 3;\n"
+"    if (inside && y - 3 == gh / 2 && ((x - 3) & 3) < 2) return 5;\n"
+"    return 0;\n"
+"}\n"
+"fragment float4 ps_face(FOut in [[stage_in]], constant FaceU &U [[buffer(0)]])\n"
+"{\n"
+"    if (U.kind == 2) {\n"
+"        float2 px = in.pos.xy - U.box.xy;\n"
+"        int2 q = int2(floor(px / U.box.zw * float2(52.0, 34.0)));\n"
+"        if (q.x < 0 || q.y < 0 || q.x > 51 || q.y > 33) discard_fragment();\n"
+"        int c = mt_pixel(q.x, q.y, U.hist);\n"
+"        if (c < 0) discard_fragment();\n"
+"        return float4(mt_pal(U.style % 2, c) / 255.0, 1.0);\n"
+"    }\n"
+"    float2 px = in.pos.xy - 0.5 - U.box.xy;\n"
+"    float2 k = 34.0 / U.box.zw;\n"
+"    int style = int(U.style % 5);\n"
+"    float3 acc = float3(0.0);\n"
+"    float n = 0.0;\n"
+"    for (int j = 0; j < 4; j++)\n"
+"        for (int i = 0; i < 4; i++) {\n"
+"            int c = face_at((px + (float2(i, j) + 0.5) / 4.0) * k, style, U.hms.xyz);\n"
+"            if (c >= 0) {\n"
+"                acc += fc_rgb(ST[style * 8 + c]);\n"
+"                n += 1.0;\n"
+"            }\n"
+"        }\n"
+"    if (n == 0.0) discard_fragment();\n"
+"    float a = n / 16.0;\n"
+"    return float4(acc / n * a, a);  /* premultiplied */\n"
 "}\n";
 
 typedef struct SQuad {
@@ -2582,7 +2734,10 @@ static struct {
     unsigned ring;
     MetalSurfacesView view;
     bool on;                            /* this frame composites the list */
+    id<MTLRenderPipelineState> face;    /* the clock's and the meter's, into the drawable */
+    id<MTLRenderPipelineState> face_shot;   /* the same, into a screenshot's RGBA texture */
     uint32_t drawn_frame;
+    double face_due;                    /* when a listed clock is next to be drawn */
     uint64_t frames, quads_drawn;
 } surf;
 
@@ -2631,6 +2786,36 @@ static bool surf_build(void)
     for (unsigned i = 0; i < METAL_RING; i++) {
         surf.quads[i] = [m.device newBufferWithLength:SURF_QUADS * sizeof(SQuad)
                                               options:MTLResourceStorageModeShared];
+    }
+    {
+        id<MTLLibrary> flib;
+        id<MTLFunction> fvs, ffs;
+        MTLCompileOptions *fo = [[MTLCompileOptions alloc] init];
+
+        flib = [m.device newLibraryWithSource:SURF_SRC options:fo error:&err];
+        [fo release];
+        fvs = [flib newFunctionWithName:@"vs_face"];
+        ffs = [flib newFunctionWithName:@"ps_face"];
+        pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = fvs;
+        pd.fragmentFunction = ffs;
+        pd.colorAttachments[0].pixelFormat = m.layer.pixelFormat;
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        surf.face = flib ? [m.device newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        surf.face_shot = flib ? [m.device newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+        [pd release];
+        [fvs release];
+        [ffs release];
+        [flib release];
+        if (!surf.face) {
+            metal_log("surfaces: the faces' pipeline failed: %s",
+                      err ? [[err localizedDescription] UTF8String] : "?");
+        }
     }
     metal_log("surfaces: pipeline up");
     return true;
@@ -2691,6 +2876,84 @@ static uint32_t surf_quads(SQuad *q)
         }
     }
     return n;
+}
+
+typedef struct FaceU {
+    float box[4], clip[4], target[2];
+    uint32_t style, kind;
+    float hms[4];
+    float hist[24];
+} FaceU;
+
+/* The clock's face and the meter's graph, into the drawable at its own
+ * resolution, clipped to what can be seen of each, over the scaled
+ * frame (enc is its encoder) */
+static void surf_faces(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> pipe,
+                       CGSize target, uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+    struct timeval tv;
+    struct tm lt;
+    time_t tt;
+    FaceU u;
+
+    if (!surf.on || !v->nicons || !pipe) {
+        return;
+    }
+    gettimeofday(&tv, NULL);
+    tt = tv.tv_sec;
+    localtime_r(&tt, &lt);
+    [enc setRenderPipelineState:pipe];
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        const MetalIcon *ic = &v->icon[i];
+
+        memset(&u, 0, sizeof(u));
+        u.box[0] = ic->x * sx, u.box[1] = ic->y * sy, u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
+        u.target[0] = target.width, u.target[1] = target.height;
+        u.style = ic->style, u.kind = ic->kind;
+        u.hms[0] = lt.tm_hour, u.hms[1] = lt.tm_min;
+        u.hms[2] = lt.tm_sec + (ic->rate > 1 ? tv.tv_usec / 1e6f : 0.0f);
+        for (int k = 0; k < 24; k++) {
+            u.hist[k] = ic->data[k];
+        }
+        for (uint32_t r = 0; r < ic->nrects; r++) {
+            const int16_t *q = v->rect[ic->rects + r];
+
+            u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+            u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+            if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
+                continue;
+            }
+            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+    }
+}
+
+/* Whether a listed clock is due to be drawn again: at the rate it asks,
+ * else at each second */
+static bool surf_face_due(void)
+{
+    const MetalSurfacesView *v = &surf.view;
+    double now = CFAbsoluteTimeGetCurrent(), step = 0;
+
+    if (!surf.on) {
+        return false;
+    }
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        if (v->icon[i].kind == 1 && v->icon[i].nrects) {
+            double s = v->icon[i].rate > 1 ? 1.0 / MIN(v->icon[i].rate, 60u) : 1.0;
+
+            step = step ? MIN(step, s) : s;
+        }
+    }
+    if (!step || now < surf.face_due) {
+        return false;
+    }
+    surf.face_due = (floor(now / step) + 1) * step;
+    return true;
 }
 
 /* This frame's surfaces into fb.decoded, in place of the decode pass */
@@ -2874,7 +3137,7 @@ static bool metal_render_frame(void)
         if (have_fb && v.content && !frame_wanted && v.content == drawn_content
             && v.generation == drawn_gen && pgen == ptr.generation
             && size.width == drawn_size.width && size.height == drawn_size.height
-            && (!surf.on || surf.view.frame == surf.drawn_frame)) {
+            && (!surf.on || surf.view.frame == surf.drawn_frame) && !surf_face_due()) {
             frame_skipped = true;
             return have_fb;
         }
@@ -3004,6 +3267,10 @@ static bool metal_render_frame(void)
         [enc setFragmentSamplerState:m.linear atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle
                 vertexStart:0 vertexCount:3];
+    }
+
+    if (have_fb && surf.on) {
+        surf_faces(enc, surf.face, target, v.xres, v.yres);
     }
 
     /* The pointer sprite, on top of the scaled frame.  The peer
@@ -3218,6 +3485,8 @@ static bool metal_screenshot_to(NSString *path)
             [senc setFragmentSamplerState:m.linear atIndex:0];
             [senc drawPrimitives:MTLPrimitiveTypeTriangle
                      vertexStart:0 vertexCount:3];
+            /* the icons this window draws itself, as the window shows them */
+            surf_faces(senc, surf.face_shot, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             [senc endEncoding];
             source = composite;
         }

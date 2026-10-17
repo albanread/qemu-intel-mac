@@ -359,8 +359,7 @@ static void vg_announce(const VgBacking *b, const VgMode *m)
     p.magic = cpu_to_le32(ROSGD_PRESENT_MAGIC);
     p.state = cpu_to_le32(2);
     p.beat = cpu_to_le32(++beat);
-    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION |
-                         (mode == VG_SURF_ON ? ROSGD_PRESENT_WINDOWS_ONLY : 0));
+    p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION);
     iov_from_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_PRESENT,
                  &p, sizeof(p));
     if (mode != VG_SURF_PROBE) {
@@ -569,10 +568,31 @@ static int vg_surfaces_view(MetalSurfacesView *out)
     out->look = v->look;
     out->n = 0;
     out->nrects = 0;
+    out->nicons = 0;
     for (uint32_t k = 0; k < v->nsurfaces && k < ROSGD_V2_SURFACES; k++) {
         const RosgdV2Surface *e = &v->surface[k];
         MetalSurface *d;
         uint32_t o = v->offset[k];
+
+        if ((e->kind == 1 || e->kind == 2) && out->nicons < METAL_ICONS && e->w > 0 && e->h > 0) {
+            /* the clock's face, the meter's graph: drawn by the window */
+            MetalIcon *ic = &out->icon[out->nicons++];
+
+            ic->kind = e->kind, ic->style = e->param, ic->rate = e->stride;
+            ic->x = e->x, ic->y = e->y, ic->w = e->w, ic->h = e->h;
+            memcpy(ic->data, e->data, sizeof(ic->data));
+            ic->rects = out->nrects;
+            for (uint32_t r = 0; r < e->nrects && e->rects + r < ROSGD_V2_RECTS
+                 && out->nrects < METAL_SURF_RECTS; r++) {
+                const RosgdV2Rect *q = &v->rect[e->rects + r];
+
+                out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
+                out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+                out->nrects++;
+            }
+            ic->nrects = out->nrects - ic->rects;
+            continue;
+        }
 
         if (e->kind != ROSGD_SURF_WINDOW || !e->backing || o == ROSGD_V2_NO_OFFSET || !host
             || e->w <= 0 || e->h <= 0 || !e->stride
@@ -810,6 +830,11 @@ static void hmp_info_box_v2(Monitor *mon, const QDict *qdict)
         if (e->kind == ROSGD_SURF_WINDOW) {
             monitor_printf(mon, " backing %u stride %u", e->backing,
                            e->stride);
+            if (e->data[1] || e->shadow_nrects) {
+                monitor_printf(mon, " corner %u shadow %u rects drop %d blur %d "
+                               "strength %d", e->data[1], e->shadow_nrects,
+                               e->shadow_dy, e->shadow_blur, e->shadow_strength);
+            }
         }
         if (o != ROSGD_V2_NO_OFFSET && host && (uint64_t)o + 16 <= v->shm_size) {
             uint32_t mapped[4], phys[4];

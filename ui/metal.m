@@ -4301,6 +4301,12 @@ static void metal_view_take_keys(void)
     return YES;
 }
 
+/* Every press and release carries its own place: Cocoa sends no
+ * mouseMoved: just before a click when the pointer came in from another
+ * window, or the window was brought forward by the click, or the move was
+ * quicker than its events, so the guest would put the press where the
+ * pointer last was -- and a stroke drawn from it starts off the page, with
+ * a line out to where the button really went down. */
 - (void)mouseDown:(NSEvent *)e
 {
     metal_view_take_keys();
@@ -4309,11 +4315,13 @@ static void metal_view_take_keys(void)
         metal_log("view: mouseDown -> button %d (flags %#lx)",
                   mouse.held_left, (unsigned long)[e modifierFlags]);
     }
+    metal_mouse_move(e);            /* where it was pressed, first */
     metal_button(mouse.held_left, true);
 }
 
 - (void)mouseUp:(NSEvent *)e
 {
+    metal_mouse_move(e);
     metal_button(mouse.held_left, false);
     metal_mods_restore(e);
 }
@@ -4326,11 +4334,13 @@ static void metal_view_take_keys(void)
         metal_log("view: rightMouseDown -> button %d (flags %#lx)",
                   mouse.held_right, (unsigned long)[e modifierFlags]);
     }
+    metal_mouse_move(e);
     metal_button(mouse.held_right, true);
 }
 
 - (void)rightMouseUp:(NSEvent *)e
 {
+    metal_mouse_move(e);
     metal_button(mouse.held_right, false);
     metal_mods_restore(e);
 }
@@ -4347,6 +4357,7 @@ static void metal_view_take_keys(void)
         return;
     }
     metal_view_take_keys();
+    metal_mouse_move(e);
     metal_button(1, true);
 }
 
@@ -4355,6 +4366,7 @@ static void metal_view_take_keys(void)
     if ([e buttonNumber] != 2) {
         return;
     }
+    metal_mouse_move(e);
     metal_button(1, false);
 }
 

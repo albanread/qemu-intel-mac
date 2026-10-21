@@ -104,6 +104,12 @@ typedef struct VgMode {
 #define ROSGD_V2_NO_OFFSET      0xFFFFFFFFu
 #define ROSGD_SURF_WINDOW       3u
 #define ROSGD_SURF_PAGE         4u
+/* A game pane (design 50) is ROSGD_SURF_GAMEPANE, declared in metal.h
+ * beside MetalIcon because that is what metal.m switches on: the host
+ * RENDERS this surface rather than copying it.  Its data says where its
+ * block lies in the region, and it arrives through the icon-surface
+ * path because that path already carries a kind and the kind's 32
+ * bytes. */
 
 typedef struct RosgdPresent {
     uint32_t magic, state, beat, caps;
@@ -778,8 +784,10 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             }
             continue;
         }
-        if ((e->kind == 1 || e->kind == 2) && out->nicons < METAL_ICONS && e->w > 0 && e->h > 0) {
-            /* the clock's face, the meter's graph: drawn by the window */
+        if ((e->kind == 1 || e->kind == 2 || e->kind == ROSGD_SURF_GAMEPANE)
+            && out->nicons < METAL_ICONS && e->w > 0 && e->h > 0) {
+            /* the clock's face, the meter's graph, a game pane: drawn by
+             * the window rather than copied out of guest memory */
             MetalIcon *ic = &out->icon[out->nicons++];
 
             ic->kind = e->kind, ic->style = e->param, ic->rate = e->stride;
@@ -1010,6 +1018,7 @@ static const char *vg_kind(uint32_t k)
     case 2: return "monitor";
     case ROSGD_SURF_WINDOW: return "window";
     case ROSGD_SURF_PAGE: return "page";
+    case ROSGD_SURF_GAMEPANE: return "game pane";
     default: return "?";
     }
 }

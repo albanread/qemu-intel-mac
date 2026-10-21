@@ -162,8 +162,16 @@ typedef struct MetalSurface {
  * ROS_SURF_CLOCK, ROS_SURF_MONITOR): DeskClock's face and DeskMeter's
  * graph, at the window's own resolution */
 #define METAL_ICONS         6
+/* An icon surface's kind, as metal.m switches on it.  1 and 2 are the
+ * clock's face and the meter's graph, which the window DRAWS from a
+ * handful of numbers rather than copying pixels for.  5 is a game pane
+ * (design 50), which is the same idea carried much further: the guest
+ * writes planes and instance lists into a block and the window renders
+ * all of it.  It mirrors screen.h's ROS_SURF_GAMEPANE in the box. */
+#define ROSGD_SURF_GAMEPANE 5u
+
 typedef struct MetalIcon {
-    uint32_t kind, style;           /* 1 the clock, 2 the meter; the task's style */
+    uint32_t kind, style;           /* 1 the clock, 2 the meter, 5 a game pane */
     uint32_t rate;                  /* the rate it asks to be drawn again at, Hz (0: as it changes) */
     int16_t x, y, w, h;             /* its box, guest pixels */
     uint32_t rects, nrects;         /* visible: a range of the rect pool */

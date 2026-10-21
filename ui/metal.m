@@ -3214,6 +3214,245 @@ typedef struct FaceU {
     float hist[24];
 } FaceU;
 
+/* ---- a game pane, drawn here (design 50) -------------------------------
+ *
+ * On the PC a game pane renders itself: there is a GPU in the box.  On
+ * the Mac there is none -- the guest's Mesa is llvmpipe and virtio-gpu
+ * is a scanout -- so the guest writes its planes and its instance lists
+ * into a block, and this draws them.  The guest does no rendering at
+ * all; its layers keep the same interfaces they have on the PC, and
+ * only the last call of a frame differs.
+ *
+ * M0 is the canvas: the index plane resolved through two palettes.
+ * Indices 16..255 come from the global palette and 0..15 from the
+ * PER-SCANLINE one, which is what makes this a retro canvas rather than
+ * a framebuffer -- a gradient sky or a copper bar costs a palette row
+ * instead of a screen of pixels.  The sprites, the text and the twelve
+ * cosmos scenes follow (M1 to M3).
+ *
+ * NOTHING HERE TRUSTS THE BLOCK.  It is memory a guest program wrote.
+ * The magic, the version and the size are checked, the counts are
+ * clamped, and the planes are read at fixed offsets so there is no
+ * offset arithmetic to get wrong.
+ */
+#define GP_MAGIC    0x4E415047u         /* "GPAN" */
+#define GP_VERSION  1u
+#define GP_W        640
+#define GP_H        360
+#define GP_PAL_GLOBAL 256
+#define GP_PAL_LINE 16
+#define GP_CANVAS_OVER 1u
+
+/* The block's head, and the planes' places in it.  It mirrors
+ * include/rosgd/gamepane.h in the box; the _Static_asserts there and
+ * the size check here are what keep the two honest. */
+typedef struct GpHead {
+    uint32_t magic, version, frame, flags, scene;
+    float    seconds;
+    uint32_t nsprites, nglyphs, art_frame, reserved[7];
+} GpHead;
+#define GP_OFF_IDX        (sizeof(GpHead))
+#define GP_OFF_PAL_GLOBAL (GP_OFF_IDX + (size_t)GP_W * GP_H)
+#define GP_OFF_PAL_LINE   (GP_OFF_PAL_GLOBAL + (size_t)GP_PAL_GLOBAL * 4)
+#define GP_MIN_SIZE       (GP_OFF_PAL_LINE + (size_t)GP_PAL_LINE * GP_H * 4)
+
+/* a game pane's 32 bytes in its surface entry */
+typedef struct GpData {
+    uint32_t offset, size;
+    uint16_t canvas_w, canvas_h;
+    uint8_t  reserved[16];
+} GpData;
+
+static NSString * const GP_SRC = @""
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"\n"
+"struct GpU {\n"
+"    float4 box;          /* the pane on the target, in target pixels */\n"
+"    float4 clip;         /* the rectangle being drawn */\n"
+"    float2 target;\n"
+"    uint   over;         /* 1: index 0 is a hole */\n"
+"    uint   pad;\n"
+"};\n"
+"struct GpV { float4 pos [[position]]; float2 uv; };\n"
+"\n"
+"/* the clipped rectangle as a strip, so each visible piece of the pane\n"
+"   is one draw and nothing is painted where the pane cannot be seen */\n"
+"vertex GpV gp_vs(uint id [[vertex_id]], constant GpU &U [[buffer(0)]])\n"
+"{\n"
+"    float2 c = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = mix(U.clip.xy, U.clip.zw, c);\n"
+"    GpV o;\n"
+"    o.pos = float4(p / U.target * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    /* where that lands in the pane's own 0..1 */\n"
+"    o.uv = (p - U.box.xy) / U.box.zw;\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 gp_canvas(GpV v [[stage_in]], constant GpU &U [[buffer(0)]],\n"
+"                          texture2d<uint> idx [[texture(0)]],\n"
+"                          texture2d<float> palGlobal [[texture(1)]],\n"
+"                          texture2d<float> palLine [[texture(2)]])\n"
+"{\n"
+"    int px = clamp(int(v.uv.x * 640.0), 0, 639);\n"
+"    int py = clamp(int(v.uv.y * 360.0), 0, 359);\n"
+"    uint c = idx.read(uint2(px, py)).r;\n"
+"    if (U.over != 0u && c == 0u) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    float4 p = c < 16u ? palLine.read(uint2(c, py))\n"
+"                       : palGlobal.read(uint2(c, 0));\n"
+"    /* the palettes keep the Direct3D backend's B G R A, as they do on\n"
+"       the PC, so a game's palette data needs no rearranging on either\n"
+"       machine; the alpha is the canvas's own and never the palette's */\n"
+"    return float4(p.bgr, 1.0);\n"
+"}\n";
+
+typedef struct GpU {
+    float box[4], clip[4], target[2];
+    uint32_t over, pad;
+} GpU;
+
+static struct {
+    id<MTLRenderPipelineState> pipe;
+    id<MTLTexture> idx, pal_global, pal_line;
+    uint32_t frame;                     /* the block frame last uploaded */
+    bool tried;
+} gp;
+
+static void gp_setup(void)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    MTLRenderPipelineDescriptor *pd;
+    MTLTextureDescriptor *td;
+
+    if (gp.tried) {
+        return;
+    }
+    gp.tried = true;
+    lib = [m.device newLibraryWithSource:GP_SRC options:nil error:&err];
+    if (!lib) {
+        metal_log("game pane: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+    pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"gp_vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"gp_canvas"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    gp.pipe = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!gp.pipe) {
+        metal_log("game pane pipeline: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+    /* made once, at the canvas's fixed size: a retro canvas with a
+       settable resolution is a framebuffer with extra steps */
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint
+                                                            width:GP_W height:GP_H mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    gp.idx = [m.device newTextureWithDescriptor:td];
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                            width:GP_PAL_GLOBAL height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    gp.pal_global = [m.device newTextureWithDescriptor:td];
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                            width:GP_PAL_LINE height:GP_H mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    gp.pal_line = [m.device newTextureWithDescriptor:td];
+}
+
+/* The planes to the card, if the block holds a frame worth taking.
+ * Returns false when it does not -- then the last frame is drawn again,
+ * because a pane that tears is worse than one that repeats and at sixty
+ * frames a second nobody sees the repeat. */
+static bool gp_upload(const uint8_t *blk, size_t size)
+{
+    GpHead h;
+    uint32_t after;
+
+    if (size < GP_MIN_SIZE) {
+        return false;
+    }
+    memcpy(&h, blk, sizeof(h));
+    if (h.magic != GP_MAGIC || h.version != GP_VERSION || (h.frame & 1u)) {
+        return false;                   /* not a block, or being written */
+    }
+    if (h.frame == gp.frame) {
+        return true;                    /* unchanged: what is on the card stands */
+    }
+    [gp.idx replaceRegion:MTLRegionMake2D(0, 0, GP_W, GP_H) mipmapLevel:0
+                withBytes:blk + GP_OFF_IDX bytesPerRow:GP_W];
+    [gp.pal_global replaceRegion:MTLRegionMake2D(0, 0, GP_PAL_GLOBAL, 1) mipmapLevel:0
+                       withBytes:blk + GP_OFF_PAL_GLOBAL bytesPerRow:GP_PAL_GLOBAL * 4];
+    [gp.pal_line replaceRegion:MTLRegionMake2D(0, 0, GP_PAL_LINE, GP_H) mipmapLevel:0
+                     withBytes:blk + GP_OFF_PAL_LINE bytesPerRow:GP_PAL_LINE * 4];
+    /* The frame is read again AFTER the planes: if the guest began a new
+       one while they were being copied, what went to the card is a mix
+       of two and must not be shown.  This is the reader's half of the
+       seqlock and the only thing that makes the single block safe. */
+    memcpy(&after, blk + offsetof(GpHead, frame), sizeof(after));
+    if (after != h.frame) {
+        return false;
+    }
+    gp.frame = h.frame;
+    return true;
+}
+
+/* Every game pane in the list, drawn where the Wimp says it goes and
+ * only where it can be seen. */
+static void surf_gamepanes(id<MTLRenderCommandEncoder> enc, CGSize target,
+                           uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+
+    if (!surf.on || !v->nicons || !v->region) {
+        return;
+    }
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        const MetalIcon *ic = &v->icon[i];
+        GpData d;
+        GpU u;
+
+        if (ic->kind != ROSGD_SURF_GAMEPANE || !ic->nrects) {
+            continue;
+        }
+        memcpy(&d, ic->data, sizeof(d));
+        /* the block must lie inside the region, whole */
+        if (!d.size || (uint64_t)d.offset + d.size > v->region_size) {
+            continue;
+        }
+        gp_setup();
+        if (!gp.pipe) {
+            return;                     /* said once in the log; the desktop goes on */
+        }
+        if (!gp_upload((const uint8_t *)v->region + d.offset, d.size)) {
+            continue;
+        }
+        memset(&u, 0, sizeof(u));
+        u.box[0] = ic->x * sx, u.box[1] = ic->y * sy;
+        u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
+        u.target[0] = target.width, u.target[1] = target.height;
+        u.over = 0;                     /* M0: the canvas owns the picture */
+        [enc setRenderPipelineState:gp.pipe];
+        [enc setFragmentTexture:gp.idx atIndex:0];
+        [enc setFragmentTexture:gp.pal_global atIndex:1];
+        [enc setFragmentTexture:gp.pal_line atIndex:2];
+        for (uint32_t r = 0; r < ic->nrects; r++) {
+            const int16_t *q = v->rect[ic->rects + r];
+
+            u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+            u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+            if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
+                continue;
+            }
+            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+    }
+}
+
 /* The clock's face and the meter's graph, into the drawable at its own
  * resolution, clipped to what can be seen of each, over the scaled
  * frame (enc is its encoder) */
@@ -3654,6 +3893,7 @@ static bool metal_render_frame(void)
     }
 
     if (have_fb && surf.on) {
+        surf_gamepanes(enc, target, v.xres, v.yres);
         surf_faces(enc, surf.face, target, v.xres, v.yres);
     }
 
@@ -3935,6 +4175,7 @@ static bool metal_screenshot_to(NSString *path)
             [senc drawPrimitives:MTLPrimitiveTypeTriangle
                      vertexStart:0 vertexCount:3];
             /* the icons this window draws itself, as the window shows them */
+            surf_gamepanes(senc, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_faces(senc, surf.face_shot, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             [senc endEncoding];
             source = composite;

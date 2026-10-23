@@ -3228,8 +3228,9 @@ typedef struct FaceU {
  * PER-SCANLINE one, which is what makes this a retro canvas rather than
  * a framebuffer -- a gradient sky or a copper bar costs a palette row
  * instead of a screen of pixels.  Over it go the sprites, every one in
- * one instanced draw (M1), and the text, likewise (M2); the twelve
- * cosmos scenes under it follow (M3).
+ * one instanced draw (M1), and the text, likewise (M2); under it, when
+ * the block names one, a cosmos scene (M3) -- the twelve backdrops the
+ * PC draws, generated into MSL by the same script that makes its GLSL.
  *
  * The three are drawn into the pane's own 640x360 picture, in a pass
  * before the frame's main one, and the picture is then shown at the
@@ -3282,6 +3283,8 @@ typedef struct GpData {
     uint16_t canvas_w, canvas_h;
     uint8_t  reserved[16];
 } GpData;
+
+#include "metal-cosmos.h"
 
 static NSString * const GP_SRC = @""
 "#include <metal_stdlib>\n"
@@ -3427,7 +3430,7 @@ typedef struct GpU {
 } GpU;
 
 static struct {
-    id<MTLRenderPipelineState> canvas, show, spr, txt;
+    id<MTLRenderPipelineState> cosmos, canvas, show, spr, txt;
     id<MTLTexture> idx, pal_global, pal_line, atlas, spal, font;
     id<MTLTexture> frame;               /* the pane's own 640x360 picture */
     uint32_t drawn;                     /* the block frame the picture is of */
@@ -3479,16 +3482,20 @@ static void gp_setup(void)
         return;
     }
     gp.tried = true;
-    lib = [m.device newLibraryWithSource:GP_SRC options:nil error:&err];
+    /* the pane's own passes, and the twelve scenes appended: they are
+       generated (metal-cosmos.h), and declare nothing the passes do */
+    lib = [m.device newLibraryWithSource:[NSString stringWithFormat:@"%@%s", GP_SRC, GP_COSMOS_MSL]
+                                 options:nil error:&err];
     if (!lib) {
         metal_log("game pane: %s", [[err localizedDescription] UTF8String]);
         return;
     }
+    gp.cosmos = gp_pipe(lib, @"gp_vs", @"gp_cosmos", false);
     gp.canvas = gp_pipe(lib, @"gp_vs", @"gp_canvas", false);
     gp.show = gp_pipe(lib, @"gp_vs", @"gp_show", false);
     gp.spr = gp_pipe(lib, @"gp_spr_vs", @"gp_spr", true);
     gp.txt = gp_pipe(lib, @"gp_txt_vs", @"gp_txt", false);
-    if (!gp.canvas || !gp.show || !gp.spr || !gp.txt) {
+    if (!gp.cosmos || !gp.canvas || !gp.show || !gp.spr || !gp.txt) {
         gp.canvas = nil;                /* said in the log; the desktop goes on */
         return;
     }
@@ -3580,6 +3587,17 @@ static bool gp_render(id<MTLCommandBuffer> cb, const uint8_t *blk, size_t size)
     u.clip[2] = GP_W, u.clip[3] = GP_H;
     u.target[0] = GP_W, u.target[1] = GP_H;
     u.over = (h.flags & GP_CANVAS_OVER) ? 1u : 0u;
+    if (h.scene < GP_COSMOS_SCENES) {
+        /* layer 0, opaque and first: the frame's clear as well.  Its time
+           is the guest's wall clock, so the sky breathes at the display's
+           rate whatever the game's own step */
+        float tparm[4] = { isfinite(h.seconds) ? h.seconds : 0.0f, (float)h.scene, 0, 0 };
+
+        [enc setRenderPipelineState:gp.cosmos];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+        [enc setFragmentBytes:tparm length:sizeof(tparm) atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
     [enc setRenderPipelineState:gp.canvas];
     [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
     [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];

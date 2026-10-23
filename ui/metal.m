@@ -3227,8 +3227,16 @@ typedef struct FaceU {
  * Indices 16..255 come from the global palette and 0..15 from the
  * PER-SCANLINE one, which is what makes this a retro canvas rather than
  * a framebuffer -- a gradient sky or a copper bar costs a palette row
- * instead of a screen of pixels.  The sprites, the text and the twelve
- * cosmos scenes follow (M1 to M3).
+ * instead of a screen of pixels.  Over it go the sprites, every one in
+ * one instanced draw (M1), and the text, likewise (M2); the twelve
+ * cosmos scenes under it follow (M3).
+ *
+ * The three are drawn into the pane's own 640x360 picture, in a pass
+ * before the frame's main one, and the picture is then shown at the
+ * window's size a canvas pixel to a block of screen pixels -- as the
+ * PC's pane draws into its canvas and scales that to the screen.  A
+ * sprite lands on whole canvas pixels, and is never smeared across
+ * two, whatever the zoom.
  *
  * NOTHING HERE TRUSTS THE BLOCK.  It is memory a guest program wrote.
  * The magic, the version and the size are checked, the counts are
@@ -3254,7 +3262,19 @@ typedef struct GpHead {
 #define GP_OFF_IDX        (sizeof(GpHead))
 #define GP_OFF_PAL_GLOBAL (GP_OFF_IDX + (size_t)GP_W * GP_H)
 #define GP_OFF_PAL_LINE   (GP_OFF_PAL_GLOBAL + (size_t)GP_PAL_GLOBAL * 4)
-#define GP_MIN_SIZE       (GP_OFF_PAL_LINE + (size_t)GP_PAL_LINE * GP_H * 4)
+#define GP_SPRITES  8192
+#define GP_GLYPHS   4096
+#define GP_SLOTS    32
+#define GP_COLOURS  16
+#define GP_ATLAS    512
+#define GP_FONT_W   128
+#define GP_FONT_H   64
+#define GP_OFF_SPRITE     (GP_OFF_PAL_LINE + (size_t)GP_PAL_LINE * GP_H * 4)
+#define GP_OFF_GLYPH      (GP_OFF_SPRITE + (size_t)GP_SPRITES * 32)
+#define GP_OFF_ATLAS      (GP_OFF_GLYPH + (size_t)GP_GLYPHS * 32)
+#define GP_OFF_SPAL       (GP_OFF_ATLAS + (size_t)GP_ATLAS * GP_ATLAS)
+#define GP_OFF_FONT       (GP_OFF_SPAL + (size_t)GP_SLOTS * GP_COLOURS * 4)
+#define GP_SIZE           (GP_OFF_FONT + (size_t)GP_FONT_W * GP_FONT_H)
 
 /* a game pane's 32 bytes in its surface entry */
 typedef struct GpData {
@@ -3289,6 +3309,7 @@ static NSString * const GP_SRC = @""
 "    return o;\n"
 "}\n"
 "\n"
+"/* layer 1, into the pane's own 640x360 frame */\n"
 "fragment float4 gp_canvas(GpV v [[stage_in]], constant GpU &U [[buffer(0)]],\n"
 "                          texture2d<uint> idx [[texture(0)]],\n"
 "                          texture2d<float> palGlobal [[texture(1)]],\n"
@@ -3306,6 +3327,98 @@ static NSString * const GP_SRC = @""
 "       the PC, so a game's palette data needs no rearranging on either\n"
 "       machine; the alpha is the canvas's own and never the palette's */\n"
 "    return float4(p.bgr, 1.0);\n"
+"}\n"
+"\n"
+"/* The finished frame onto the screen: a canvas pixel to a block of\n"
+"   screen pixels, never blended between two, as a retro screen is */\n"
+"fragment float4 gp_show(GpV v [[stage_in]], texture2d<float> frame [[texture(0)]])\n"
+"{\n"
+"    int px = clamp(int(v.uv.x * 640.0), 0, 639);\n"
+"    int py = clamp(int(v.uv.y * 360.0), 0, 359);\n"
+"    return float4(frame.read(uint2(px, py)).rgb, 1.0);\n"
+"}\n"
+"\n"
+"/* Layer 2: every sprite in one instanced draw.  A record is the guest's\n"
+"   own eight floats (x, y, ax, ay, w, h, slot, alpha), read as two\n"
+"   float4s, so a frame's list crosses with one memcpy. */\n"
+"struct GpSprite { float4 a; float4 b; };\n"
+"struct GpSV {\n"
+"    float4 pos [[position]];\n"
+"    float2 atl;\n"
+"    float2 org [[flat]];\n"
+"    float2 wh [[flat]];\n"
+"    float  slot [[flat]];\n"
+"    float  alpha [[flat]];\n"
+"};\n"
+"vertex GpSV gp_spr_vs(uint id [[vertex_id]], uint inst [[instance_id]],\n"
+"                      const device GpSprite *s [[buffer(0)]])\n"
+"{\n"
+"    GpSprite r = s[inst];\n"
+"    float2 corner = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 wh = clamp(r.b.xy, float2(0), float2(512));\n"
+"    float2 p = r.a.xy + corner * wh;\n"
+"    GpSV o;\n"
+"    /* the canvas is 640x360, so 320 and 180 are its half-extents */\n"
+"    o.pos = float4(p.x / 320.0 - 1.0, 1.0 - p.y / 180.0, 0, 1);\n"
+"    o.atl = r.a.zw + corner * wh;\n"
+"    o.org = r.a.zw;\n"
+"    o.wh = wh;\n"
+"    o.slot = r.b.z;\n"
+"    o.alpha = clamp(r.b.w, 0.0, 1.0);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 gp_spr(GpSV v [[stage_in]], texture2d<uint> atlas [[texture(0)]],\n"
+"                       texture2d<float> spal [[texture(1)]])\n"
+"{\n"
+"    int x0 = int(v.org.x), y0 = int(v.org.y);\n"
+"    /* to this sprite's own rect first, then to the sheet: the first\n"
+"       clamp is what stops a sprite fringing with its neighbour */\n"
+"    int ax = clamp(int(v.atl.x), x0, x0 + int(v.wh.x) - 1);\n"
+"    int ay = clamp(int(v.atl.y), y0, y0 + int(v.wh.y) - 1);\n"
+"    ax = clamp(ax, 0, 511);\n"
+"    ay = clamp(ay, 0, 511);\n"
+"    uint c = atlas.read(uint2(ax, ay)).r & 15u;\n"
+"    if (c == 0u) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    int slot = clamp(int(v.slot + 0.5), 0, 31);\n"
+"    float4 p = spal.read(uint2(c, slot));\n"
+"    return float4(p.bgr, v.alpha);\n"
+"}\n"
+"\n"
+"/* Layer 3: every glyph in one instanced draw; the colour travels in\n"
+"   the instance, which is what makes a title, a score and an overlay\n"
+"   one draw.  The record is (x, y, cx, cy, r, g, b, scale). */\n"
+"struct GpTV {\n"
+"    float4 pos [[position]];\n"
+"    float2 atl;\n"
+"    float2 org [[flat]];\n"
+"    float3 col [[flat]];\n"
+"};\n"
+"vertex GpTV gp_txt_vs(uint id [[vertex_id]], uint inst [[instance_id]],\n"
+"                      const device GpSprite *g [[buffer(0)]])\n"
+"{\n"
+"    GpSprite r = g[inst];\n"
+"    float2 corner = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = r.a.xy + corner * 8.0 * clamp(r.b.w, 0.0, 16.0);\n"
+"    GpTV o;\n"
+"    o.pos = float4(p.x / 320.0 - 1.0, 1.0 - p.y / 180.0, 0, 1);\n"
+"    o.atl = r.a.zw + corner * 8.0;\n"
+"    o.org = r.a.zw;\n"
+"    o.col = clamp(float3(r.b.xyz), float3(0), float3(1));\n"
+"    return o;\n"
+"}\n"
+"fragment float4 gp_txt(GpTV v [[stage_in]], texture2d<uint> font [[texture(0)]])\n"
+"{\n"
+"    int x0 = int(v.org.x), y0 = int(v.org.y);\n"
+"    /* to this glyph's own cell first, then to the atlas, against a\n"
+"       garbage instance */\n"
+"    int ax = clamp(clamp(int(v.atl.x), x0, x0 + 7), 0, 127);\n"
+"    int ay = clamp(clamp(int(v.atl.y), y0, y0 + 7), 0, 63);\n"
+"    if (font.read(uint2(ax, ay)).r == 0u) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    return float4(v.col, 1.0);\n"
 "}\n";
 
 typedef struct GpU {
@@ -3314,18 +3427,53 @@ typedef struct GpU {
 } GpU;
 
 static struct {
-    id<MTLRenderPipelineState> pipe;
-    id<MTLTexture> idx, pal_global, pal_line;
-    uint32_t frame;                     /* the block frame last uploaded */
+    id<MTLRenderPipelineState> canvas, show, spr, txt;
+    id<MTLTexture> idx, pal_global, pal_line, atlas, spal, font;
+    id<MTLTexture> frame;               /* the pane's own 640x360 picture */
+    uint32_t drawn;                     /* the block frame the picture is of */
+    uint32_t art;                       /* the art_frame last uploaded */
+    bool art_any;
     bool tried;
 } gp;
+
+static id<MTLRenderPipelineState> gp_pipe(id<MTLLibrary> lib, NSString *vs, NSString *fs,
+                                          bool blend)
+{
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    NSError *err = nil;
+    id<MTLRenderPipelineState> p;
+
+    pd.vertexFunction = [lib newFunctionWithName:vs];
+    pd.fragmentFunction = [lib newFunctionWithName:fs];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (blend) {
+        /* G3's own blend state: the sprite's alpha over the canvas */
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
+    p = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) {
+        metal_log("game pane %s: %s", [fs UTF8String], [[err localizedDescription] UTF8String]);
+    }
+    return p;
+}
+
+static id<MTLTexture> gp_texture(MTLPixelFormat f, NSUInteger w, NSUInteger h, MTLTextureUsage u)
+{
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f
+                                                                                  width:w height:h
+                                                                              mipmapped:NO];
+    td.usage = u;
+    return [m.device newTextureWithDescriptor:td];
+}
 
 static void gp_setup(void)
 {
     NSError *err = nil;
     id<MTLLibrary> lib;
-    MTLRenderPipelineDescriptor *pd;
-    MTLTextureDescriptor *td;
 
     if (gp.tried) {
         return;
@@ -3336,49 +3484,48 @@ static void gp_setup(void)
         metal_log("game pane: %s", [[err localizedDescription] UTF8String]);
         return;
     }
-    pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [lib newFunctionWithName:@"gp_vs"];
-    pd.fragmentFunction = [lib newFunctionWithName:@"gp_canvas"];
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    gp.pipe = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
-    if (!gp.pipe) {
-        metal_log("game pane pipeline: %s", [[err localizedDescription] UTF8String]);
+    gp.canvas = gp_pipe(lib, @"gp_vs", @"gp_canvas", false);
+    gp.show = gp_pipe(lib, @"gp_vs", @"gp_show", false);
+    gp.spr = gp_pipe(lib, @"gp_spr_vs", @"gp_spr", true);
+    gp.txt = gp_pipe(lib, @"gp_txt_vs", @"gp_txt", false);
+    if (!gp.canvas || !gp.show || !gp.spr || !gp.txt) {
+        gp.canvas = nil;                /* said in the log; the desktop goes on */
         return;
     }
     /* made once, at the canvas's fixed size: a retro canvas with a
        settable resolution is a framebuffer with extra steps */
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint
-                                                            width:GP_W height:GP_H mipmapped:NO];
-    td.usage = MTLTextureUsageShaderRead;
-    gp.idx = [m.device newTextureWithDescriptor:td];
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                            width:GP_PAL_GLOBAL height:1 mipmapped:NO];
-    td.usage = MTLTextureUsageShaderRead;
-    gp.pal_global = [m.device newTextureWithDescriptor:td];
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                            width:GP_PAL_LINE height:GP_H mipmapped:NO];
-    td.usage = MTLTextureUsageShaderRead;
-    gp.pal_line = [m.device newTextureWithDescriptor:td];
+    gp.idx = gp_texture(MTLPixelFormatR8Uint, GP_W, GP_H, MTLTextureUsageShaderRead);
+    gp.pal_global = gp_texture(MTLPixelFormatRGBA8Unorm, GP_PAL_GLOBAL, 1, MTLTextureUsageShaderRead);
+    gp.pal_line = gp_texture(MTLPixelFormatRGBA8Unorm, GP_PAL_LINE, GP_H, MTLTextureUsageShaderRead);
+    gp.atlas = gp_texture(MTLPixelFormatR8Uint, GP_ATLAS, GP_ATLAS, MTLTextureUsageShaderRead);
+    gp.spal = gp_texture(MTLPixelFormatRGBA8Unorm, GP_COLOURS, GP_SLOTS, MTLTextureUsageShaderRead);
+    gp.font = gp_texture(MTLPixelFormatR8Uint, GP_FONT_W, GP_FONT_H, MTLTextureUsageShaderRead);
+    gp.frame = gp_texture(MTLPixelFormatBGRA8Unorm, GP_W, GP_H,
+                          MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
 }
 
-/* The planes to the card, if the block holds a frame worth taking.
- * Returns false when it does not -- then the last frame is drawn again,
- * because a pane that tears is worse than one that repeats and at sixty
- * frames a second nobody sees the repeat. */
-static bool gp_upload(const uint8_t *blk, size_t size)
+/* A frame of the block into the pane's own picture, if the block holds
+ * one worth taking.  Returns false when it does not -- then the last
+ * picture is shown again, because a pane that tears is worse than one
+ * that repeats, and at sixty frames a second nobody sees the repeat. */
+static bool gp_render(id<MTLCommandBuffer> cb, const uint8_t *blk, size_t size)
 {
     GpHead h;
-    uint32_t after;
+    uint32_t after, ns, ng;
+    id<MTLBuffer> sprites = nil, glyphs = nil;
+    MTLRenderPassDescriptor *rp;
+    id<MTLRenderCommandEncoder> enc;
+    GpU u;
 
-    if (size < GP_MIN_SIZE) {
+    if (size < GP_SIZE) {
         return false;
     }
     memcpy(&h, blk, sizeof(h));
     if (h.magic != GP_MAGIC || h.version != GP_VERSION || (h.frame & 1u)) {
         return false;                   /* not a block, or being written */
     }
-    if (h.frame == gp.frame) {
-        return true;                    /* unchanged: what is on the card stands */
+    if (h.frame == gp.drawn) {
+        return true;                    /* unchanged: the picture stands */
     }
     [gp.idx replaceRegion:MTLRegionMake2D(0, 0, GP_W, GP_H) mipmapLevel:0
                 withBytes:blk + GP_OFF_IDX bytesPerRow:GP_W];
@@ -3386,70 +3533,154 @@ static bool gp_upload(const uint8_t *blk, size_t size)
                        withBytes:blk + GP_OFF_PAL_GLOBAL bytesPerRow:GP_PAL_GLOBAL * 4];
     [gp.pal_line replaceRegion:MTLRegionMake2D(0, 0, GP_PAL_LINE, GP_H) mipmapLevel:0
                      withBytes:blk + GP_OFF_PAL_LINE bytesPerRow:GP_PAL_LINE * 4];
-    /* The frame is read again AFTER the planes: if the guest began a new
-       one while they were being copied, what went to the card is a mix
-       of two and must not be shown.  This is the reader's half of the
-       seqlock and the only thing that makes the single block safe. */
+    /* the art changes when a game loads it and almost never after: taken
+       only when its number moves, which is the difference between 900 KB
+       a frame and 25 */
+    if (!gp.art_any || h.art_frame != gp.art) {
+        [gp.atlas replaceRegion:MTLRegionMake2D(0, 0, GP_ATLAS, GP_ATLAS) mipmapLevel:0
+                      withBytes:blk + GP_OFF_ATLAS bytesPerRow:GP_ATLAS];
+        [gp.spal replaceRegion:MTLRegionMake2D(0, 0, GP_COLOURS, GP_SLOTS) mipmapLevel:0
+                     withBytes:blk + GP_OFF_SPAL bytesPerRow:GP_COLOURS * 4];
+        [gp.font replaceRegion:MTLRegionMake2D(0, 0, GP_FONT_W, GP_FONT_H) mipmapLevel:0
+                     withBytes:blk + GP_OFF_FONT bytesPerRow:GP_FONT_W];
+    }
+    ns = MIN(h.nsprites, (uint32_t)GP_SPRITES);
+    ng = MIN(h.nglyphs, (uint32_t)GP_GLYPHS);
+    /* the lists copied out now, while the frame is known to be whole:
+       the GPU reads them later, when the guest may be writing the next */
+    if (ns) {
+        sprites = [m.device newBufferWithBytes:blk + GP_OFF_SPRITE length:(NSUInteger)ns * 32
+                                       options:MTLResourceStorageModeShared];
+    }
+    if (ng) {
+        glyphs = [m.device newBufferWithBytes:blk + GP_OFF_GLYPH length:(NSUInteger)ng * 32
+                                      options:MTLResourceStorageModeShared];
+    }
+    /* The frame is read again AFTER everything is copied: if the guest
+       began a new one meanwhile, what was taken is a mix of two and must
+       not be shown.  This is the reader's half of the seqlock and the
+       only thing that makes the single block safe. */
     memcpy(&after, blk + offsetof(GpHead, frame), sizeof(after));
     if (after != h.frame) {
         return false;
     }
-    gp.frame = h.frame;
+    gp.drawn = h.frame;
+    gp.art = h.art_frame;
+    gp.art_any = true;
+
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = gp.frame;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+    memset(&u, 0, sizeof(u));
+    u.box[2] = GP_W, u.box[3] = GP_H;
+    u.clip[2] = GP_W, u.clip[3] = GP_H;
+    u.target[0] = GP_W, u.target[1] = GP_H;
+    u.over = (h.flags & GP_CANVAS_OVER) ? 1u : 0u;
+    [enc setRenderPipelineState:gp.canvas];
+    [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+    [enc setFragmentTexture:gp.idx atIndex:0];
+    [enc setFragmentTexture:gp.pal_global atIndex:1];
+    [enc setFragmentTexture:gp.pal_line atIndex:2];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    if (sprites) {
+        [enc setRenderPipelineState:gp.spr];
+        [enc setVertexBuffer:sprites offset:0 atIndex:0];
+        [enc setFragmentTexture:gp.atlas atIndex:0];
+        [enc setFragmentTexture:gp.spal atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+              instanceCount:ns];
+    }
+    if (glyphs) {
+        [enc setRenderPipelineState:gp.txt];
+        [enc setVertexBuffer:glyphs offset:0 atIndex:0];
+        [enc setFragmentTexture:gp.font atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+              instanceCount:ng];
+    }
+    [enc endEncoding];
     return true;
 }
 
-/* Every game pane in the list, drawn where the Wimp says it goes and
- * only where it can be seen. */
+/* The pane whose picture is made this frame: the first one visible.
+ * One picture is kept, so a second pane on the screen at once would
+ * show the first's; a game has one pane, and the box's own limit is
+ * four only so that a test can open a pane beside a game's. */
+static const MetalIcon *gp_first(GpData *d)
+{
+    const MetalSurfacesView *v = &surf.view;
+
+    if (!surf.on || !v->nicons || !v->region) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        const MetalIcon *ic = &v->icon[i];
+
+        if (ic->kind != ROSGD_SURF_GAMEPANE || !ic->nrects) {
+            continue;
+        }
+        memcpy(d, ic->data, sizeof(*d));
+        /* the block must lie inside the region, whole */
+        if (!d->size || (uint64_t)d->offset + d->size > v->region_size) {
+            continue;
+        }
+        return ic;
+    }
+    return NULL;
+}
+
+/* Before the frame's main pass: the pane's own picture made, in a pass of
+ * its own.  Returns whether there is a picture to show. */
+static bool surf_gamepane_render(id<MTLCommandBuffer> cb)
+{
+    GpData d;
+
+    if (!gp_first(&d)) {
+        return false;
+    }
+    gp_setup();
+    if (!gp.canvas) {
+        return false;
+    }
+    gp_render(cb, (const uint8_t *)surf.view.region + d.offset, d.size);
+    return gp.drawn != 0;
+}
+
+/* The pane's picture, drawn where the Wimp says it goes and only where it
+ * can be seen. */
 static void surf_gamepanes(id<MTLRenderCommandEncoder> enc, CGSize target,
                            uint32_t xres, uint32_t yres)
 {
     const MetalSurfacesView *v = &surf.view;
     double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+    const MetalIcon *ic;
+    GpData d;
+    GpU u;
 
-    if (!surf.on || !v->nicons || !v->region) {
+    ic = gp_first(&d);
+    if (!ic || !gp.canvas || !gp.drawn) {
         return;
     }
-    for (uint32_t i = 0; i < v->nicons; i++) {
-        const MetalIcon *ic = &v->icon[i];
-        GpData d;
-        GpU u;
+    memset(&u, 0, sizeof(u));
+    u.box[0] = ic->x * sx, u.box[1] = ic->y * sy;
+    u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
+    u.target[0] = target.width, u.target[1] = target.height;
+    [enc setRenderPipelineState:gp.show];
+    [enc setFragmentTexture:gp.frame atIndex:0];
+    for (uint32_t r = 0; r < ic->nrects; r++) {
+        const int16_t *q = v->rect[ic->rects + r];
 
-        if (ic->kind != ROSGD_SURF_GAMEPANE || !ic->nrects) {
+        u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+        u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+        if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
             continue;
         }
-        memcpy(&d, ic->data, sizeof(d));
-        /* the block must lie inside the region, whole */
-        if (!d.size || (uint64_t)d.offset + d.size > v->region_size) {
-            continue;
-        }
-        gp_setup();
-        if (!gp.pipe) {
-            return;                     /* said once in the log; the desktop goes on */
-        }
-        if (!gp_upload((const uint8_t *)v->region + d.offset, d.size)) {
-            continue;
-        }
-        memset(&u, 0, sizeof(u));
-        u.box[0] = ic->x * sx, u.box[1] = ic->y * sy;
-        u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
-        u.target[0] = target.width, u.target[1] = target.height;
-        u.over = 0;                     /* M0: the canvas owns the picture */
-        [enc setRenderPipelineState:gp.pipe];
-        [enc setFragmentTexture:gp.idx atIndex:0];
-        [enc setFragmentTexture:gp.pal_global atIndex:1];
-        [enc setFragmentTexture:gp.pal_line atIndex:2];
-        for (uint32_t r = 0; r < ic->nrects; r++) {
-            const int16_t *q = v->rect[ic->rects + r];
-
-            u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
-            u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
-            if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
-                continue;
-            }
-            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
-            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        }
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     }
 }
 
@@ -3878,6 +4109,11 @@ static bool metal_render_frame(void)
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0.05, 0.05, 0.08, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    /* a game pane's picture first, in a pass of its own: the main pass
+       then shows it like any other layer */
+    if (have_fb) {
+        surf_gamepane_render(cb);
+    }
     enc = [cb renderCommandEncoderWithDescriptor:rp];
     if (have_fb && !fb.scale && !fb_build_scale()) {
         have_fb = false;                /* logged by metal_pipeline */
@@ -4170,6 +4406,7 @@ static bool metal_screenshot_to(NSString *path)
             srp.colorAttachments[0].texture = composite;
             srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             srp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            surf_gamepane_render(cb);
             senc = [cb renderCommandEncoderWithDescriptor:srp];
             [senc setRenderPipelineState:fb.shot];
             [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];

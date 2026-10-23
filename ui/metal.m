@@ -3476,6 +3476,9 @@ static void surf_faces(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineStat
     for (uint32_t i = 0; i < v->nicons; i++) {
         const MetalIcon *ic = &v->icon[i];
 
+        if (ic->kind != 1 && ic->kind != 2) {
+            continue;                   /* the clock and the meter only: a game pane has its own pass */
+        }
         memset(&u, 0, sizeof(u));
         u.box[0] = ic->x * sx, u.box[1] = ic->y * sy, u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
         u.target[0] = target.width, u.target[1] = target.height;
@@ -3519,6 +3522,12 @@ static bool surf_face_due(void)
                        ? 1.0 / MIN(v->icon[i].rate, 60u) : 1.0;
 
             step = step ? MIN(step, s) : s;
+        }
+        if (v->icon[i].kind == ROSGD_SURF_GAMEPANE && v->icon[i].nrects) {
+            /* a game pane is drawn at sixty whatever the window's focus:
+             * its block changes without the Wimp knowing, so no damage
+             * would ever say so, and a pane running has priority */
+            step = step ? MIN(step, 1.0 / 60) : 1.0 / 60;
         }
     }
     if (!step || now < surf.face_due) {

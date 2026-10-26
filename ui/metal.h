@@ -169,6 +169,14 @@ typedef struct MetalSurface {
  * writes planes and instance lists into a block and the window renders
  * all of it.  It mirrors screen.h's ROS_SURF_GAMEPANE in the box. */
 #define ROSGD_SURF_GAMEPANE 5u
+/* 6 is a tile map (screen.h's ROS_SURF_TILES, include/rosgd/tiles.h): a map
+ * of tile numbers and a list of sprites, drawn from the pictures they are
+ * cut from at the icon's size -- !Micropolis's city */
+#define ROSGD_SURF_TILES 6u
+/* 7 is a tower (screen.h's ROS_SURF_TOWER, include/rosgd/tower.h): the
+ * tower game's floors, rooms, sky and ground, drawn from a live block and
+ * an art block in two backings -- !Tower's tower */
+#define ROSGD_SURF_TOWER 7u
 
 typedef struct MetalIcon {
     uint32_t kind, style;           /* 1 the clock, 2 the meter, 5 a game pane */

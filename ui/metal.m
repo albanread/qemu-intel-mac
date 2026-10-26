@@ -3752,6 +3752,1737 @@ static void surf_faces(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineStat
     }
 }
 
+/* ---- a tile map (ROSGD_SURF_TILES) ---------------------------------------
+ * !Micropolis's city, drawn by the window from the tiles themselves: the
+ * box writes a map of tile numbers, a list of sprites and, once, the two
+ * pictures they are cut from into a backing in the region
+ * (rosgd/include/rosgd/tiles.h, which this mirrors); here a tile is looked
+ * up in the map texture and its pixel read from the atlas, at whatever
+ * size the icon is on the screen.  The icon is the whole map and the Wimp
+ * scrolls it, so a zoom or a scroll costs the box nothing at all. */
+
+#define TL_MAGIC    0x53454C54u
+#define TL_VERSION  4u
+#define TL_MAP      128
+#define TL_SPRITES  256
+#define TL_CLASSES  1024
+#define TL_SPR_W    2048
+#define TL_SPR_H    1024
+#define TL_ATLAS_MAX_W 1024
+#define TL_ATLAS_MAX_H 4096
+#define TL_Q_RICH   2
+typedef struct TlHead {
+    uint32_t magic, version, frame, art;
+    uint16_t map_w, map_h, tile, atlas_cols;
+    uint32_t ntiles, nsprites;
+    int16_t outline[4];
+    uint32_t outline_rgba, back_rgba;
+    uint16_t atlas_w, atlas_h;      /* the tiles' picture, after the fixed part */
+    uint8_t quality, daylight, rate, overlay;
+    uint32_t reserved[2];
+} TlHead;
+#define TL_OFF_MAP      sizeof(TlHead)
+#define TL_OFF_SPRITE   (TL_OFF_MAP + (size_t)TL_MAP * TL_MAP * 2)
+#define TL_OFF_OVL      (TL_OFF_SPRITE + (size_t)TL_SPRITES * 16)
+#define TL_OFF_CLS      (TL_OFF_OVL + (size_t)TL_MAP * TL_MAP * 4)
+#define TL_OFF_SPR      (TL_OFF_CLS + (size_t)TL_CLASSES * 4)
+#define TL_OFF_ATLAS    (TL_OFF_SPR + (size_t)TL_SPR_W * TL_SPR_H * 4)
+#define TL_SIZE(w, h)   (TL_OFF_ATLAS + (uint64_t)(w) * (h) * 5)
+#define TL_LIVE         TL_OFF_CLS      /* what changes with the map */
+_Static_assert(sizeof(TlHead) == 64, "a tile map's head is 64 bytes");
+
+/* its 32 bytes in the surface entry */
+typedef struct TlData {
+    uint32_t backing, offset, size, frame;
+    uint8_t reserved[16];
+} TlData;
+
+static NSString * const TL_SRC = @""
+"/* tl_map_hd -- the tile map, drawn larger and richer than its art (Metal).\n"
+" *\n"
+" * A drop-in for the TlU struct, tl_vs and tl_map in metal.m's TL_SRC; the\n"
+" * sprites' functions (tl_spr_vs, tl_spr) stay as they are.  TlU gains four\n"
+" * fields at its end, which the C side's TlU must gain too:\n"
+" *\n"
+" *     int32_t quality;     0 the original, 1 xBR-lite, 2 xBR-lite + enrichment,\n"
+" *                          3 sharp bilinear + enrichment, 4 EPX/MMPX-style + enrichment\n"
+" *     float   time;        seconds, for the water (wrap it every hour or so)\n"
+" *     float   daylight;    1 day ... 0 night\n"
+" *     int32_t ovl;         1: the overlay over the map (texture 4)\n"
+" *\n"
+" * tl_map takes the material atlas as texture(3): R8Uint, the atlas's size,\n"
+" * each texel's material | lamp << 4, made once when the art changes\n"
+" * (tl_matlas.c, or emu.material_atlas); and the class table as texture(2): R32Uint, 1024 x 1, classes.py's\n"
+" * c_array(): class | size << 8 | (lx | ly << 4) << 16 | height/64 << 24.\n"
+" *\n"
+" * The same maths as tl_map_hd.glsl and emu.py, function for function; Metal\n"
+" * has no mutable globals, so the hood and the window live in an Hd.\n"
+" */\n"
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"\n"
+"struct TlU {\n"
+"    float4 box;          /* the whole map on the target, target pixels */\n"
+"    float4 clip;         /* the visible piece being drawn */\n"
+"    float2 target;\n"
+"    int    ntiles, pad;\n"
+"    int4   geo;          /* the map's width and height in tiles, a tile's edge,\n"
+"                            tiles across the atlas */\n"
+"    int4   outline;      /* a frame round tiles x0 y0 to x1 y1 */\n"
+"    float4 ocol;\n"
+"    int    quality;\n"
+"    float  time;\n"
+"    float  daylight;\n"
+"    int    ovl;          /* 1: the overlay over the map */\n"
+"};\n"
+"struct TlV { float4 pos [[position]]; };\n"
+"\n"
+"vertex TlV tl_vs(uint id [[vertex_id]], constant TlU &U [[buffer(0)]])\n"
+"{\n"
+"    float2 c = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = mix(U.clip.xy, U.clip.zw, c);\n"
+"    TlV o;\n"
+"    o.pos = float4(p / U.target * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    return o;\n"
+"}\n"
+"\n"
+"constant uint C_DIRT = 0, C_WATER = 1, C_SHORE = 2, C_TREE = 3, C_FLOOD = 5;\n"
+"constant uint C_ROAD = 8, C_BRIDGE = 9, C_POWER = 10, C_RAIL = 11, C_LOT = 12, C_HOUSE = 13, C_BUILD = 14;\n"
+"constant int M_GROUND = 0, M_SAND = 1, M_WATER = 2, M_TREE = 3, M_TREED = 4, M_GRASS = 5, M_ROAD = 6,\n"
+"             M_STRUCT = 7, M_OTHER = 8;\n"
+"\n"
+"constant float3 EARTH_A = float3(0.70, 0.45, 0.34), EARTH_B = float3(0.84, 0.58, 0.41);\n"
+"constant float3 SAND_A = float3(0.80, 0.68, 0.46), SAND_B = float3(0.90, 0.80, 0.58);\n"
+"constant float3 GRASS_A = float3(0.26, 0.56, 0.20), GRASS_B = float3(0.46, 0.72, 0.28);\n"
+"constant float3 ASPH = float3(0.25, 0.26, 0.28);\n"
+"constant float3 TREE_DARK = float3(0.07, 0.24, 0.10), TREE_LIGHT = float3(0.50, 0.76, 0.26);\n"
+"constant float3 SHALLOW = float3(0.33, 0.62, 0.74), DEEP = float3(0.10, 0.25, 0.52);\n"
+"constant float3 FOAM = float3(0.88, 0.94, 0.96);\n"
+"constant float3 NIGHT = float3(0.16, 0.20, 0.36), LAMP = float3(1.00, 0.82, 0.45);\n"
+"constant float3 COOL = float3(0.90, 0.95, 1.08), WARM = float3(1.06, 1.00, 0.92);\n"
+"constant float3 L3 = float3(-1.0, -1.0, 1.4) / 1.9899749;     /* towards the light */\n"
+"constant float EQ = 0.5;\n"
+"\n"
+"struct Hd {\n"
+"    int4 geo;\n"
+"    int ntiles;\n"
+"    int2 T0;\n"
+"    uint TA[9];         /* each tile's origin in the atlas: x | y << 16 */\n"
+"    uint TC[9];         /* its class word: class | size << 8 | lx|ly << 16 | height << 24 */\n"
+"    int2 BASE, CI, S;\n"
+"    uint WRGB[16];      /* the window's texels, packed unorm8 */\n"
+"    uint WCL[16];       /* their class words, with the lamp bit at 11 and the material at 12-15 */\n"
+"};\n"
+"static uint4 cword(uint w) { return uint4(w & 255u, (w >> 8) & 7u, (w >> 16) & 255u, w >> 24); }\n"
+"static int wmat(thread const Hd &h, int i) { return int((h.WCL[i] >> 12) & 15u); }\n"
+"static float3 wrgb(thread const Hd &h, int i) { return unpack_unorm4x8_to_float(h.WRGB[i]).rgb; }\n"
+"\n"
+"static void hood(thread Hd &h, float2 m, texture2d<ushort> map, texture2d<uint> cls)\n"
+"{\n"
+"    h.T0 = int2(floor(m / float(h.geo.z)));\n"
+"    for (int k = 0; k < 9; k++) {\n"
+"        int2 t = clamp(h.T0 + int2(k % 3 - 1, k / 3 - 1), int2(0), h.geo.xy - 1);\n"
+"        int n = int(map.read(uint2(t)).r);\n"
+"        if (n >= h.ntiles) n = 0;\n"
+"        h.TA[k] = uint(n % h.geo.w * h.geo.z) | uint(n / h.geo.w * h.geo.z) << 16;\n"
+"        h.TC[k] = cls.read(uint2(n, 0)).r;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* any map pixel near the fragment -> its atlas texel, through the map */\n"
+"static float4 px(thread Hd &h, int2 p, thread uint &c, thread uint &mt, bool want,\n"
+"                  texture2d<float> atlas, texture2d<uint> mats)\n"
+"{\n"
+"    p = clamp(p, int2(0), h.geo.xy * h.geo.z - 1);\n"
+"    int2 t = p / h.geo.z;\n"
+"    int k = (t.y - h.T0.y + 1) * 3 + (t.x - h.T0.x + 1);\n"
+"    c = h.TC[k];\n"
+"    uint2 a = uint2(int2(h.TA[k] & 0xffffu, h.TA[k] >> 16) + p - t * h.geo.z);\n"
+"    mt = want ? mats.read(a).r : 0u;\n"
+"    return atlas.read(a);\n"
+"}\n"
+"\n"
+"static uint lowbias32(uint x)\n"
+"{\n"
+"    x ^= x >> 16; x *= 0x7feb352du;\n"
+"    x ^= x >> 15; x *= 0x846ca68bu;\n"
+"    x ^= x >> 16;\n"
+"    return x;\n"
+"}\n"
+"\n"
+"static float hash2(int ix, int iy, uint seed)\n"
+"{\n"
+"    uint h = lowbias32(uint(ix) + lowbias32(uint(iy) + seed));\n"
+"    return float(h >> 8) * (1.0 / 16777216.0);\n"
+"}\n"
+"\n"
+"static float vnoise(float2 p, uint seed)\n"
+"{\n"
+"    float2 i = floor(p), f = p - i;\n"
+"    float2 u = f * f * (3.0 - 2.0 * f);\n"
+"    int2 k = int2(i);\n"
+"    float a = hash2(k.x, k.y, seed), b = hash2(k.x + 1, k.y, seed);\n"
+"    float c = hash2(k.x, k.y + 1, seed), d = hash2(k.x + 1, k.y + 1, seed);\n"
+"    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);\n"
+"}\n"
+"\n"
+"static float yuv_dist(float3 a, float3 b)\n"
+"{\n"
+"    float3 d = a - b;\n"
+"    float y = dot(d, float3(0.299, 0.587, 0.114));\n"
+"    float u = dot(d, float3(-0.169, -0.331, 0.5));\n"
+"    float v = dot(d, float3(0.5, -0.419, -0.081));\n"
+"    return 48.0 * abs(y) + 7.0 * abs(u) + 6.0 * abs(v);\n"
+"}\n"
+"\n"
+"static float3 tent_field(thread const float *v, float2 t)\n"
+"{\n"
+"    float b[4];\n"
+"    for (int q = 0; q < 4; q++) {\n"
+"        int i = 1 + (q & 1), j = 1 + (q >> 1);\n"
+"        float s = 0.0;\n"
+"        for (int di = -1; di <= 1; di++)\n"
+"            for (int dj = -1; dj <= 1; dj++)\n"
+"                s += v[(i + di) * 4 + (j + dj)] * ((di == 0 ? 0.5 : 0.25) * (dj == 0 ? 0.5 : 0.25));\n"
+"        b[q] = s;\n"
+"    }\n"
+"    float top = mix(b[0], b[1], t.x), bot = mix(b[2], b[3], t.x);\n"
+"    return float3(mix(top, bot, t.y), mix(b[1] - b[0], b[3] - b[2], t.y), bot - top);\n"
+"}\n"
+"\n"
+"static int widx(thread const Hd &h, int dx, int dy) { return (h.CI.x + h.S.x * dx) * 4 + (h.CI.y + h.S.y * dy); }\n"
+"static float3 P(thread const Hd &h, int dx, int dy) { return wrgb(h, widx(h, dx, dy)); }\n"
+"\n"
+"static float rdist(float2 pt, float2 r0, float t)\n"
+"{\n"
+"    float2 d = max(max(r0 - pt, pt - (r0 + t)), float2(0));\n"
+"    return length(d);\n"
+"}\n"
+"\n"
+"static float3 shade(thread Hd &h, int idx, float2 m, float n_low, float n_mid, float n_fine, float sF, float2 sg,\n"
+"                    float psh, float shd, float ao, bool own_built, thread float3 &emis, float wgt)\n"
+"{\n"
+"    float3 rgbx = wrgb(h, idx);\n"
+"    int mat = wmat(h, idx);\n"
+"    uint4 cl = cword(h.WCL[idx]);\n"
+"    if (mat == M_GROUND && own_built && sF > 0.45) mat = M_STRUCT;\n"
+"    float size = float(max(cl.g, 1u));\n"
+"    float2 tf = m / float(h.geo.z) - floor(m / float(h.geo.z));\n"
+"    float2 u = (float2(float(cl.b & 15u), float(cl.b >> 4)) + tf) / size;\n"
+"    float3 ground = mix(EARTH_A, EARTH_B, n_low) * (0.92 + 0.16 * n_mid) * (0.96 + 0.08 * n_fine);\n"
+"    float3 sand = mix(SAND_A, SAND_B, n_mid) * (0.96 + 0.08 * n_fine);\n"
+"    float3 grass = mix(GRASS_A, GRASS_B, n_low) * (0.94 + 0.12 * n_fine);\n"
+"    float3 road = ASPH * (0.90 + 0.10 * n_mid + 0.08 * n_fine);\n"
+"    float3 n = float3(-sg * 2.2, 1.0);\n"
+"    float diff = clamp(dot(n, L3) / length(n), 0.0, 1.0);\n"
+"    float lit = 0.62 + 0.55 * diff;\n"
+"    float grad = 1.10 - 0.20 * (u.x + u.y) * 0.5;\n"
+"    float3 tint = mix(COOL, WARM, smoothstep(0.55, 1.0, diff));\n"
+"    float3 col;\n"
+"    if (mat == M_STRUCT) col = rgbx * (lit * grad) * tint;\n"
+"    else if (mat == M_ROAD) col = road;\n"
+"    else if (mat == M_GRASS) col = grass;\n"
+"    else if (mat == M_GROUND || mat == M_TREE || mat == M_TREED) col = ground;\n"
+"    else if (mat == M_SAND || mat == M_WATER) col = cl.r == C_SHORE ? sand : ground;\n"
+"    else col = rgbx * (own_built ? grad : 1.0);\n"
+"    if (mat != M_STRUCT) {\n"
+"        float occl = clamp(0.55 * psh + 0.5 * shd + 0.28 * ao +\n"
+"                           0.35 * smoothstep(0.15, 0.7, sF) * (own_built ? 1.0 : 0.0), 0.0, 0.75);\n"
+"        col *= 1.0 - occl;\n"
+"    }\n"
+"    if (mat == M_STRUCT && (h.WCL[idx] & 0x800u) != 0u) {\n"
+"        int2 tp = h.BASE + int2(idx / 4, idx % 4);\n"
+"        if (hash2(tp.x, tp.y, 7u) > 0.4) emis += LAMP * wgt;\n"
+"    }\n"
+"    return col;\n"
+"}\n"
+"\n"
+"fragment float4 tl_map(TlV v [[stage_in]], constant TlU &U [[buffer(0)]],\n"
+"                       texture2d<ushort> map [[texture(0)]],\n"
+"                       texture2d<float> atlas [[texture(1)]],\n"
+"                       texture2d<uint> cls [[texture(2)]],\n"
+"                       texture2d<uint> mats [[texture(3)]],\n"
+"                       texture2d<float> ovl [[texture(4)]])\n"
+"{\n"
+"    Hd h;\n"
+"    h.geo = U.geo;\n"
+"    h.ntiles = U.ntiles;\n"
+"    float2 size = float2(U.geo.xy * U.geo.z);\n"
+"    float2 m = (v.pos.xy - U.box.xy) / U.box.zw * size;      /* the map's pixels */\n"
+"    float zoom = U.box.z / size.x;                           /* target pixels a map pixel */\n"
+"    int2 t = int2(floor(m / float(U.geo.z)));\n"
+"    if (t.x < 0 || t.y < 0 || t.x >= U.geo.x || t.y >= U.geo.y) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    float4 colour;\n"
+"    if (U.quality <= 0) {\n"
+"        int n = int(map.read(uint2(t)).r);\n"
+"        if (n >= U.ntiles) {\n"
+"            n = 0;\n"
+"        }\n"
+"        int2 a = int2(n % U.geo.w, n / U.geo.w) * U.geo.z\n"
+"                 + clamp(int2(floor(m)) - t * U.geo.z, int2(0), int2(U.geo.z - 1));\n"
+"        colour = atlas.read(uint2(a));\n"
+"    } else {\n"
+"        hood(h, m, map, cls);\n"
+"        int2 c = int2(floor(m));\n"
+"        h.BASE = int2(floor(m - 0.5)) - 1;\n"
+"        for (int i = 0; i < 4; i++)\n"
+"            for (int j = 0; j < 4; j++) {\n"
+"                uint cl, mt;\n"
+"                float4 a = px(h, h.BASE + int2(i, j), cl, mt, U.quality != 1, atlas, mats);\n"
+"                h.WRGB[i * 4 + j] = pack_float_to_unorm4x8(a);\n"
+"                h.WCL[i * 4 + j] = (cl & 0xffff07ffu) | (mt & 15u) << 12 | ((mt >> 4) & 1u) << 11;\n"
+"            }\n"
+"        float2 f = m - floor(m);\n"
+"        float2 tt = (m - 0.5) - floor(m - 0.5);\n"
+"        bool2 hi = f >= float2(0.5);\n"
+"        h.S = int2(hi.x ? 1 : -1, hi.y ? 1 : -1);\n"
+"        h.CI = int2(hi.x ? 1 : 2, hi.y ? 1 : 2);\n"
+"        float2 fp = float2(hi.x ? f.x : 1.0 - f.x, hi.y ? f.y : 1.0 - f.y);\n"
+"\n"
+"        int pi[4] = {0, 0, 0, 0};\n"
+"        float pw[4] = {0, 0, 0, 0};\n"
+"        int np = 1;\n"
+"        float3 E = P(h, 0, 0), Fx = P(h, 1, 0), H = P(h, 0, 1), I = P(h, 1, 1);\n"
+"        if (U.quality == 1 || U.quality == 2) {\n"
+"            float3 C = P(h, 1, -1), G = P(h, -1, 1);\n"
+"            float3 F4 = P(h, 2, 0), H5 = P(h, 0, 2), I4 = P(h, 2, 1), I5 = P(h, 1, 2), C4 = P(h, 2, -1), G5 = P(h, -1, 2);\n"
+"            float d1 = yuv_dist(E, C) + yuv_dist(E, G) + yuv_dist(I, F4) + yuv_dist(I, H5) + 4.0 * yuv_dist(H, Fx);\n"
+"            float d2 = yuv_dist(H, G5) + yuv_dist(H, I5) + yuv_dist(Fx, I4) + yuv_dist(Fx, C4) + 4.0 * yuv_dist(E, I);\n"
+"            bool edge = d1 < d2 && yuv_dist(E, Fx) > EQ && yuv_dist(E, H) > EQ;\n"
+"            int newi = yuv_dist(E, Fx) <= yuv_dist(E, H) ? widx(h, 1, 0) : widx(h, 0, 1);\n"
+"            float cov = clamp((fp.x + fp.y - 1.5) * zoom * 0.70710678 + 0.5, 0.0, 1.0);\n"
+"            if (!edge) cov = 0.0;\n"
+"            pi[0] = widx(h, 0, 0); pw[0] = 1.0 - cov;\n"
+"            pi[1] = newi; pw[1] = cov;\n"
+"            np = 2;\n"
+"        } else if (U.quality == 3) {\n"
+"            float2 fs = clamp((tt - 0.5) * zoom + 0.5, 0.0, 1.0);\n"
+"            pi[0] = 1 * 4 + 1; pw[0] = (1.0 - fs.x) * (1.0 - fs.y);\n"
+"            pi[1] = 2 * 4 + 1; pw[1] = fs.x * (1.0 - fs.y);\n"
+"            pi[2] = 1 * 4 + 2; pw[2] = (1.0 - fs.x) * fs.y;\n"
+"            pi[3] = 2 * 4 + 2; pw[3] = fs.x * fs.y;\n"
+"            np = 4;\n"
+"        } else {\n"
+"            float3 B = P(h, 0, -1), D = P(h, -1, 0);\n"
+"            bool take = yuv_dist(Fx, H) <= EQ && yuv_dist(E, Fx) > EQ && yuv_dist(Fx, B) > EQ &&\n"
+"                        yuv_dist(H, D) > EQ && !(yuv_dist(E, I) <= EQ);\n"
+"            pi[0] = take ? widx(h, 1, 0) : widx(h, 0, 0); pw[0] = 1.0;\n"
+"        }\n"
+"\n"
+"        float3 col = float3(0);\n"
+"        if (U.quality == 1) {\n"
+"            for (int k = 0; k < np; k++) col += wrgb(h, pi[k]) * pw[k];\n"
+"        } else {\n"
+"            float wv[16], tv[16], sv[16];\n"
+"            for (int k = 0; k < 16; k++) {\n"
+"                int wm = wmat(h, k);\n"
+"                wv[k] = wm == M_WATER ? 1.0 : 0.0;\n"
+"                tv[k] = wm == M_TREE ? 1.0 : wm == M_TREED ? 0.55 : 0.0;\n"
+"                sv[k] = wm == M_STRUCT ? 1.0 : 0.0;\n"
+"            }\n"
+"            float wF = tent_field(wv, tt).x;\n"
+"            float3 tfl = tent_field(tv, tt), sfl = tent_field(sv, tt);\n"
+"            float tF = tfl.x, sF = sfl.x;\n"
+"\n"
+"            float2 mn = m * (16.0 / float(h.geo.z));\n"
+"            int st = max(h.geo.z / 16, 1);       /* texels a 16-pixel texel */\n"
+    "            float n_low = vnoise(mn * (1.0 / 37.0), 11u) * 0.65 + vnoise(mn * (1.0 / 13.0), 12u) * 0.35;\n"
+"            float n_mid = vnoise(mn * (1.0 / 4.5), 13u);\n"
+"            float n_fine = vnoise(mn * 1.3, 14u);\n"
+"\n"
+"            float tile = float(U.geo.z);\n"
+"            float2 q = m / tile - 0.5;\n"
+"            int2 qi = int2(floor(q));\n"
+"            float2 qf = q - floor(q);\n"
+"            float dv[4];\n"
+"            for (int k = 0; k < 4; k++) {\n"
+"                int2 o = qi + int2(k & 1, k >> 1) - h.T0 + 1;\n"
+"                uint cl = h.TC[o.y * 3 + o.x] & 255u;\n"
+"                dv[k] = (cl == C_WATER || cl == C_BRIDGE) ? 1.0 : cl == C_SHORE ? 0.35 : 0.0;\n"
+"            }\n"
+"            float depth = mix(mix(dv[0], dv[1], qf.x), mix(dv[2], dv[3], qf.x), qf.y);\n"
+"            uint own = h.TC[4] & 255u;\n"
+"            bool own_built = own == C_HOUSE || own == C_BUILD;\n"
+"            /* shadow and occlusion fall only on what is not a structure */\n"
+"            bool need = false;\n"
+"            for (int k = 0; k < np; k++) need = need || wmat(h, pi[k]) != M_STRUCT;\n"
+"            float ao = 0.0, shd = 0.0, psh = 0.0;\n"
+"            for (int k = 0; k < 9 && need; k++) {\n"
+"                if (k == 4) continue;\n"
+"                uint cl = h.TC[k] & 255u;\n"
+"                if (!((cl == C_HOUSE || cl == C_BUILD) && !own_built)) continue;\n"
+"                float hh = float(h.TC[k] >> 24) / 64.0;\n"
+"                float2 r0 = float2(h.T0 + int2(k % 3 - 1, k / 3 - 1)) * tile;\n"
+"                float a_k = 1.0 - smoothstep(0.0, 0.30 * tile, rdist(m, r0, tile));\n"
+"                float s_k = 1.0 - smoothstep(0.0, 0.22 * tile, rdist(m - float2(hh * tile * 0.55), r0, tile));\n"
+"                ao = max(ao, a_k);\n"
+"                shd = max(shd, s_k * clamp(hh * 1.6, 0.0, 1.0));\n"
+"            }\n"
+"\n"
+"            uint pc, pt;\n"
+"            px(h, c - st, pc, pt, true, atlas, mats);\n"
+"            int pm = int(pt & 15u);\n"
+"            for (int dk = 1; dk <= 5 && need; dk++) {\n"
+"                uint bc, bt;\n"
+"                px(h, c - (dk + 1) * st, bc, bt, true, atlas, mats);\n"
+"                int bm = int(bt & 15u);\n"
+"                float hpx = float(pc >> 24) / 64.0 * 16.0 * 0.9;\n"
+"                bool caster = (pm == M_STRUCT || pm == M_TREE) && (bm == M_STRUCT || bm == M_TREE);\n"
+"                if (caster && hpx >= float(dk)) psh = max(psh, 1.0 - float(dk) / 8.0);\n"
+"                pc = bc; pm = bm;\n"
+"            }\n"
+"\n"
+"            float3 emis = float3(0);\n"
+"            for (int k = 0; k < np; k++)\n"
+"                col += shade(h, pi[k], m, n_low, n_mid, n_fine, sF, sfl.yz, psh, shd, ao, own_built, emis, pw[k]) * pw[k];\n"
+"            int nm = wmat(h, widx(h, 0, 0));\n"
+"            bool soft_ok = nm == M_GROUND || nm == M_TREE || nm == M_TREED || nm == M_GRASS || nm == M_SAND ||\n"
+"                           nm == M_WATER;\n"
+"\n"
+"            float ct = smoothstep(0.22, 0.42, tF) * (soft_ok ? 1.0 : 0.0);\n"
+"            if (ct > 0.0) {\n"
+"            float crown = vnoise(mn * 0.42, 21u);\n"
+"            float cgx = (vnoise(float2(mn.x + 0.5, mn.y) * 0.42, 21u) - crown) * 2.0;\n"
+"            float cgy = (vnoise(float2(mn.x, mn.y + 0.5) * 0.42, 21u) - crown) * 2.0;\n"
+"            float3 tn = float3(-(tfl.y * 1.8 + cgx * 0.9), -(tfl.z * 1.8 + cgy * 0.9), 1.0);\n"
+"            float tdiff = clamp(dot(tn, L3) / length(tn), 0.0, 1.0);\n"
+"            float tl = clamp(tdiff * (0.45 + 0.55 * clamp(tF * 1.3, 0.0, 1.0)) + (crown - 0.5) * 0.25, 0.0, 1.0);\n"
+"            float3 canopy = mix(TREE_DARK, TREE_LIGHT, tl);\n"
+"            canopy = mix(canopy, canopy * float3(1.15, 1.0, 0.55), n_low * 0.45);\n"
+"            col = mix(col, canopy, ct);\n"
+"            }\n"
+"\n"
+"            float cw = smoothstep(0.40, 0.52, wF) * (soft_ok ? 1.0 : 0.0);\n"
+"            if (cw > 0.0) {\n"
+"            float wa = vnoise(mn * 0.09 + U.time * float2(0.30, 0.11), 31u);\n"
+"            float2 r = float2(mn.x * 0.8 - mn.y * 0.6, mn.x * 0.6 + mn.y * 0.8);\n"
+"            float wb = vnoise(r * 0.33 + U.time * float2(-0.21, 0.47), 32u);\n"
+"            float wgx = (vnoise((r + float2(0.6, 0.0)) * 0.33 + U.time * float2(-0.21, 0.47), 32u) - wb) * 1.6;\n"
+"            float wgy = (vnoise((r + float2(0.0, 0.6)) * 0.33 + U.time * float2(-0.21, 0.47), 32u) - wb) * 1.6;\n"
+"            float deep = depth * smoothstep(0.55, 1.0, wF);\n"
+"            float3 water = mix(SHALLOW, DEEP, deep) * (0.90 + 0.14 * wa + 0.08 * wb);\n"
+"            float3 wn = normalize(float3(-wgx * 1.5, -wgy * 1.5, 1.0));\n"
+"            float3 rv = 2.0 * wn.z * wn - float3(0, 0, 1);\n"
+"            float spec = pow(clamp(dot(rv, L3), 0.0, 1.0), 16.0) * 0.22;\n"
+"            water += spec * U.daylight;\n"
+"            float foam = (1.0 - smoothstep(0.50, 0.78, wF)) * (0.55 + 0.45 * wb);\n"
+"            water = mix(water, FOAM, foam * 0.55);\n"
+"            water *= 1.0 - 0.30 * psh - 0.18 * shd;\n"
+"            col = mix(col, water, cw);\n"
+"            }\n"
+"\n"
+"            col = col * mix(NIGHT, float3(1), U.daylight) + emis * (1.0 - U.daylight);\n"
+"        }\n"
+"        colour = float4(clamp(col, 0.0, 1.0), 1.0);\n"
+"    }\n"
+"    if (U.ovl != 0) {\n"
+"        /* the statistics' colours over the map, smoothly from square to square */\n"
+"        constexpr sampler lin(filter::linear, address::clamp_to_edge);\n"
+"        float4 o = ovl.sample(lin, m / float(U.geo.z) / 128.0);\n"
+"        colour = float4(o.rgb + colour.rgb * (1.0 - o.a), 1.0);\n"
+"    }\n"
+"    if (U.outline.z > U.outline.x && t.x >= U.outline.x && t.y >= U.outline.y\n"
+"        && t.x < U.outline.z && t.y < U.outline.w) {\n"
+"        float2 k = U.box.zw / size;\n"
+"        float2 lo = (m - float2(U.outline.xy * U.geo.z)) * k;\n"
+"        float2 hi2 = (float2(U.outline.zw * U.geo.z) - m) * k;\n"
+"        if (min(min(lo.x, lo.y), min(hi2.x, hi2.y)) < 2.0) {\n"
+"            colour = U.ocol;\n"
+"        }\n"
+"    }\n"
+"    return colour;\n"
+"}\n"
+"\n"
+"/* the sprites */\n"
+"struct TlS { short4 at; ushort4 cell; };\n"
+"struct TlSV { float4 pos [[position]]; float2 uv; uint4 cell [[flat]]; };\n"
+"/* a sprite: its box in the map, cut to the visible piece, as a strip */\n"
+"vertex TlSV tl_spr_vs(uint id [[vertex_id]], uint inst [[instance_id]],\n"
+"                      constant TlU &U [[buffer(0)]], constant TlS *S [[buffer(1)]])\n"
+"{\n"
+"    TlS s = S[inst];\n"
+"    float k = U.box.z / float(U.geo.x * U.geo.z);\n"
+"    float4 b = float4(U.box.xy + float2(s.at.xy) * k, U.box.xy + float2(s.at.xy + s.at.zw) * k);\n"
+"    float4 q = float4(max(b.xy, U.clip.xy), min(b.zw, U.clip.zw));\n"
+"    if (q.z <= q.x || q.w <= q.y) {\n"
+"        q = float4(0);\n"
+"    }\n"
+"    float2 c = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = mix(q.xy, q.zw, c);\n"
+"    TlSV o;\n"
+"    o.pos = float4(p / U.target * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    o.uv = (p - b.xy) / max(b.zw - b.xy, float2(1e-3));\n"
+"    o.cell = uint4(s.cell);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 tl_spr(TlSV v [[stage_in]], texture2d<float> spr [[texture(0)]])\n"
+"{\n"
+"    int2 a = int2(v.cell.xy) + clamp(int2(floor(v.uv * float2(v.cell.zw))), int2(0), int2(v.cell.zw) - 1);\n"
+"    return spr.read(uint2(a));\n"
+"}\n";
+
+typedef struct TlU {
+    float box[4], clip[4], target[2];
+    int32_t ntiles, pad;
+    int32_t geo[4], outline[4];
+    float ocol[4];
+    int32_t quality;            /* the rich drawing (tl_map_hd.metal) */
+    float time, daylight;
+    int32_t ovl;
+} TlU;
+
+static struct {
+    id<MTLRenderPipelineState> map, spr;            /* into the window's BGRA */
+    id<MTLRenderPipelineState> map_shot, spr_shot;  /* into a screenshot's RGBA */
+    id<MTLTexture> mapt, atlas, sprt, clst, matt, ovlt;
+    uint32_t frame, art;
+    int atlas_w, atlas_h;           /* the atlas and materials textures' size */
+    bool have, tried;
+    uint8_t live[TL_LIVE];          /* the last whole frame's head, map and sprites */
+} tl;
+
+static id<MTLRenderPipelineState> tl_pipe(id<MTLLibrary> lib, NSString *vs, NSString *fs,
+                                          MTLPixelFormat f)
+{
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    NSError *err = nil;
+    id<MTLRenderPipelineState> p;
+
+    pd.vertexFunction = [lib newFunctionWithName:vs];
+    pd.fragmentFunction = [lib newFunctionWithName:fs];
+    pd.colorAttachments[0].pixelFormat = f;
+    /* premultiplied, as the box's pictures are */
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    p = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) {
+        metal_log("tile map %s: %s", [fs UTF8String], [[err localizedDescription] UTF8String]);
+    }
+    return p;
+}
+
+static void tl_setup(void)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+
+    if (tl.tried) {
+        return;
+    }
+    tl.tried = true;
+    lib = [m.device newLibraryWithSource:TL_SRC options:nil error:&err];
+    if (!lib) {
+        metal_log("tile map: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+    tl.map = tl_pipe(lib, @"tl_vs", @"tl_map", MTLPixelFormatBGRA8Unorm);
+    tl.spr = tl_pipe(lib, @"tl_spr_vs", @"tl_spr", MTLPixelFormatBGRA8Unorm);
+    tl.map_shot = tl_pipe(lib, @"tl_vs", @"tl_map", MTLPixelFormatRGBA8Unorm);
+    tl.spr_shot = tl_pipe(lib, @"tl_spr_vs", @"tl_spr", MTLPixelFormatRGBA8Unorm);
+    tl.mapt = gp_texture(MTLPixelFormatR16Uint, TL_MAP, TL_MAP, MTLTextureUsageShaderRead);
+    tl.sprt = gp_texture(MTLPixelFormatRGBA8Unorm, TL_SPR_W, TL_SPR_H, MTLTextureUsageShaderRead);
+    tl.clst = gp_texture(MTLPixelFormatR32Uint, TL_CLASSES, 1, MTLTextureUsageShaderRead);
+    tl.ovlt = gp_texture(MTLPixelFormatRGBA8Unorm, TL_MAP, TL_MAP, MTLTextureUsageShaderRead);
+}
+
+/* The first visible tile map, and its block, whole inside the region */
+static const MetalIcon *tl_first(TlData *d)
+{
+    const MetalSurfacesView *v = &surf.view;
+
+    if (!surf.on || !v->nicons || !v->region) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        const MetalIcon *ic = &v->icon[i];
+
+        if (ic->kind != ROSGD_SURF_TILES || !ic->nrects) {
+            continue;
+        }
+        memcpy(d, ic->data, sizeof(*d));
+        if (d->size < TL_OFF_ATLAS || d->offset == 0xFFFFFFFFu
+            || (uint64_t)d->offset + d->size > v->region_size) {
+            continue;
+        }
+        return ic;
+    }
+    return NULL;
+}
+
+/* A frame of the block into the textures, if it is whole and new; whether
+ * there is a frame to draw (the last one, if this one is being written) */
+static bool tl_take(const uint8_t *blk, uint32_t size)
+{
+    TlHead h;
+    uint32_t after;
+
+    memcpy(&h, blk, sizeof(h));
+    if (h.magic != TL_MAGIC || h.version != TL_VERSION || (h.frame & 1u)) {
+        return tl.have;
+    }
+    if (tl.have && h.frame == tl.frame) {
+        return true;
+    }
+    /* copied out, and read again AFTER: if the box began a new frame
+       meanwhile the copy is a mix of two, and the last whole one stands */
+    static uint8_t next[TL_LIVE];
+    memcpy(next, blk, sizeof(next));
+    memcpy(&after, blk + offsetof(TlHead, frame), sizeof(after));
+    if (after != h.frame) {
+        return tl.have;
+    }
+    int aw = h.atlas_w, ah = h.atlas_h;
+    if (aw < 1 || ah < 1 || aw > TL_ATLAS_MAX_W || ah > TL_ATLAS_MAX_H || TL_SIZE(aw, ah) > size) {
+        return tl.have;                 /* a block too short for what it says it holds */
+    }
+    memcpy(tl.live, next, sizeof(tl.live));
+    if (aw != tl.atlas_w || ah != tl.atlas_h) {
+        /* the atlas's size is the box's: textures of that size */
+        tl.atlas = gp_texture(MTLPixelFormatRGBA8Unorm, aw, ah, MTLTextureUsageShaderRead);
+        tl.matt = gp_texture(MTLPixelFormatR8Uint, aw, ah, MTLTextureUsageShaderRead);
+        tl.atlas_w = aw, tl.atlas_h = ah;
+        tl.have = false;
+    }
+    if (!tl.atlas || !tl.matt) {
+        return false;
+    }
+    if (!tl.have || h.art != tl.art) {
+        /* the pictures, the classes and the materials: once, when the box
+           first writes them */
+        [tl.atlas replaceRegion:MTLRegionMake2D(0, 0, aw, ah) mipmapLevel:0
+                      withBytes:blk + TL_OFF_ATLAS bytesPerRow:(NSUInteger)aw * 4];
+        [tl.matt replaceRegion:MTLRegionMake2D(0, 0, aw, ah) mipmapLevel:0
+                     withBytes:blk + TL_OFF_ATLAS + (size_t)aw * ah * 4 bytesPerRow:(NSUInteger)aw];
+        [tl.sprt replaceRegion:MTLRegionMake2D(0, 0, TL_SPR_W, TL_SPR_H) mipmapLevel:0
+                     withBytes:blk + TL_OFF_SPR bytesPerRow:TL_SPR_W * 4];
+        [tl.clst replaceRegion:MTLRegionMake2D(0, 0, TL_CLASSES, 1) mipmapLevel:0
+                     withBytes:blk + TL_OFF_CLS bytesPerRow:TL_CLASSES * 4];
+        tl.art = h.art;
+    }
+    [tl.mapt replaceRegion:MTLRegionMake2D(0, 0, TL_MAP, TL_MAP) mipmapLevel:0
+                 withBytes:tl.live + TL_OFF_MAP bytesPerRow:TL_MAP * 2];
+    if (((const TlHead *)tl.live)->overlay) {
+        [tl.ovlt replaceRegion:MTLRegionMake2D(0, 0, TL_MAP, TL_MAP) mipmapLevel:0
+                     withBytes:tl.live + TL_OFF_OVL bytesPerRow:TL_MAP * 4];
+    }
+    tl.frame = h.frame;
+    tl.have = true;
+    return true;
+}
+
+/* The map, then its sprites, where the Wimp says the icon is and only
+ * where it can be seen */
+static void surf_tiles(id<MTLRenderCommandEncoder> enc, bool shot, CGSize target,
+                       uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+    const MetalIcon *ic;
+    const TlHead *h;
+    TlData d;
+    TlU u;
+    uint32_t ns, cap;
+
+    ic = tl_first(&d);
+    if (!ic) {
+        return;
+    }
+    tl_setup();
+    if (!tl.map || !tl.spr || !tl.map_shot || !tl.spr_shot || !tl.mapt) {
+        return;
+    }
+    if (!tl_take((const uint8_t *)surf.view.region + d.offset, d.size)) {
+        return;
+    }
+    h = (const TlHead *)tl.live;
+    if (h->map_w < 1 || h->map_h < 1 || h->map_w > TL_MAP || h->map_h > TL_MAP || h->tile < 1
+        || h->atlas_cols < 1 || h->atlas_cols * h->tile > tl.atlas_w) {
+        return;
+    }
+    cap = MIN((uint32_t)(h->atlas_cols * (tl.atlas_h / h->tile)), (uint32_t)TL_CLASSES);
+    memset(&u, 0, sizeof(u));
+    u.box[0] = ic->x * sx, u.box[1] = ic->y * sy, u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
+    u.target[0] = target.width, u.target[1] = target.height;
+    u.ntiles = (int32_t)MIN(h->ntiles, cap);
+    u.geo[0] = h->map_w, u.geo[1] = h->map_h, u.geo[2] = h->tile, u.geo[3] = h->atlas_cols;
+    for (int k = 0; k < 4; k++) {
+        u.outline[k] = h->outline[k];
+        u.ocol[k] = ((h->outline_rgba >> (8 * k)) & 255) / 255.0f;
+    }
+    u.quality = MIN((int32_t)h->quality, TL_Q_RICH);
+    u.time = (float)fmod(CFAbsoluteTimeGetCurrent(), 3600.0);
+    u.daylight = h->daylight / 255.0f;
+    u.ovl = h->overlay ? 1 : 0;
+    ns = MIN(h->nsprites, (uint32_t)TL_SPRITES);
+    for (uint32_t r = 0; r < ic->nrects; r++) {
+        const int16_t *q = v->rect[ic->rects + r];
+
+        u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+        u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+        if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
+            continue;
+        }
+        [enc setRenderPipelineState:shot ? tl.map_shot : tl.map];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        [enc setFragmentTexture:tl.mapt atIndex:0];
+        [enc setFragmentTexture:tl.atlas atIndex:1];
+        [enc setFragmentTexture:tl.clst atIndex:2];
+        [enc setFragmentTexture:tl.matt atIndex:3];
+        [enc setFragmentTexture:tl.ovlt atIndex:4];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        if (ns) {
+            [enc setRenderPipelineState:shot ? tl.spr_shot : tl.spr];
+            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+            [enc setVertexBytes:tl.live + TL_OFF_SPRITE length:(NSUInteger)ns * 16 atIndex:1];
+            [enc setFragmentTexture:tl.sprt atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+                  instanceCount:ns];
+        }
+    }
+}
+
+/* ---- a tower (ROSGD_SURF_TOWER) --------------------------------------------
+ * !Tower's tower, drawn by the window from two blocks the box writes into
+ * two backings in the region (rosgd/include/rosgd/tower.h, which this
+ * mirrors; rosgd/ports/tower/docs/graphics-design.md is the design): the
+ * live block (the cells, the rooms, the fixtures, the stops, the movers,
+ * section by section with a generation each) and the art block (the
+ * tables and the pictures, uploaded once for each of its gens).  The
+ * field (P1, design 7.5) is one quad over each visible piece of the icon,
+ * which is the whole tower: the Wimp scrolls it and a zoom is a new size
+ * of icon; the fixtures (P2) and the movers (P3) are instanced over it.
+ * All three qualities (classic, smooth, rich: design 7.1), as the live
+ * block asks.  The library is built for rich (TW_Q 2); if it will not
+ * build, again for classic only (TW_Q 0: the smooth and rich parts left
+ * out), and the tower is drawn in classic whatever it asks.
+ * ROSGD_TOWER_FAIL_RICH=1 makes the rich library fail, to prove that.
+ *
+ * The shader text is the design's section 7.5 as it stands; the CPU twin
+ * (ports/tower/surface, twin.rs) is its reference, and classic at 4x is to
+ * match it exactly.  For that the mip levels are made here as the twin
+ * makes them (a rounded 2 x 2 box), not by the GPU, and the library is
+ * built without fast maths (design 8.3). */
+
+#define TW_MAGIC        0x52574F54u     /* "TOWR" */
+#define TW_ART_MAGIC    0x41525754u     /* "TWRA" */
+#define TW_VERSION      1u
+#define TW_GRID_W       375
+#define TW_GRID_H       120
+#define TW_STRIDE       384
+#define TW_NROOMS       16384
+#define TW_NART         1024
+#define TW_NSPR         1024
+#define TW_RAMP         48
+#define TW_PROFILES     16
+#define TW_LIVE_SIZE    712960u
+#define TW_NFIX         512
+#define TW_NSHAFTS      64
+#define TW_NROWS        128
+#define TW_NMOVERS      8192
+#define TW_OFF_FIX      630976u
+#define TW_OFF_STOPS    639168u
+#define TW_OFF_MOVERS   647424u
+#define TW_OFF_CELLS    192u
+#define TW_OFF_ROOMS    368832u
+#define TW_F_WEEKEND    1u
+#define TW_A_F_AUX      1u
+enum { TW_CELLS, TW_ROOMS, TW_FIX, TW_STOPS, TW_PAL, TW_MOVERS, TW_NSECT };
+
+typedef struct TwHead {             /* struct ros_tower's first 192 bytes */
+    uint32_t magic, version, frame, art;
+    uint16_t grid_w, grid_h, ground_row, scale;
+    uint16_t nrooms, nfixtures, nmovers;
+    uint8_t quality, rate, view, flags;
+    uint16_t hour, day;
+    int16_t outline[4];
+    uint16_t reserved0;
+    uint32_t outline_rgba, back_rgba;
+    uint32_t gen[8];
+    uint32_t room_gen[16];
+    uint32_t reserved[10];
+} TwHead;
+_Static_assert(sizeof(TwHead) == 192, "a tower's header is 192 bytes");
+_Static_assert(offsetof(TwHead, gen) == 56, "gen at 56");
+
+typedef struct TwArtHead {          /* struct ros_tower_art, before its pictures */
+    uint32_t magic, version, gen, size;
+    uint16_t scale, atlas_w, atlas_h, spr_w, spr_h, nart, nsprites, emit_shift, flags, lang;
+    uint32_t reserved[7];
+    uint32_t art[TW_NART][4];
+    uint32_t spr[TW_NSPR][4];
+    uint8_t ramp[4][TW_RAMP][4];
+    uint8_t prof[2][TW_PROFILES][24];
+} TwArtHead;
+_Static_assert(sizeof(TwArtHead) == 34368, "the art block's pictures start at 34,368");
+
+typedef struct TwData {             /* struct ros_surf_tower: the surface's 32 bytes */
+    uint32_t backing, offset, size, frame;
+    uint32_t art_backing, art_offset, art_size, art_gen;
+} TwData;
+
+typedef struct TwU {                /* design 7.2: 480 bytes, the same in C, GLSL and Metal */
+    float box[4], clip[4], view[4], clock[4];
+    float zen[4], hor[4], amb[4], misc[4];
+    int32_t grid[4], counts[4], sizes[4], mode[4], outline[4];
+    float ocol[4];
+    float pal[16][4];
+} TwU;
+_Static_assert(sizeof(TwU) == 480, "the tower's uniforms are 480 bytes");
+
+static NSString * const TW_SRC = @""
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"\n"
+"struct TwU {\n"
+"    float4 box, clip, view, clock;\n"
+"    float4 zen, hor, amb, misc;\n"
+"    int4   grid, counts, sizes, mode, outline;\n"
+"    float4 ocol;\n"
+"    float4 pal[16];\n"
+"};\n"
+"struct Res {\n"
+"    constant TwU *u;\n"
+"    texture2d<ushort> cells;  texture2d<uint> rooms;\n"
+"    texture2d<uint>   arttab; texture2d<uint> sprtab;\n"
+"    texture2d<ushort> aux;\n"
+"    texture2d<float>  albedo, emis, sprites, spremis, prof;\n"
+"};\n"
+"#define U (*R.u)\n"
+"\n"
+"constexpr sampler TRI(coord::normalized, filter::linear, mip_filter::linear,\n"
+"                      address::clamp_to_edge);\n"
+"constexpr sampler PROF(coord::normalized, filter::linear,\n"
+"                       s_address::repeat, t_address::clamp_to_edge);\n"
+"\n"
+"constant float2 CELL = float2(4.0, 16.0);\n"
+"constant uint S_VACANT = 1, S_SALE = 2, S_STUCK = 4, S_CLOSED = 8, S_INFESTED = 16,\n"
+"              S_SHOWING = 32, S_SELECTED = 128, S_LIT = 256, S_DARK = 512;\n"
+"constant uint A_REPEAT = 1, A_LAMP_ALL = 2, A_SOLID = 4, A_GROUND = 8, A_ANIM = 16,\n"
+"              A_EMIT = 32, A_AUX = 64, A_FIRE = 128;\n"
+"constant uint M_GLASS = 2, M_SCREEN = 7;\n"
+"constant uint ART_SKY_FAR = 1, ART_SKY_NEAR = 2;\n"
+"constant uint SPR_ROACH = 256;\n"
+"constant float3 LAMP = float3(1.00, 0.90, 0.74);\n"
+"constant float3 DARK_IN = float3(0.10, 0.12, 0.20);\n"
+"constant float3 SLAB = float3(0.46, 0.46, 0.48), PART = float3(0.24, 0.24, 0.27);\n"
+"constant float3 LUMA = float3(0.299, 0.587, 0.114);\n"
+"\n"
+"static float  gmod(float a, float b)   { return a - b * floor(a / b); }\n"
+"static float2 gmod(float2 a, float2 b) { return a - b * floor(a / b); }\n"
+"static float4 unpack8(uint w) { return float4(uint4(w, w >> 8, w >> 16, w >> 24) & 255u) / 255.0; }\n"
+"\n"
+"#if TW_Q >= 2 && defined(TW_FAIL)\n"
+"this is not a shader;\n"
+"#endif\n"
+"static uint hash(uint x) {\n"
+"    x ^= x >> 16; x *= 0x7feb352du;\n"
+"    x ^= x >> 15; x *= 0x846ca68bu;\n"
+"    x ^= x >> 16;\n"
+"    return x;\n"
+"}\n"
+"static float h01(uint x) { return float(hash(x) >> 8) * (1.0 / 16777216.0); }\n"
+"static float hash2(int ix, int iy, uint seed) { return h01(uint(ix) + hash(uint(iy) + seed)); }\n"
+"static float vnoise(float2 p, uint seed) {\n"
+"    float2 i = floor(p), f = p - i;\n"
+"    float2 u = f * f * (3.0 - 2.0 * f);\n"
+"    int2 k = int2(i);\n"
+"    float a = hash2(k.x, k.y, seed), b = hash2(k.x + 1, k.y, seed);\n"
+"    float c = hash2(k.x, k.y + 1, seed), d = hash2(k.x + 1, k.y + 1, seed);\n"
+"    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);\n"
+"}\n"
+"\n"
+"static uint4 artrec(thread const Res &R, uint a) {\n"
+"    return R.arttab.read(uint2(min(a, uint(U.counts.y) - 1u), 0));\n"
+"}\n"
+"static uint4 sprrec(thread const Res &R, uint s) {\n"
+"    return R.sprtab.read(uint2(min(s, uint(U.counts.z) - 1u), 0));\n"
+"}\n"
+"static uint4 room(thread const Res &R, uint id) { return R.rooms.read(uint2(id & 127u, id >> 7)); }\n"
+"static uint4 cellat(thread const Res &R, int2 c) {\n"
+"    if (c.x < 0 || c.y < 0 || c.x >= U.grid.x || c.y >= U.grid.y) return uint4(0);\n"
+"    uint4 k = uint4(R.cells.read(uint2(c)));\n"
+"    if (k.x >= uint(U.counts.x)) k.x = 0;\n"
+"    return k;\n"
+"}\n"
+"static uint4 rect(uint4 A, uint fr) {\n"
+"    uint n = max(A.w >> 16, 1u), w = (A.y & 0xffffu) / n;\n"
+"    return uint4((A.x & 0xffffu) + (fr % n) * w, A.x >> 16, w, A.y >> 16);\n"
+"}\n"
+"static float4 atl(thread const Res &R, uint4 r, float2 p, float lod) {\n"
+"    float e = 0.5 * exp2(ceil(lod));\n"
+"    float2 q = clamp(p, float2(e), max(float2(r.zw) - e, float2(e))) + float2(r.xy);\n"
+"    return R.albedo.sample(TRI, q / float2(U.sizes.xy), level(lod));\n"
+"}\n"
+"static float4 atl_emis(thread const Res &R, uint4 r, float2 p, float lod) {\n"
+"    float e = 0.5 * exp2(ceil(lod));\n"
+"    float2 q = clamp(p, float2(e), max(float2(r.zw) - e, float2(e))) + float2(r.xy);\n"
+"    return R.emis.sample(TRI, q / float2(U.sizes.xy), level(max(lod - float(U.mode.y), 0.0)));\n"
+"}\n"
+"static uint2 auxat(thread const Res &R, uint4 r, float2 p) {\n"
+"    int2 q = clamp(int2(floor(p)), int2(0), int2(r.zw) - 1) + int2(r.xy);\n"
+"    return uint2(R.aux.read(uint2(q)).rg);\n"
+"}\n"
+"static float4 spr(thread const Res &R, uint s, uint fr, float2 uv, float lod, thread float4 &glow) {\n"
+"    uint4 S = sprrec(R, s);\n"
+"    uint n = max(S.w >> 16, 1u);\n"
+"    float2 sz = float2(float(S.y & 0xffffu), float(S.y >> 16));\n"
+"    float e = 0.5 * exp2(ceil(lod));\n"
+"    float2 q = clamp(clamp(uv, 0.0, 1.0) * sz, float2(e), max(sz - e, float2(e)))\n"
+"             + float2(float((S.x & 0xffffu) + (fr % n) * (S.y & 0xffffu)), float(S.x >> 16));\n"
+"    float2 t = q / float2(U.sizes.zw);\n"
+"    glow = (S.w & (A_EMIT | 64u)) != 0 ? R.spremis.sample(TRI, t, level(lod)) : float4(0);\n"
+"    return R.sprites.sample(TRI, t, level(lod));\n"
+"}\n"
+"static float3 over(float3 under, float4 top) { return top.rgb + under * (1.0 - top.a); }\n"
+"\n"
+"static float night_alpha(float hour) {\n"
+"    float h = hour < 7.0 ? hour + 24.0 : hour;\n"
+"    if (h < 20.0) return 0.0;\n"
+"    if (h < 21.0) return h - 20.0;\n"
+"    if (h < 28.0) return 1.0;\n"
+"    if (h < 30.0) return 1.0 - (h - 28.0) * 0.5;\n"
+"    return 0.0;\n"
+"}\n"
+"static float3 outdoors(thread const Res &R, float3 c, float3 glow) {\n"
+"    if (U.counts.w == 0) return c;\n"
+"    return c * U.amb.rgb + glow * (1.0 - U.misc.x);\n"
+"}\n"
+"static float lamp(thread const Res &R, uint4 Rm, uint group) {\n"
+"    uint st = Rm.z & 0xffffu;\n"
+"    if ((st & (S_DARK | S_CLOSED)) != 0) return 0.0;\n"
+"    if ((st & S_LIT) != 0) return 1.0;\n"
+"    float chance = R.prof.sample(PROF, float2((U.clock.x + 0.5) / 24.0,\n"
+"                                (float((Rm.y >> 16) & 15u) + 0.5) / 16.0), level(0.0)).r;\n"
+"    return h01(Rm.w ^ group * 0x9e3779b9u ^ uint(U.clock.z) * 0x85ebca6bu) < chance ? 1.0 : 0.0;\n"
+"}\n"
+"\n"
+"static float3 grad3(float3 a, float3 b, float3 c, float mid, float t) {\n"
+"    return t < mid ? mix(a, b, t / mid) : mix(b, c, (t - mid) / (1.0 - mid));\n"
+"}\n"
+"static float3 sky(thread const Res &R, float2 m) {\n"
+"    float ground = float(U.grid.z) * CELL.y;\n"
+"    float t = clamp(m.y / ground, 0.0, 1.0);\n"
+"    if (U.counts.w == 0) {\n"
+"        float3 d = grad3(float3(0.102, 0.227, 0.431), float3(0.357, 0.659, 0.831),\n"
+"                         float3(0.706, 0.867, 0.941), 0.6, t);\n"
+"        float3 n = grad3(float3(0.016, 0.035, 0.102), float3(0.039, 0.071, 0.208),\n"
+"                         float3(0.055, 0.122, 0.290), 0.5, t);\n"
+"        return mix(d, n, night_alpha(U.clock.x));\n"
+"    }\n"
+"#if TW_Q >= 1\n"
+"    float3 c = mix(U.zen.rgb, U.hor.rgb, t * t);\n"
+"    int2 sq = int2(floor(m / 10.0));\n"
+"    uint h = hash(uint(sq.x) * 73856093u ^ uint(sq.y) * 19349663u);\n"
+"    if ((h & 255u) == 0) {\n"
+"        float2 sp = (float2(sq) + float2(float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0) * 10.0;\n"
+"        float d = length(m - sp) * float(U.grid.w) / U.view.z;\n"
+"        c += U.misc.y * (1.0 - smoothstep(0.6, 1.6, d)) * float3(0.90, 0.94, 1.00);\n"
+"    }\n"
+"#if TW_Q >= 2\n"
+"    if (U.counts.w >= 2 && U.misc.z > 0.0) {\n"
+"        float k = clamp((U.clock.x - 6.0) / 13.0, 0.0, 1.0);\n"
+"        float2 sun = float2(1500.0 * (0.1 + 0.8 * k), ground * (0.9 - 0.7 * sin(3.14159265 * k)));\n"
+"        float d = length(m - sun);\n"
+"        c += U.misc.z * (float3(1.0, 0.95, 0.80) * (1.0 - smoothstep(14.0, 15.0, d))\n"
+"                         + float3(1.0, 0.80, 0.50) * 0.25 * exp2(-d / 75.0));\n"
+"    }\n"
+"#endif\n"
+"    for (uint s = ART_SKY_FAR; s <= ART_SKY_NEAR && U.counts.w >= 1; s++) {\n"
+"        uint4 A = artrec(R, s), r = rect(A, 0);\n"
+"        float S = float(U.grid.w);\n"
+"        float hgt = float(r.w) / S;\n"
+"        float y = m.y - (ground - hgt);\n"
+"        if (y >= 0.0) {\n"
+"            float2 p = float2(gmod(m.x * S, float(r.z)), y * S);\n"
+"            float4 g = (A.w & A_EMIT) != 0 ? atl_emis(R, r, p, U.view.w) : float4(0);\n"
+"            float4 a = atl(R, r, p, U.view.w);\n"
+"            c = outdoors(R, a.rgb, g.rgb) + c * (1.0 - a.a);\n"
+"        }\n"
+"    }\n"
+"    return c;\n"
+"#else\n"
+"    return float3(0);\n"
+"#endif\n"
+"}\n"
+"\n"
+"static float4 piece(thread const Res &R, uint a, float2 m, int2 c, thread float3 &glow) {\n"
+"    uint4 A = artrec(R, a);\n"
+"    if ((A.w & A_SOLID) != 0) { glow = float3(0); return unpack8(A.x); }\n"
+"    uint fr = (A.w & A_ANIM) != 0 ? uint(U.clock.y * 8.0) + hash(uint(c.x) * 31u + uint(c.y)) : 0u;\n"
+"    uint4 r = rect(A, fr);\n"
+"    float S = float(U.grid.w);\n"
+"    float2 p = float2(gmod(m.x * S, float(r.z)),\n"
+"                      (A.w & A_GROUND) != 0 ? m.y * S - (float(U.grid.z) * CELL.y * S - float(r.w))\n"
+"                                            : gmod(m.y * S, float(r.w)));\n"
+"    glow = (A.w & A_EMIT) != 0 ? atl_emis(R, r, p, U.view.w).rgb : float3(0);\n"
+"    return atl(R, r, p, U.view.w);\n"
+"}\n"
+"\n"
+"static float3 roaches(thread const Res &R, uint4 Rm, float2 l, float2 size, float floor_y, float3 col) {\n"
+"    int n = min(6, 2 + int((Rm.x >> 16) & 511u) / 4);\n"
+"    for (int k = 0; k < 6; k++) {\n"
+"        if (k >= n) break;\n"
+"        uint hk = hash(Rm.w + uint(k) * 0x9e3779b9u);\n"
+"        float dir = (hk & 1u) != 0 ? 1.0 : -1.0;\n"
+"        float speed = 1.5 + float((hk >> 1) & 7u) * 0.25;\n"
+"        float bx = gmod(float(hk >> 8) + dir * speed * U.clock.y, size.x - 4.0) + 2.0;\n"
+"        float by = floor_y - 0.5 - float(k & 1);\n"
+"        float2 d = (l - float2(bx - 1.25, by - 2.0)) / float2(2.5, 2.0);\n"
+"        if (d.x >= 0.0 && d.y >= 0.0 && d.x < 1.0 && d.y < 1.0) {\n"
+"            if (dir < 0.0) d.x = 1.0 - d.x;\n"
+"            float4 g;\n"
+"            float4 b = spr(R, SPR_ROACH, uint(U.clock.y * 9.0) + uint(k), d, U.view.w, g);\n"
+"            col = over(col, b);\n"
+"        }\n"
+"    }\n"
+"    return col;\n"
+"}\n"
+"\n"
+"static float4 shade_room(thread const Res &R, uint4 Rm, float2 m, int2 c) {\n"
+"    float x0 = float(Rm.x & 511u), yt = float((Rm.x >> 9) & 127u);\n"
+"    float wc = float((Rm.x >> 16) & 511u), hf = float(max((Rm.x >> 25) & 7u, 1u));\n"
+"    uint st = Rm.z & 0xffffu, occ = (Rm.z >> 16) & 255u;\n"
+"    float2 size = float2(wc, hf) * CELL;\n"
+"    float2 l = m - float2(x0, yt) * CELL;\n"
+"    float fy = gmod(l.y, CELL.y);\n"
+"    int q = U.counts.w;\n"
+"    float lod = U.view.w, S = float(U.grid.w);\n"
+"\n"
+"    float gx = q == 0 ? 1.0 : 0.75, gy = 1.0;\n"
+"    if (l.x >= size.x - gx || fy >= CELL.y - gy) {\n"
+"        if (q == 0) return float4(0);\n"
+"#if TW_Q >= 1\n"
+"        float3 s = fy >= CELL.y - gy ? SLAB : PART;\n"
+"        return float4(s * mix(float3(0.45), float3(1.0), U.misc.x), 1.0);\n"
+"#else\n"
+"        return float4(0);\n"
+"#endif\n"
+"    }\n"
+"\n"
+"    uint4 A = artrec(R, Rm.y & 0xffffu);\n"
+"    float3 col, glow = float3(0);\n"
+"    uint mat = 0, grp = 0, ht = 0;\n"
+"    uint4 r = uint4(0);\n"
+"    float2 p = float2(0);\n"
+"    if ((A.w & A_SOLID) != 0) {\n"
+"        col = unpack8(A.x).rgb;\n"
+"    } else {\n"
+"        uint fr = ((A.w & A_ANIM) != 0 || (st & S_SHOWING) != 0) ? uint(U.clock.y * 6.0) : 0u;\n"
+"        r = rect(A, fr);\n"
+"        uint period = A.z >> 16;\n"
+"        p = (A.w & A_REPEAT) != 0\n"
+"            ? float2(gmod(l.x * S, float(period != 0 ? period : r.z)), l.y / size.y * float(r.w))\n"
+"            : l / size * float2(r.zw);\n"
+"        float4 a = atl(R, r, p, lod);\n"
+"        if ((A.w & A_AUX) != 0) {\n"
+"            uint2 x = auxat(R, r, p);\n"
+"            uint slot = x.r >> 4;\n"
+"            mat = x.r & 15u; grp = x.g & 15u; ht = x.g >> 4;\n"
+"            uint alt = A.z & 0xffffu;\n"
+"            if (slot != 0 && alt != 0 && float(occ) > h01(Rm.w ^ slot * 0x27d4eb2fu) * 255.0)\n"
+"                a = atl(R, rect(artrec(R, alt), fr), p, lod);\n"
+"        }\n"
+"        col = a.rgb;\n"
+"        if ((A.w & A_EMIT) != 0) glow = atl_emis(R, r, p, lod).rgb;\n"
+"    }\n"
+"\n"
+"#if TW_Q >= 1\n"
+"    if (q >= 1) {\n"
+"        float on = lamp(R, Rm, (A.w & A_LAMP_ALL) != 0 ? 0u : grp);\n"
+"        float day = U.misc.x;\n"
+"        float3 base = col;\n"
+"        col = base * mix(mix(DARK_IN, float3(1.0), day), mix(LAMP, float3(1.0), day), on)\n"
+"            + glow * on * (1.0 - day);\n"
+"        if (mat == M_GLASS) col = mix(col, sky(R, m), 0.7 - 0.35 * on);\n"
+"        if (mat == M_SCREEN && (st & S_SHOWING) != 0)\n"
+"            col += float3(0.6, 0.7, 0.9) * (0.25 + 0.2 * vnoise(float2(U.clock.y * 4.0, x0), 51u));\n"
+"#if TW_Q >= 2\n"
+"        if (q >= 2) {\n"
+"            float ao = (1.0 - 0.22 * (1.0 - smoothstep(0.0, 2.5, fy)))\n"
+"                     * (1.0 - 0.18 * (1.0 - smoothstep(0.0, 2.0, min(l.x, size.x - gx - l.x))));\n"
+"            float sh = 0.0;\n"
+"            if ((A.w & A_AUX) != 0)\n"
+"                for (int k = 1; k <= 3; k++) {\n"
+"                    uint2 y = auxat(R, r, p - float2(1.0, 2.0) * float(k) * exp2(lod));\n"
+"                    if (float(y.g >> 4) > float(ht) + float(k)) sh = max(sh, 1.0 - 0.25 * float(k));\n"
+"                }\n"
+"            col *= ao * (1.0 - 0.35 * sh);\n"
+"            if (day < 0.95) {\n"
+"                uint4 kl = cellat(R, int2(int(x0) - 1, c.y)), kr = cellat(R, int2(int(x0 + wc), c.y));\n"
+"                float s = 0.0;\n"
+"                if (kl.x != 0) s += lamp(R, room(R, kl.x), 0u) * exp2(-l.x / 6.0);\n"
+"                if (kr.x != 0) s += lamp(R, room(R, kr.x), 0u) * exp2(-(size.x - l.x) / 6.0);\n"
+"                col += base * LAMP * s * 0.35 * (1.0 - day);\n"
+"            }\n"
+"            float w = fract((m.x + m.y * 0.35) / 225.0);\n"
+"            float streak = smoothstep(0.40, 0.45, w) - smoothstep(0.52, 0.60, w);\n"
+"            col = mix(col, U.hor.rgb, U.misc.w * (0.4 + 0.6 * streak));\n"
+"        }\n"
+"#endif\n"
+"    }\n"
+"#endif\n"
+"\n"
+"    if ((st & S_STUCK) != 0) col = float3(dot(col, LUMA) * 0.85);\n"
+"    uint sign = Rm.z >> 24;\n"
+"    if (sign != 0 && l.y < CELL.y) {\n"
+"        float4 g;\n"
+"        col = over(col, spr(R, sign, 0u, l / float2(size.x, CELL.y), lod, g));\n"
+"    }\n"
+"    if ((st & S_INFESTED) != 0) col = roaches(R, Rm, l, size, size.y - gy, col);\n"
+"    uint ev = (Rm.y >> 20) & 3u;\n"
+"    if (U.mode.x == 1 && ev != 0) col = over(col, U.pal[ev]);\n"
+"    if (U.mode.x == 2) col = over(col, U.pal[4 + int((Rm.y >> 24) & 255u) * 12 / 256]);\n"
+"    if ((st & S_SELECTED) != 0) {\n"
+"        float e = 2.0 * U.view.z / S;\n"
+"        if (l.x < e || l.y < e || l.x > size.x - gx - e || l.y > size.y - gy - e) col = U.ocol.rgb;\n"
+"    }\n"
+"    return float4(col, 1.0);\n"
+"}\n"
+"\n"
+"#if TW_Q >= 2\n"
+"static float3 burn(thread const Res &R, float3 col, float2 m, float fy) {\n"
+"    float up = 1.0 - fy / CELL.y;\n"
+"    float n = vnoise(float2(m.x / 3.0, m.y / 3.0 + U.clock.y * 2.5), 61u) * 0.7\n"
+"            + vnoise(float2(m.x / 1.25, m.y / 1.25 + U.clock.y * 5.0), 62u) * 0.3;\n"
+"    float flame = smoothstep(0.35, 0.75, n * (1.25 - up));\n"
+"    float3 hot = mix(float3(0.85, 0.20, 0.05), float3(1.0, 0.85, 0.35), flame);\n"
+"    return mix(col * 0.30, hot, flame) + float3(0.35, 0.10, 0.02) * (1.0 - up);\n"
+"}\n"
+"#endif\n"
+"\n"
+"static float4 field(thread const Res &R, float2 f) {\n"
+"    float2 world = float2(U.grid.xy) * CELL;\n"
+"    float2 m = f / U.box.zw * world;\n"
+"    if (m.x < 0.0 || m.y < 0.0 || m.x >= world.x || m.y >= world.y) return float4(0);\n"
+"    int2 c = int2(floor(m / CELL));\n"
+"    uint4 k = cellat(R, c);\n"
+"    float3 col = c.y < U.grid.z ? sky(R, m) : float3(0.24, 0.13, 0.06);\n"
+"    float3 g;\n"
+"    if (k.y != 0) {\n"
+"        float4 b = piece(R, k.y, m, c, g);\n"
+"        col = outdoors(R, b.rgb, g) + col * (1.0 - b.a);\n"
+"    }\n"
+"    if (k.x != 0) {\n"
+"        float4 r = shade_room(R, room(R, k.x), m, c);\n"
+"        col = mix(col, r.rgb, r.a);\n"
+"    }\n"
+"    if (k.z != 0) {\n"
+"        float4 b = piece(R, k.z, m, c, g);\n"
+"        if (U.counts.w == 0 && (artrec(R, k.z).w & A_FIRE) != 0)\n"
+"            col = mix(col, float3(0.87, 0.20, 0.20), 0.5 * b.a);\n"
+"#if TW_Q >= 2\n"
+"        else if (U.counts.w >= 2) col = mix(col, burn(R, col, m, gmod(m.y, CELL.y)), b.a * 0.6);\n"
+"#endif\n"
+"        col = over(col, float4(outdoors(R, b.rgb, g), b.a));\n"
+"    }\n"
+"    int4 o = U.outline;\n"
+"    if (o.z > o.x && c.x >= o.x && c.y >= o.y && c.x < o.z && c.y < o.w) {\n"
+"        float2 kk = U.box.zw / world;\n"
+"        float2 lo = (m - float2(o.xy) * CELL) * kk, hi = (float2(o.zw) * CELL - m) * kk;\n"
+"        if (min(min(lo.x, lo.y), min(hi.x, hi.y)) < 2.0) col = U.ocol.rgb;\n"
+"    }\n"
+"    return float4(clamp(col, 0.0, 1.0), 1.0);\n"
+"}\n"
+"\n"
+"struct TwV { float4 pos [[position]]; };\n"
+"\n"
+"vertex TwV tw_vs(uint id [[vertex_id]], constant TwU &u [[buffer(0)]]) {\n"
+"    float2 k = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = mix(u.clip.xy, u.clip.zw, k);\n"
+"    TwV o;\n"
+"    o.pos = float4(p / u.view.xy * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 tw_field(TwV v [[stage_in]], constant TwU &u [[buffer(0)]],\n"
+"        texture2d<ushort> cells   [[texture(0)]], texture2d<uint>  rooms   [[texture(1)]],\n"
+"        texture2d<uint>   arttab  [[texture(2)]], texture2d<uint>  sprtab  [[texture(3)]],\n"
+"        texture2d<float>  albedo  [[texture(4)]], texture2d<float> emis    [[texture(5)]],\n"
+"        texture2d<ushort> aux     [[texture(6)]], texture2d<float> sprites [[texture(7)]],\n"
+"        texture2d<float>  spremis [[texture(8)]], texture2d<float> prof    [[texture(9)]])\n"
+"{\n"
+"    Res R = { &u, cells, rooms, arttab, sprtab, aux, albedo, emis, sprites, spremis, prof };\n"
+"    float4 c = field(R, v.pos.xy - u.box.xy);       /* Metal's origin is the top left */\n"
+"    if (c.a == 0.0) discard_fragment();\n"
+"    return c;\n"
+"}\n"
+"\n"
+"/* ---- P2, the fixtures (design 7.7) --------------------------------------- */\n"
+"constant uint FIX_CARLIFT = 5;\n"
+"\n"
+"struct TwF { float4 pos [[position]]; float2 lp; uint4 F [[flat]]; };\n"
+"\n"
+"vertex TwF tw_fix_vs(uint id [[vertex_id]], uint inst [[instance_id]],\n"
+"                     constant TwU &u [[buffer(0)]], texture2d<uint> fixtab [[texture(0)]])\n"
+"{\n"
+"    uint4 r = fixtab.read(uint2(min(int(inst), u.mode.z - 1), 0));\n"
+"    float over_ = float((r.z >> 8) & 255u);\n"
+"    float2 o  = float2(float(r.x & 511u), float((r.x >> 9) & 127u)) * CELL - float2(0.0, over_);\n"
+"    float2 sz = float2(float((r.x >> 16) & 255u) * CELL.x, float((r.x >> 24) & 127u) * CELL.y + over_);\n"
+"    float2 k  = float2(id & 1, (id >> 1) & 1);\n"
+"    TwF v;\n"
+"    v.lp = k * sz;\n"
+"    float2 world = float2(u.grid.xy) * CELL;\n"
+"    float2 t = u.box.xy + (o + v.lp) / world * u.box.zw;\n"
+"    v.pos = float4(t / u.view.xy * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    v.F = r;\n"
+"    return v;\n"
+"}\n"
+"\n"
+"fragment float4 tw_fix(TwF v [[stage_in]], constant TwU &u [[buffer(0)]],\n"
+"        texture2d<ushort> cells   [[texture(0)]], texture2d<uint>  rooms   [[texture(1)]],\n"
+"        texture2d<uint>   arttab  [[texture(2)]], texture2d<uint>  sprtab  [[texture(3)]],\n"
+"        texture2d<float>  albedo  [[texture(4)]], texture2d<float> emis    [[texture(5)]],\n"
+"        texture2d<ushort> aux     [[texture(6)]], texture2d<float> sprites [[texture(7)]],\n"
+"        texture2d<float>  spremis [[texture(8)]], texture2d<float> prof    [[texture(9)]],\n"
+"        texture2d<ushort> stops   [[texture(10)]])\n"
+"{\n"
+"    Res R = { &u, cells, rooms, arttab, sprtab, aux, albedo, emis, sprites, spremis, prof };\n"
+"    uint4 F = v.F;\n"
+"    uint kind = (F.y >> 16) & 255u, base = F.y & 0xffffu;\n"
+"    float S = float(u.grid.w), lod = u.view.w;\n"
+"    float over_ = float((F.z >> 8) & 255u);\n"
+"    if (kind <= 2 || kind == FIX_CARLIFT) {\n"
+"        if (v.lp.y < over_) {                       /* the top, above the highest floor, standing on it */\n"
+"            uint4 r = rect(artrec(R, base + 1u), 0);\n"
+"            float2 p = float2(v.lp.x * S, (v.lp.y - over_) * S + float(r.w));\n"
+"            float4 c = atl(R, r, p, lod);\n"
+"            return float4(outdoors(R, c.rgb, float3(0)), c.a);\n"
+"        }\n"
+"        int top = int((F.x >> 9) & 127u), rows = int((F.x >> 24) & 127u);\n"
+"        int row = top + int(floor((v.lp.y - over_) / CELL.y));\n"
+"        float fy = gmod(v.lp.y - over_, CELL.y);\n"
+"        float2 p = float2(v.lp.x * S, fy * S);\n"
+"        if (row >= top + rows - 1) {                /* the pit, under the lowest floor */\n"
+"            uint4 r = rect(artrec(R, base + 2u), 0);\n"
+"            if (p.y >= float(r.w)) return float4(0);\n"
+"            float4 c = atl(R, r, p, lod);\n"
+"            return float4(outdoors(R, c.rgb, float3(0)), c.a);\n"
+"        }\n"
+"        uint s = uint(stops.read(uint2(clamp(row, 0, 127), F.z & 63u)).r);\n"
+"        uint a = (s & 1u) != 0 ? base + 4u + ((s >> 4) & 3u) : base + 3u;\n"
+"        float4 body = atl(R, rect(artrec(R, base), 0), p, lod);\n"
+"        uint4 r = rect(artrec(R, a), 0);\n"
+"        float4 front = atl(R, r, p, lod);\n"
+"        float4 g = (artrec(R, a).w & A_EMIT) != 0 ? atl_emis(R, r, p, lod) : float4(0);\n"
+"        float calling = (s & 6u) != 0 ? 1.0 : 0.25;\n"
+"        float3 c = over(outdoors(R, body.rgb, float3(0)),\n"
+"                        float4(outdoors(R, front.rgb, g.rgb * calling), front.a));\n"
+"        return float4(c, max(body.a, front.a));\n"
+"    }\n"
+"    uint4 A = artrec(R, base);\n"
+"    uint fr = (A.w & A_ANIM) != 0 ? uint(u.clock.y * 8.0) : 0u;\n"
+"    uint4 r = rect(A, fr);\n"
+"    float2 sz = float2(float((F.x >> 16) & 255u) * CELL.x, float((F.x >> 24) & 127u) * CELL.y + over_);\n"
+"    float2 p = v.lp / sz * float2(r.zw);\n"
+"    float4 c = atl(R, r, p, lod);\n"
+"    float4 g = (A.w & A_EMIT) != 0 ? atl_emis(R, r, p, lod) : float4(0);\n"
+"    return float4(outdoors(R, c.rgb, g.rgb), c.a);\n"
+"}\n"
+"\n"
+"/* ---- P3, the movers (design 7.9) ------------------------------------------ */\n"
+"constant uint SPR_TINT = 64, P_TINTED = 0x8000;\n"
+"constant float3 TOPS[16] = {\n"
+"    float3(0x2f, 0x5d, 0x50) / 255.0, float3(0x3b, 0x5b, 0x8a) / 255.0, float3(0x6b, 0x5a, 0x7e) / 255.0,\n"
+"    float3(0x7a, 0x6a, 0x4f) / 255.0, float3(0x4a, 0x4f, 0x57) / 255.0, float3(0xb9, 0xa3, 0xd6) / 255.0,\n"
+"    float3(0x2f, 0x4a, 0x7a) / 255.0, float3(0xe9, 0xee, 0xf2) / 255.0, float3(0xff, 0x5f, 0xa2) / 255.0,\n"
+"    float3(0xd8, 0x19, 0x19) / 255.0, float3(0), float3(0), float3(0), float3(0), float3(0), float3(0) };\n"
+"constant float3 LEGS[4] = { float3(0x3b, 0x42, 0x50) / 255.0, float3(0x2e, 0x34, 0x40) / 255.0,\n"
+"                            float3(0xa3, 0x3a, 0x6c) / 255.0, float3(0x8a, 0x10, 0x10) / 255.0 };\n"
+"constant float3 SKINS[4] = { float3(0xf1, 0xc2, 0x7d) / 255.0, float3(0xe0, 0xac, 0x69) / 255.0,\n"
+"                             float3(0xc6, 0x86, 0x42) / 255.0, float3(0x8d, 0x55, 0x24) / 255.0 };\n"
+"\n"
+"struct TwM { float4 pos [[position]]; float2 uv; float2 at; uint4 M [[flat]]; uint4 SP [[flat]]; };\n"
+"\n"
+"vertex TwM tw_mov_vs(uint id [[vertex_id]], uint inst [[instance_id]],\n"
+"                     constant TwU &u [[buffer(0)]],\n"
+"                     texture2d<ushort> movers [[texture(11)]], texture2d<uint> sprtab [[texture(3)]])\n"
+"{\n"
+"    int i = min(int(inst), u.mode.w - 1);\n"
+"    uint4 mv = uint4(movers.read(uint2(i & 255, i >> 8)));\n"
+"    uint4 s = sprtab.read(uint2(min(mv.z & 1023u, uint(u.counts.z) - 1u), 0));\n"
+"    float2 feet = float2(mv.xy) * 0.25;\n"
+"    float2 sz = float2(float(s.z & 0xffffu), float(s.z >> 16)) * 0.25;\n"
+"    float2 k = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = feet + (k - float2(0.5, 1.0)) * sz;\n"
+"    float2 world = float2(u.grid.xy) * CELL;\n"
+"    float2 t = u.box.xy + p / world * u.box.zw;\n"
+"    TwM o;\n"
+"    o.pos = float4(t / u.view.xy * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    o.uv = float2((mv.z & 1024u) != 0 ? 1.0 - k.x : k.x, k.y);\n"
+"    o.at = p;\n"
+"    o.M = mv; o.SP = s;\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 tw_mov(TwM v [[stage_in]], constant TwU &u [[buffer(0)]],\n"
+"        texture2d<ushort> cells   [[texture(0)]], texture2d<uint>  rooms   [[texture(1)]],\n"
+"        texture2d<uint>   arttab  [[texture(2)]], texture2d<uint>  sprtab  [[texture(3)]],\n"
+"        texture2d<float>  albedo  [[texture(4)]], texture2d<float> emis    [[texture(5)]],\n"
+"        texture2d<ushort> aux     [[texture(6)]], texture2d<float> sprites [[texture(7)]],\n"
+"        texture2d<float>  spremis [[texture(8)]], texture2d<float> prof    [[texture(9)]])\n"
+"{\n"
+"    Res R = { &u, cells, rooms, arttab, sprtab, aux, albedo, emis, sprites, spremis, prof };\n"
+"    if ((v.M.z & 2048u) != 0) {                     /* BEHIND: hidden by any room */\n"
+"        int2 c = int2(floor(v.at / CELL));\n"
+"        if (c.x >= 0 && c.y >= 0 && c.x < u.grid.x && c.y < u.grid.y &&\n"
+"            cells.read(uint2(c)).x != 0) discard_fragment();\n"
+"    }\n"
+"    uint fr = (v.SP.w & 16u) != 0 ? uint(u.clock.y * 8.0) : (v.M.w & 15u);\n"
+"    float4 g;\n"
+"    float4 a = spr(R, v.M.z & 1023u, fr, v.uv, u.view.w, g);\n"
+"    if ((v.SP.w & SPR_TINT) != 0) {                 /* a person: the tint layer's weights */\n"
+"        float4 w = g;\n"
+"        g = float4(0);\n"
+"        if ((v.M.w & P_TINTED) != 0) {\n"
+"            float3 top = TOPS[(v.M.w >> 4) & 15u], legs = LEGS[(v.M.w >> 8) & 3u], skin = SKINS[(v.M.w >> 10) & 3u];\n"
+"            a.rgb = a.rgb * (1.0 - w.r - w.g - w.b) + (top * w.r + skin * w.g + legs * w.b) * a.a;\n"
+"        }\n"
+"    }\n"
+"    if (a.a <= 0.0 && g.a <= 0.0) discard_fragment();\n"
+"    float3 c = (v.M.z & 4096u) != 0 && u.counts.w >= 1\n"
+"             ? a.rgb * mix(LAMP, float3(1.0), u.misc.x) + g.rgb * (1.0 - u.misc.x)\n"
+"             : outdoors(R, a.rgb, g.rgb);\n"
+"    return float4(c, a.a);\n"
+"}\n"
+"\n";
+
+#define TW_RING 3                       /* per-frame textures: one the GPU may read, one written */
+
+static struct {
+    id<MTLRenderPipelineState> field, field_shot, fix, fix_shot, mov, mov_shot;
+    id<MTLTexture> cells, rooms, arttab, sprtab, albedo, emis, aux, sprites, spremis, prof;
+    id<MTLTexture> fixtab;
+    id<MTLTexture> stops[TW_RING], movers[TW_RING];  /* design 8.4: a ring, as they change each frame */
+    int ring;
+    uint32_t frame, art_gen, gen[8], room_gen[16];
+    int weekend;                    /* the lamp profiles uploaded: 0 weekday, 1 weekend, -1 none */
+    int maxq;                       /* the best quality the library was built for */
+    bool have, art_have, tried;
+    uint8_t *live;                  /* the last whole frame of the live block */
+    uint8_t *next;
+    TwArtHead *ah;                  /* the art block's head, as uploaded */
+} tw;
+
+static void tw_setup(void)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    MTLCompileOptions *opts;
+
+    if (tw.tried) {
+        return;
+    }
+    tw.tried = true;
+    tw.weekend = -1;
+    tw.live = calloc(1, TW_LIVE_SIZE);
+    tw.next = calloc(1, TW_LIVE_SIZE);
+    tw.ah = calloc(1, sizeof(TwArtHead));
+    if (!tw.live || !tw.next || !tw.ah) {
+        return;
+    }
+    /* no fast maths: the twin's arithmetic, as the design asks (8.3) */
+    opts = [[MTLCompileOptions alloc] init];
+    if (@available(macOS 15.0, *)) {
+        opts.mathMode = MTLMathModeSafe;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opts.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    }
+    /* rich, else the classic program (design 3.3, safe_program) */
+    for (int q = 2; q >= 0; q -= 2) {
+        const char *fail = getenv("ROSGD_TOWER_FAIL_RICH");
+        NSMutableDictionary *mac = [NSMutableDictionary dictionary];
+        mac[@"TW_Q"] = @(q);
+        if (fail && *fail == '1') {
+            mac[@"TW_FAIL"] = @1;
+        }
+        opts.preprocessorMacros = mac;
+        err = nil;
+        lib = [m.device newLibraryWithSource:TW_SRC options:opts error:&err];
+        if (lib) {
+            tw.maxq = q;
+            metal_log("tower: the %s program", q ? "rich" : "classic");
+            break;
+        }
+        metal_log("tower: the %s program will not build: %s", q ? "rich" : "classic",
+                  [[err localizedDescription] UTF8String]);
+    }
+    [opts release];
+    if (!lib) {
+        return;
+    }
+    tw.field = tl_pipe(lib, @"tw_vs", @"tw_field", MTLPixelFormatBGRA8Unorm);
+    tw.field_shot = tl_pipe(lib, @"tw_vs", @"tw_field", MTLPixelFormatRGBA8Unorm);
+    tw.fix = tl_pipe(lib, @"tw_fix_vs", @"tw_fix", MTLPixelFormatBGRA8Unorm);
+    tw.fix_shot = tl_pipe(lib, @"tw_fix_vs", @"tw_fix", MTLPixelFormatRGBA8Unorm);
+    tw.mov = tl_pipe(lib, @"tw_mov_vs", @"tw_mov", MTLPixelFormatBGRA8Unorm);
+    tw.mov_shot = tl_pipe(lib, @"tw_mov_vs", @"tw_mov", MTLPixelFormatRGBA8Unorm);
+    [lib release];
+    tw.cells = gp_texture(MTLPixelFormatRGBA16Uint, TW_STRIDE, TW_GRID_H, MTLTextureUsageShaderRead);
+    tw.rooms = gp_texture(MTLPixelFormatRGBA32Uint, 128, TW_NROOMS / 128, MTLTextureUsageShaderRead);
+    tw.arttab = gp_texture(MTLPixelFormatRGBA32Uint, TW_NART, 1, MTLTextureUsageShaderRead);
+    tw.sprtab = gp_texture(MTLPixelFormatRGBA32Uint, TW_NSPR, 1, MTLTextureUsageShaderRead);
+    tw.prof = gp_texture(MTLPixelFormatR8Unorm, 24, TW_PROFILES, MTLTextureUsageShaderRead);
+    tw.fixtab = gp_texture(MTLPixelFormatRGBA32Uint, TW_NFIX, 1, MTLTextureUsageShaderRead);
+    for (int k = 0; k < TW_RING; k++) {
+        tw.stops[k] = gp_texture(MTLPixelFormatR8Uint, TW_NROWS, TW_NSHAFTS, MTLTextureUsageShaderRead);
+        tw.movers[k] = gp_texture(MTLPixelFormatRGBA16Uint, 256, TW_NMOVERS / 256, MTLTextureUsageShaderRead);
+    }
+}
+
+/* The first visible tower, and its two blocks, whole inside the region */
+static const MetalIcon *tw_first(TwData *d)
+{
+    const MetalSurfacesView *v = &surf.view;
+
+    if (!surf.on || !v->nicons || !v->region) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        const MetalIcon *ic = &v->icon[i];
+
+        if (ic->kind != ROSGD_SURF_TOWER || !ic->nrects) {
+            continue;
+        }
+        memcpy(d, ic->data, sizeof(*d));
+        if (d->size < TW_LIVE_SIZE || d->offset == 0xFFFFFFFFu
+            || (uint64_t)d->offset + d->size > v->region_size) {
+            continue;
+        }
+        return ic;
+    }
+    return NULL;
+}
+
+/* half size, a rounded 2 x 2 box: the twin's mip levels (pack.rs halve) */
+static uint8_t *tw_halve(const uint8_t *src, int w, int h)
+{
+    int hw = w / 2, hh = h / 2;
+    uint8_t *d = malloc((size_t)hw * hh * 4 + 1);
+
+    if (!d) {
+        return NULL;
+    }
+    for (int y = 0; y < hh; y++) {
+        const uint8_t *a = src + (size_t)(2 * y) * w * 4, *b = a + (size_t)w * 4;
+        uint8_t *o = d + (size_t)y * hw * 4;
+        for (int x = 0; x < hw; x++) {
+            for (int c = 0; c < 4; c++) {
+                unsigned v = a[8 * x + c] + a[8 * x + 4 + c] + b[8 * x + c] + b[8 * x + 4 + c];
+                o[4 * x + c] = (uint8_t)((v + 2) / 4);
+            }
+        }
+    }
+    return d;
+}
+
+/* an RGBA8 picture with its mip levels 0 .. max made as the twin makes them */
+static id<MTLTexture> tw_picture(const uint8_t *px, int w, int h, int max)
+{
+    int levels = 1;
+    while (levels <= max && (w >> levels) >= 1 && (h >> levels) >= 1
+           && (w >> (levels - 1)) >= 2 && (h >> (levels - 1)) >= 2) {
+        levels++;
+    }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                  width:w height:h
+                                                                              mipmapped:YES];
+    td.mipmapLevelCount = levels;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [m.device newTextureWithDescriptor:td];
+    const uint8_t *cur = px;
+    uint8_t *own = NULL;
+
+    for (int l = 0; t && l < levels; l++) {
+        int lw = w >> l, lh = h >> l;
+        [t replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l
+               withBytes:cur bytesPerRow:(NSUInteger)lw * 4];
+        if (l + 1 < levels) {
+            uint8_t *n = tw_halve(cur, lw, lh);
+            free(own);
+            own = n;
+            cur = n;
+            if (!n) {
+                break;
+            }
+        }
+    }
+    free(own);
+    return t;
+}
+
+/* The art block's tables and pictures into textures, when its gen moved */
+static bool tw_take_art(const uint8_t *blk, uint32_t size, uint32_t gen)
+{
+    const TwArtHead *a = (const TwArtHead *)blk;
+
+    if (tw.art_have && gen == tw.art_gen) {
+        return true;
+    }
+    if (size < sizeof(TwArtHead) || a->magic != TW_ART_MAGIC || a->version != TW_VERSION) {
+        return tw.art_have;
+    }
+    uint64_t aw = a->atlas_w, ah = a->atlas_h, sw = a->spr_w, sh = a->spr_h;
+    uint32_t es = a->emit_shift > 3 ? 3 : a->emit_shift;
+    uint64_t at_emis = sizeof(TwArtHead) + aw * ah * 4;
+    uint64_t at_aux = at_emis + (aw >> es) * (ah >> es) * 4;
+    uint64_t at_spr = at_aux + ((a->flags & TW_A_F_AUX) ? aw * ah * 2 : 0);
+    uint64_t at_spremis = at_spr + sw * sh * 4;
+    uint64_t total = at_spremis + sw * sh * 4;
+    if (!aw || !ah || !sw || !sh || aw > 16384 || ah > 16384 || sw > 16384 || sh > 16384 || total > size) {
+        return tw.art_have;             /* a block too short for what it says it holds */
+    }
+    memcpy(tw.ah, a, sizeof(TwArtHead));
+    [tw.albedo release];
+    [tw.emis release];
+    [tw.aux release];
+    [tw.sprites release];
+    [tw.spremis release];
+    tw.albedo = tw_picture(blk + sizeof(TwArtHead), (int)aw, (int)ah, 3);
+    tw.emis = tw_picture(blk + at_emis, (int)(aw >> es), (int)(ah >> es), 2);
+    if (a->flags & TW_A_F_AUX) {
+        tw.aux = gp_texture(MTLPixelFormatRG8Uint, aw, ah, MTLTextureUsageShaderRead);
+        [tw.aux replaceRegion:MTLRegionMake2D(0, 0, aw, ah) mipmapLevel:0
+                    withBytes:blk + at_aux bytesPerRow:aw * 2];
+    } else {
+        static const uint8_t none[2];
+        tw.aux = gp_texture(MTLPixelFormatRG8Uint, 1, 1, MTLTextureUsageShaderRead);
+        [tw.aux replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:none bytesPerRow:2];
+    }
+    tw.sprites = tw_picture(blk + at_spr, (int)sw, (int)sh, 3);
+    tw.spremis = tw_picture(blk + at_spremis, (int)sw, (int)sh, 3);
+    [tw.arttab replaceRegion:MTLRegionMake2D(0, 0, TW_NART, 1) mipmapLevel:0
+                   withBytes:a->art bytesPerRow:TW_NART * 16];
+    [tw.sprtab replaceRegion:MTLRegionMake2D(0, 0, TW_NSPR, 1) mipmapLevel:0
+                   withBytes:a->spr bytesPerRow:TW_NSPR * 16];
+    tw.weekend = -1;                    /* the lamp profiles again */
+    tw.art_gen = gen;
+    tw.art_have = tw.albedo && tw.emis && tw.aux && tw.sprites && tw.spremis;
+    metal_log("tower: art gen %u: atlas %llu x %llu, sprites %llu x %llu, %u entries",
+              gen, aw, ah, sw, sh, a->nart);
+    return tw.art_have;
+}
+
+/* A frame of the live block into the textures, if it is whole and new:
+ * only the sections whose generation moved.  Whether there is a frame to
+ * draw (the last one, if this one is being written) */
+static bool tw_take(const uint8_t *blk)
+{
+    TwHead h;
+    uint32_t after;
+
+    memcpy(&h, blk, sizeof(h));
+    if (h.magic != TW_MAGIC || h.version != TW_VERSION || (h.frame & 1u)) {
+        return tw.have;
+    }
+    if (tw.have && h.frame == tw.frame) {
+        return true;
+    }
+    /* copied out, and read again AFTER: if the box began a new frame
+       meanwhile the copy is a mix of two, and the last whole one stands */
+    memcpy(tw.next, blk, TW_LIVE_SIZE);
+    memcpy(&after, blk + offsetof(TwHead, frame), sizeof(after));
+    if (after != h.frame) {
+        return tw.have;
+    }
+    const TwHead *n = (const TwHead *)tw.next;
+    if (!tw.have || n->gen[TW_CELLS] != tw.gen[TW_CELLS]) {
+        [tw.cells replaceRegion:MTLRegionMake2D(0, 0, TW_STRIDE, TW_GRID_H) mipmapLevel:0
+                      withBytes:tw.next + TW_OFF_CELLS bytesPerRow:TW_STRIDE * 8];
+    }
+    for (int k = 0; k < 16; k++) {
+        /* a chunk of 1024 rooms is eight rows of the 128-wide texture */
+        if (!tw.have || n->room_gen[k] != tw.room_gen[k]) {
+            [tw.rooms replaceRegion:MTLRegionMake2D(0, k * 8, 128, 8) mipmapLevel:0
+                          withBytes:tw.next + TW_OFF_ROOMS + (size_t)k * 1024 * 16 bytesPerRow:128 * 16];
+        }
+    }
+    if (!tw.have || n->gen[TW_FIX] != tw.gen[TW_FIX]) {
+        [tw.fixtab replaceRegion:MTLRegionMake2D(0, 0, TW_NFIX, 1) mipmapLevel:0
+                       withBytes:tw.next + TW_OFF_FIX bytesPerRow:TW_NFIX * 16];
+    }
+    if (!tw.have || n->gen[TW_STOPS] != tw.gen[TW_STOPS] || n->gen[TW_MOVERS] != tw.gen[TW_MOVERS]) {
+        /* what moves: into the next of the ring, the one drawn from now */
+        tw.ring = (tw.ring + 1) % TW_RING;
+        [tw.stops[tw.ring] replaceRegion:MTLRegionMake2D(0, 0, TW_NROWS, TW_NSHAFTS) mipmapLevel:0
+                               withBytes:tw.next + TW_OFF_STOPS bytesPerRow:TW_NROWS];
+        uint32_t nm = n->nmovers > TW_NMOVERS ? TW_NMOVERS : n->nmovers;
+        uint32_t rows = (nm + 255) / 256;
+        if (rows) {
+            [tw.movers[tw.ring] replaceRegion:MTLRegionMake2D(0, 0, 256, rows) mipmapLevel:0
+                                    withBytes:tw.next + TW_OFF_MOVERS bytesPerRow:256 * 8];
+        }
+    }
+    memcpy(tw.gen, n->gen, sizeof(tw.gen));
+    memcpy(tw.room_gen, n->room_gen, sizeof(tw.room_gen));
+    uint8_t *t = tw.live;
+    tw.live = tw.next;
+    tw.next = t;
+    tw.frame = h.frame;
+    tw.have = true;
+    return true;
+}
+
+/* tw_light(): the sky ramp at an hour, linear between its two half-hour
+ * columns, in float from the bytes (the twin's, as both presenters carry) */
+static void tw_light(const TwArtHead *a, float hour, float out[4][4])
+{
+    float t = hour * 2.0f - TW_RAMP * floorf(hour * 2.0f / TW_RAMP);
+    int i0 = (int)floorf(t);
+    if (i0 > TW_RAMP - 1) {
+        i0 = TW_RAMP - 1;
+    }
+    int i1 = (i0 + 1) % TW_RAMP;
+    float f = t - (float)i0;
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            float v0 = a->ramp[r][i0][c] / 255.0f, v1 = a->ramp[r][i1][c] / 255.0f;
+            out[r][c] = v0 * (1.0f - f) + v1 * f;
+        }
+    }
+}
+
+static void tw_unpack8(uint32_t w, float o[4])
+{
+    for (int k = 0; k < 4; k++) {
+        o[k] = ((w >> (8 * k)) & 255) / 255.0f;
+    }
+}
+
+/* The tower, where the Wimp says the icon is and only where it can be seen */
+static void surf_tower(id<MTLRenderCommandEncoder> enc, bool shot, CGSize target,
+                       uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+    const MetalIcon *ic;
+    const TwHead *h;
+    TwData d;
+    TwU u;
+
+    ic = tw_first(&d);
+    if (!ic) {
+        return;
+    }
+    tw_setup();
+    if (!tw.field || !tw.field_shot || !tw.cells || !tw.live) {
+        return;
+    }
+    if (d.art_offset == 0xFFFFFFFFu || (uint64_t)d.art_offset + d.art_size > v->region_size
+        || !tw_take_art((const uint8_t *)v->region + d.art_offset, d.art_size, d.art_gen)) {
+        return;                         /* no pictures yet: nothing drawn */
+    }
+    if (!tw_take((const uint8_t *)v->region + d.offset)) {
+        return;
+    }
+    h = (const TwHead *)tw.live;
+    const TwArtHead *a = tw.ah;
+    int want = (h->flags & TW_F_WEEKEND) ? 1 : 0;
+    if (tw.weekend != want) {
+        /* the lamp profiles the header's day names (design 6.5) */
+        [tw.prof replaceRegion:MTLRegionMake2D(0, 0, 24, TW_PROFILES) mipmapLevel:0
+                     withBytes:a->prof[want] bytesPerRow:24];
+        tw.weekend = want;
+    }
+    memset(&u, 0, sizeof(u));
+    u.box[0] = ic->x * sx, u.box[1] = ic->y * sy, u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
+    float tpp = (float)a->scale * (TW_GRID_W * 4) / MAX(u.box[2], 1.0f);
+    float lod = log2f(tpp);
+    lod = lod < 0 ? 0 : lod > 3 ? 3 : lod;
+    float hour = (float)(h->hour % 1536) / 64.0f;
+    float light[4][4];
+    tw_light(a, hour, light);
+    u.view[0] = target.width, u.view[1] = target.height, u.view[2] = tpp, u.view[3] = lod;
+    u.clock[0] = hour;
+    u.clock[1] = (float)fmod(CFAbsoluteTimeGetCurrent(), 3600.0);
+    u.clock[2] = h->day;
+    u.clock[3] = target.height;
+    memcpy(u.zen, light[0], 16);
+    memcpy(u.hor, light[1], 16);
+    memcpy(u.amb, light[2], 16);
+    memcpy(u.misc, light[3], 16);
+    u.grid[0] = TW_GRID_W, u.grid[1] = TW_GRID_H;
+    u.grid[2] = h->ground_row > TW_GRID_H ? TW_GRID_H : h->ground_row;
+    u.grid[3] = a->scale;
+    u.counts[0] = h->nrooms > TW_NROOMS ? TW_NROOMS : h->nrooms;
+    u.counts[1] = a->nart > TW_NART ? TW_NART : a->nart;
+    u.counts[2] = a->nsprites > TW_NSPR ? TW_NSPR : a->nsprites;
+    u.counts[3] = MIN(MIN(h->quality, 2), tw.maxq);   /* as the block asks, as far as the library goes */
+    u.sizes[0] = a->atlas_w, u.sizes[1] = a->atlas_h, u.sizes[2] = a->spr_w, u.sizes[3] = a->spr_h;
+    u.mode[0] = h->view, u.mode[1] = a->emit_shift, u.mode[2] = h->nfixtures, u.mode[3] = h->nmovers;
+    for (int k = 0; k < 4; k++) {
+        u.outline[k] = h->outline[k];
+    }
+    tw_unpack8(h->outline_rgba, u.ocol);
+    for (int k = 0; k < 16; k++) {
+        uint32_t p;
+        memcpy(&p, tw.live + TW_OFF_ROOMS + (size_t)TW_NROOMS * 16 + 512 * 16 + 64 * 128 + 4 * k, 4);
+        tw_unpack8(p, u.pal[k]);
+    }
+    if (u.counts[1] < 1 || u.counts[2] < 1 || u.counts[0] < 1) {
+        return;
+    }
+    uint32_t nfix = h->nfixtures > TW_NFIX ? TW_NFIX : h->nfixtures;
+    uint32_t nmov = h->nmovers > TW_NMOVERS ? TW_NMOVERS : h->nmovers;
+    u.mode[2] = (int32_t)nfix, u.mode[3] = (int32_t)nmov;
+    [enc setFragmentTexture:tw.cells atIndex:0];
+    [enc setFragmentTexture:tw.rooms atIndex:1];
+    [enc setFragmentTexture:tw.arttab atIndex:2];
+    [enc setFragmentTexture:tw.sprtab atIndex:3];
+    [enc setFragmentTexture:tw.albedo atIndex:4];
+    [enc setFragmentTexture:tw.emis atIndex:5];
+    [enc setFragmentTexture:tw.aux atIndex:6];
+    [enc setFragmentTexture:tw.sprites atIndex:7];
+    [enc setFragmentTexture:tw.spremis atIndex:8];
+    [enc setFragmentTexture:tw.prof atIndex:9];
+    [enc setFragmentTexture:tw.stops[tw.ring] atIndex:10];
+    [enc setVertexTexture:tw.fixtab atIndex:0];
+    [enc setVertexTexture:tw.sprtab atIndex:3];
+    [enc setVertexTexture:tw.movers[tw.ring] atIndex:11];
+    for (uint32_t r = 0; r < ic->nrects; r++) {
+        const int16_t *q = v->rect[ic->rects + r];
+
+        u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+        u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+        if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
+            continue;
+        }
+        [enc setRenderPipelineState:shot ? tw.field_shot : tw.field];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        /* the fixtures and the movers, instanced, under the piece's scissor */
+        MTLScissorRect sc;
+        double x0 = MAX(u.clip[0], 0.0), y0 = MAX(u.clip[1], 0.0);
+        double x1 = MIN(u.clip[2], target.width), y1 = MIN(u.clip[3], target.height);
+        if (x1 <= x0 || y1 <= y0 || (!nfix && !nmov)) {
+            continue;
+        }
+        sc.x = (NSUInteger)x0, sc.y = (NSUInteger)y0;
+        sc.width = (NSUInteger)(x1 - x0), sc.height = (NSUInteger)(y1 - y0);
+        [enc setScissorRect:sc];
+        if (nfix && tw.fix && tw.fix_shot) {
+            [enc setRenderPipelineState:shot ? tw.fix_shot : tw.fix];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:nfix];
+        }
+        if (nmov && tw.mov && tw.mov_shot) {
+            [enc setRenderPipelineState:shot ? tw.mov_shot : tw.mov];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:nmov];
+        }
+        sc.x = 0, sc.y = 0, sc.width = (NSUInteger)target.width, sc.height = (NSUInteger)target.height;
+        [enc setScissorRect:sc];
+    }
+}
+
 /* Whether a listed clock is due to be drawn again: at the rate it asks,
  * else at each second */
 static bool surf_face_due(void)
@@ -3769,6 +5500,21 @@ static bool surf_face_due(void)
              * windows, where 30 frames a second would only cost power */
             double s = v->icon[i].rate > 1 && [m.window isKeyWindow]
                        ? 1.0 / MIN(v->icon[i].rate, 60u) : 1.0;
+
+            step = step ? MIN(step, s) : s;
+        }
+        if (v->icon[i].kind == ROSGD_SURF_TILES && v->icon[i].nrects && v->icon[i].rate) {
+            /* a tile map's rich drawing moves (water): at the rate the box
+             * asks, while the window has the keyboard; a few frames a
+             * second behind other windows */
+            double s = 1.0 / ([m.window isKeyWindow] ? MIN(v->icon[i].rate, 60u) : 4u);
+
+            step = step ? MIN(step, s) : s;
+        }
+        if (v->icon[i].kind == ROSGD_SURF_TOWER && v->icon[i].nrects && v->icon[i].rate) {
+            /* a tower's smooth and rich drawings move (the lamps, fire):
+             * as a tile map's */
+            double s = 1.0 / ([m.window isKeyWindow] ? MIN(v->icon[i].rate, 60u) : 4u);
 
             step = step ? MIN(step, s) : s;
         }
@@ -4157,6 +5903,8 @@ static bool metal_render_frame(void)
 
     if (have_fb && surf.on) {
         surf_gamepanes(enc, target, v.xres, v.yres);
+        surf_tiles(enc, false, target, v.xres, v.yres);
+        surf_tower(enc, false, target, v.xres, v.yres);
         surf_faces(enc, surf.face, target, v.xres, v.yres);
     }
 
@@ -4440,6 +6188,8 @@ static bool metal_screenshot_to(NSString *path)
                      vertexStart:0 vertexCount:3];
             /* the icons this window draws itself, as the window shows them */
             surf_gamepanes(senc, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+            surf_tiles(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+            surf_tower(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_faces(senc, surf.face_shot, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             [senc endEncoding];
             source = composite;

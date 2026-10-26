@@ -784,7 +784,8 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             }
             continue;
         }
-        if ((e->kind == 1 || e->kind == 2 || e->kind == ROSGD_SURF_GAMEPANE)
+        if ((e->kind == 1 || e->kind == 2 || e->kind == ROSGD_SURF_GAMEPANE || e->kind == ROSGD_SURF_TILES
+             || e->kind == ROSGD_SURF_TOWER)
             && out->nicons < METAL_ICONS && e->w > 0 && e->h > 0) {
             /* the clock's face, the meter's graph, a game pane: drawn by
              * the window rather than copied out of guest memory */
@@ -1019,6 +1020,8 @@ static const char *vg_kind(uint32_t k)
     case ROSGD_SURF_WINDOW: return "window";
     case ROSGD_SURF_PAGE: return "page";
     case ROSGD_SURF_GAMEPANE: return "game pane";
+    case ROSGD_SURF_TILES: return "tile map";
+    case ROSGD_SURF_TOWER: return "tower";
     default: return "?";
     }
 }

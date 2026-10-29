@@ -177,6 +177,10 @@ typedef struct MetalSurface {
  * tower game's floors, rooms, sky and ground, drawn from a live block and
  * an art block in two backings -- !Tower's tower */
 #define ROSGD_SURF_TOWER 7u
+/* 9 is a 3D scene (screen.h's ROS_SURF_SCENE3D, scene3d.h here, a copy of
+ * the box's rosgd/include/rosgd/scene3d.h): Antiquity's terrain and models,
+ * drawn from a live block and asset pages in backings in the region */
+#define ROSGD_SURF_SCENE3D 9u
 
 typedef struct MetalIcon {
     uint32_t kind, style;           /* 1 the clock, 2 the meter, 5 a game pane */

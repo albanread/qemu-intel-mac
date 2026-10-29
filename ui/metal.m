@@ -5034,7 +5034,12 @@ static NSString * const TW_SRC = @""
 "        if (c.x >= 0 && c.y >= 0 && c.x < u.grid.x && c.y < u.grid.y &&\n"
 "            cells.read(uint2(c)).x != 0) discard_fragment();\n"
 "    }\n"
-"    uint fr = (v.SP.w & 16u) != 0 ? uint(u.clock.y * 8.0) : (v.M.w & 15u);\n"
+"    if ((v.M.z & 8192u) != 0) {                     /* WITHIN: only over room M.w */\n"
+"        int2 c = int2(floor(v.at / CELL));\n"
+"        if (c.x < 0 || c.y < 0 || c.x >= u.grid.x || c.y >= u.grid.y ||\n"
+"            cells.read(uint2(c)).x != v.M.w) discard_fragment();\n"
+"    }\n"
+"    uint fr = (v.SP.w & 16u) != 0 ? uint(u.clock.y * 8.0) : (v.M.z & 8192u) != 0 ? 0u : (v.M.w & 15u);\n"
 "    float4 g;\n"
 "    float4 a = spr(R, v.M.z & 1023u, fr, v.uv, u.view.w, g);\n"
 "    if ((v.SP.w & SPR_TINT) != 0) {                 /* a person: the tint layer's weights */\n"
@@ -5483,6 +5488,1195 @@ static void surf_tower(id<MTLRenderCommandEncoder> enc, bool shot, CGSize target
     }
 }
 
+/* ---- a 3D scene (ROSGD_SURF_SCENE3D) -----------------------------------------
+ * Antiquity's scene (0 A.D.'s engine for the BOX), drawn by the window from
+ * a live block and up to eight asset pages the box keeps in backings in the
+ * region (scene3d.h here is the box's rosgd/include/rosgd/scene3d.h; the
+ * design is Antiquity's docs/SCENE3D.md, section 6.2 the picture and
+ * section 10 this presenter).  The pages' records are uploaded as they
+ * appear: a buffer pair a mesh, a texture each (BC1-3 as the Mac's GPU
+ * takes them, else decoded here), skins and terrain textures kept as they
+ * are.  Each frame's instances and bone matrices go into the next of a ring
+ * of three textures.  The scene is drawn into a colour and depth target of
+ * its own the size of the icon's box (surf_scene3d_render, before the
+ * frame's main pass), then shown in the icon's visible rectangles
+ * (surf_scene3d).  The terrain is the engine's splats (SCENE3D.md 6.3):
+ * for the visible patches, the map's sides, then the opaque splats, then
+ * the blends through the alpha map's shapes, a run of one texture a draw,
+ * lit per vertex and shaded by the LOS grid; the models a draw an
+ * instance, skinned in the vertex shader from the bone pool.  The library is built without
+ * fast maths, and the level of detail is chosen as the CPU twin chooses it
+ * (twin.rs: once a triangle for the terrain, in the vertex shader; from the
+ * derivatives for the models), so that the shot can be compared with the
+ * twin's picture.  ROSGD_SCENE3D_CPU_BC=1 decodes BC on the CPU as the twin
+ * does, for the parity check. */
+
+#include "scene3d.h"
+
+#define S3_RING 3
+#define S3_INST_W 2048
+#define S3_BONE_W 1536
+
+typedef struct S3U {                /* a draw's uniforms: the same in the shader */
+    float vp[16];
+    float sun_dir[4], sun_rgb[4], amb[4];
+    float player[4], object[4], tint[4];
+    float tm[4];                    /* a terrain texture's matrix: u = a x + b z, v = c x + d z */
+    float tsize[4];                 /* the texture's width, height, last level */
+    float am[4];                    /* the alpha map: shape stride, texture width, shapes */
+    float side[4];                  /* the map's sides' colour; w the water's height (or 0) */
+    int32_t mode[4];                /* shading bits (256: a blend), has a texture, alpha is 1,
+                                       the instance */
+    int32_t terr[4];                /* vertices a side, the mesh's bones, the patch's px, pz */
+    int32_t edge[4];                /* a side: its first vertex i, j and its step */
+    float vsize[4];                 /* the target's width and height */
+} S3U;
+_Static_assert(sizeof(S3U) == 288, "a scene draw's uniforms are 288 bytes");
+
+typedef struct S3ShowU {
+    float box[4], clip[4], target[4];
+} S3ShowU;
+
+typedef struct S3HudU {             /* the HUD's draws (scene3d.h's HUD section) */
+    float size[4];                  /* the HUD's units across and down */
+    int32_t mode[4];                /* has a texture */
+} S3HudU;
+
+static NSString * const S3_SRC = @""
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct S3U {\n"
+"    float4 vp[4];\n"
+"    float4 sun_dir, sun_rgb, amb, player, object, tint, tm, tsize, am, side;\n"
+"    int4 mode, terr, edge;\n"
+"    float4 vsize;\n"
+"};\n"
+"struct V { float4 pos [[position]]; float2 uv; float3 n; float2 wxz; float lod [[flat]]; };\n"
+"static float4 clip_of(constant S3U &u, float3 p) {\n"
+"    return u.vp[0] * p.x + u.vp[1] * p.y + u.vp[2] * p.z + u.vp[3];\n"
+"}\n"
+"static float4 metal_z(float4 c) { return float4(c.x, c.y, (c.z + c.w) * 0.5, c.w); }\n"
+"static int hraw(texture2d<ushort> h, int i, int j) { return int(h.read(uint2(i, j)).r); }\n"
+"static float3 tpos(texture2d<ushort> h, int i, int j, int verts) {\n"
+"    int hi = clamp(i, 0, verts - 1), hj = clamp(j, 0, verts - 1);\n"
+"    return float3(float(i) * 4.0, float(h.read(uint2(hi, hj)).r) * (1.0 / 92.0), float(j) * 4.0);\n"
+"}\n"
+"static float3 edgev(float3 p, float3 b) {\n"
+"    float3 d = p - b; float l = sqrt(d.x * d.x + d.y * d.y + d.z * d.z);\n"
+"    return l > 0.0 ? d / l : d;\n"
+"}\n"
+"static float3 crs(float3 a, float3 b) { return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }\n"
+"/* CTerrain::CalcNormal, as SCENE3D.md 6.3 words it */\n"
+"static float3 vnormal(texture2d<ushort> h, int i, int j, int verts) {\n"
+"    float3 b = tpos(h, i, j, verts), z = float3(0.0);\n"
+"    float3 left = i > 0 ? edgev(tpos(h, i - 1, j, verts), b) : z;\n"
+"    float3 right = i < verts - 1 ? edgev(tpos(h, i + 1, j, verts), b) : z;\n"
+"    float3 up = j > 0 ? edgev(tpos(h, i, j - 1, verts), b) : z;\n"
+"    float3 down = j < verts - 1 ? edgev(tpos(h, i, j + 1, verts), b) : z;\n"
+"    float3 n = crs(up, left) + crs(left, down) + crs(down, right) + crs(right, up);\n"
+"    float l = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);\n"
+"    return l > 0.00001 ? n / l : n;\n"
+"}\n"
+"/* the twin's level for a triangle: texels a pixel, by area, once a triangle */\n"
+"static float tri_lod(constant S3U &u, float4 c0, float4 c1, float4 c2, float2 t0, float2 t1, float2 t2) {\n"
+"    if (c0.w <= 0.0 || c1.w <= 0.0 || c2.w <= 0.0) return 0.0;\n"
+"    float w = u.vsize.x, h = u.vsize.y;\n"
+"    float x0 = (c0.x * (1.0 / c0.w) + 1.0) * 0.5 * w, y0 = (1.0 - c0.y * (1.0 / c0.w)) * 0.5 * h;\n"
+"    float x1 = (c1.x * (1.0 / c1.w) + 1.0) * 0.5 * w, y1 = (1.0 - c1.y * (1.0 / c1.w)) * 0.5 * h;\n"
+"    float x2 = (c2.x * (1.0 / c2.w) + 1.0) * 0.5 * w, y2 = (1.0 - c2.y * (1.0 / c2.w)) * 0.5 * h;\n"
+"    float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);\n"
+"    float uva = abs((t1.x - t0.x) * (t2.y - t0.y) - (t2.x - t0.x) * (t1.y - t0.y)) * u.tsize.x * u.tsize.y;\n"
+"    float r = uva / abs(area);\n"
+"    float l = r > 1.0 ? 0.5 * log2(r) : 0.0;\n"
+"    return min(floor(l), u.tsize.z);\n"
+"}\n"
+"struct TV { float4 pos [[position]]; float2 wxz; float3 light; float lod [[flat]]; int2 g [[flat]]; uint sc [[flat]]; };\n"
+"/* a splat: a quad over its tile, its splat by vid / 6 */\n"
+"vertex TV s3_splat_vs(uint vid [[vertex_id]], constant S3U &u [[buffer(0)]],\n"
+"                     const device uint *spl [[buffer(1)]], texture2d<ushort> hg [[texture(0)]]) {\n"
+"    uint w = spl[vid / 6u];\n"
+"    int gi = u.terr.z * 16 + int(w & 15u), gj = u.terr.w * 16 + int((w >> 4) & 15u), verts = u.terr.x;\n"
+"    bool d = hraw(hg, gi, gj) + hraw(hg, gi + 1, gj + 1) < hraw(hg, gi, gj + 1) + hraw(hg, gi + 1, gj);\n"
+"    /* split along (gi+1, gj)-(gi, gj+1) when d, else along (gi, gj)-(gi+1, gj+1) */\n"
+"    const int2 A[6] = { int2(0,0), int2(1,0), int2(0,1), int2(1,0), int2(1,1), int2(0,1) };\n"
+"    const int2 B[6] = { int2(0,0), int2(1,0), int2(1,1), int2(1,1), int2(0,1), int2(0,0) };\n"
+"    uint c6 = vid % 6u, tri = c6 / 3u * 3u;\n"
+"    float4 c[3]; float2 uv[3]; int2 k[3];\n"
+"    for (uint q = 0; q < 3u; q++) {\n"
+"        k[q] = d ? A[tri + q] : B[tri + q];\n"
+"        float3 p = tpos(hg, gi + k[q].x, gj + k[q].y, verts);\n"
+"        c[q] = clip_of(u, p);\n"
+"        uv[q] = float2(u.tm.x * p.x + u.tm.y * p.z, u.tm.z * p.x + u.tm.w * p.z);\n"
+"    }\n"
+"    uint me = c6 - tri;\n"
+"    int ci = gi + k[me].x, cj = gj + k[me].y;\n"
+"    float3 n = vnormal(hg, ci, cj, verts);\n"
+"    float ndl = clamp(-(n.x * u.sun_dir.x + n.y * u.sun_dir.y + n.z * u.sun_dir.z), 0.0, 1.0);\n"
+"    TV o;\n"
+"    o.pos = metal_z(c[me]);\n"
+"    o.wxz = float2(float(ci) * 4.0, float(cj) * 4.0);\n"
+"    o.light = u.sun_rgb.rgb * ndl;\n"
+"    o.lod = u.mode.y != 0 ? tri_lod(u, c[0], c[1], c[2], uv[0], uv[1], uv[2]) : 0.0;\n"
+"    o.g = int2(gi, gj);\n"
+"    o.sc = (w >> 8) & 127u;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3_splat_fs(TV in [[stage_in]], constant S3U &u [[buffer(0)]],\n"
+"                            texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]],\n"
+"                            texture2d<float> los [[texture(1)]], texture2d<float> am [[texture(2)]],\n"
+"                            sampler asmp [[sampler(1)]]) {\n"
+"    constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+"    float x = in.wxz.x, z = in.wxz.y;\n"
+"    float2 uv = float2(u.tm.x * x + u.tm.y * z, u.tm.z * x + u.tm.w * z);\n"
+"    float4 base = u.mode.y != 0 ? tex.sample(smp, uv, level(in.lod)) : float4(0.5, 0.5, 0.5, 1.0);\n"
+"    float f = los.sample(lin, float2((x / 4.0 + 0.5) / 520.0, (z / 4.0 + 0.5) / 513.0)).r;\n"
+"    f = clamp(f - 0.03, 0.0, 1.0) / (1.0 - 0.03);\n"
+"    float3 c = clamp(base.rgb * (in.light + u.amb.rgb) * f, 0.0, 1.0);\n"
+"    if ((u.mode.x & 256) == 0) return float4(c, 1.0);\n"
+"    uint shape = in.sc & 15u, code = (in.sc >> 4) & 7u;\n"
+"    float s = x / 4.0 - float(in.g.x), t = z / 4.0 - float(in.g.y);\n"
+"    float a = (code & 1u) != 0u ? t : s, b = (code & 1u) != 0u ? s : t;\n"
+"    if ((code & 2u) != 0u) a = 1.0 - a;\n"
+"    if ((code & 4u) != 0u) b = 1.0 - b;\n"
+"    float u0 = float(shape * uint(u.am.x) + 2u) / u.am.y, u1 = float((shape + 1u) * uint(u.am.x) - 2u) / u.am.y;\n"
+"    float al = 1.0 - am.sample(asmp, float2(u0 + a * (u1 - u0), b), level(0.0)).r;\n"
+"    return float4(c, al);\n"
+"}\n"
+"struct SDV { float4 pos [[position]]; };\n"
+"/* the map's sides: from each edge vertex (or the water above it) down to 0 */\n"
+"vertex SDV s3_side_vs(uint vid [[vertex_id]], constant S3U &u [[buffer(0)]], texture2d<ushort> hg [[texture(0)]]) {\n"
+"    int k = int(vid / 6u), c = int(vid % 6u);\n"
+"    int2 a = int2(u.edge.x + k * u.edge.z, u.edge.y + k * u.edge.w), b = a + u.edge.zw;\n"
+"    const int pick[6] = { 0, 1, 3, 0, 3, 2 };   /* a0 a1 b1, a0 b1 b0 */\n"
+"    int2 v = pick[c] >= 2 ? b : a;\n"
+"    bool top = (pick[c] & 1) != 0;\n"
+"    float y = top ? max(float(hg.read(uint2(v)).r) * (1.0 / 92.0), u.side.w) : 0.0;\n"
+"    SDV o;\n"
+"    o.pos = metal_z(clip_of(u, float3(float(v.x) * 4.0, y, float(v.y) * 4.0)));\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3_side_fs(SDV in [[stage_in]], constant S3U &u [[buffer(0)]]) {\n"
+"    return float4(u.side.rgb, 1.0);\n"
+"}\n"
+"struct MV {\n"
+"    float3 pos [[attribute(0)]];\n"
+"    float3 nrm [[attribute(1)]];\n"
+"    float2 uv [[attribute(2)]];\n"
+"    uchar4 bone [[attribute(3)]];\n"
+"    uchar4 wt [[attribute(4)]];\n"
+"};\n"
+"static float3 row3(float4 r0, float4 r1, float4 r2, float3 p, float w) {\n"
+"    return float3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w * w,\n"
+"                  r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w * w,\n"
+"                  r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w * w);\n"
+"}\n"
+"static float3 nz(float3 v) { float l = sqrt(v.x * v.x + v.y * v.y + v.z * v.z); return l > 0.0 ? v / l : v; }\n"
+"vertex V s3_model_vs(MV v [[stage_in]], constant S3U &u [[buffer(0)]],\n"
+"                     texture2d<uint> inst [[texture(1)]], texture2d<float> bones [[texture(2)]]) {\n"
+"    uint at = uint(u.mode.w) * 4u;\n"
+"    uint2 ip = uint2(at % 2048u, at / 2048u);\n"
+"    float4 m0 = as_type<float4>(inst.read(ip)), m1 = as_type<float4>(inst.read(ip + uint2(1, 0)));\n"
+"    float4 m2 = as_type<float4>(inst.read(ip + uint2(2, 0)));\n"
+"    uint first = inst.read(ip + uint2(3, 0)).y;\n"
+"    uint nb = uint(u.terr.y);\n"
+"    float3 p = float3(0.0), n = float3(0.0);\n"
+"    if (first != 0xFFFFFFFFu && first + nb + 1u <= 49152u) {\n"
+"        for (uint q = 0; q < 4u; q++) {\n"
+"            uint b = uint(v.bone[q]);\n"
+"            if (b == 255u || b > nb) break;\n"
+"            uint x = (first + b) * 3u;\n"
+"            uint2 bp = uint2(x % 1536u, x / 1536u);\n"
+"            float4 r0 = bones.read(bp), r1 = bones.read(bp + uint2(1, 0)), r2 = bones.read(bp + uint2(2, 0));\n"
+"            float w = float(v.wt[q]) / 255.0;\n"
+"            p += row3(r0, r1, r2, v.pos, 1.0) * w;\n"
+"            n += row3(r0, r1, r2, v.nrm, 0.0) * w;\n"
+"        }\n"
+"        n = nz(n);\n"
+"    } else {\n"
+"        p = row3(m0, m1, m2, v.pos, 1.0);\n"
+"        n = nz(row3(m0, m1, m2, v.nrm, 0.0));\n"
+"    }\n"
+"    V o;\n"
+"    o.pos = metal_z(clip_of(u, p));\n"
+"    o.uv = v.uv;\n"
+"    o.n = n;\n"
+"    o.wxz = float2(p.x, p.z);\n"
+"    o.lod = -1.0;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3_fs(V in [[stage_in]], constant S3U &u [[buffer(0)]],\n"
+"                      texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]],\n"
+"                      texture2d<float> los [[texture(1)]]) {\n"
+"    float4 base = float4(0.5, 0.5, 0.5, 1.0);\n"
+"    if (u.mode.y != 0) {\n"
+"        float2 t = in.uv * u.tsize.xy;\n"
+"        float2 dx = dfdx(t), dy = dfdy(t);\n"
+"        float l = in.lod;\n"
+"        if (l < 0.0) {\n"
+"            float r = abs(dx.x * dy.y - dx.y * dy.x);\n"
+"            l = min(floor(r > 1.0 ? 0.5 * log2(r) : 0.0), u.tsize.z);\n"
+"        }\n"
+"        base = tex.sample(smp, in.uv, level(l));\n"
+"        if (u.mode.z != 0) base.a = 1.0;\n"
+"    }\n"
+"    if ((u.mode.x & 4) != 0 && base.a < 0.5) discard_fragment();\n"
+"    float3 rgb = base.rgb;\n"
+"    if ((u.mode.x & 1) != 0) rgb = rgb * (u.player.rgb + (1.0 - u.player.rgb) * base.a);\n"
+"    else if ((u.mode.x & 2) != 0) rgb = rgb * (u.object.rgb + (1.0 - u.object.rgb) * base.a);\n"
+"    float3 n = nz(in.n);\n"
+"    float ndl = max(-(n.x * u.sun_dir.x + n.y * u.sun_dir.y + n.z * u.sun_dir.z), 0.0);\n"
+"    float3 light = u.sun_rgb.rgb * ndl + u.amb.rgb;\n"
+"    /* the fog of war, as on the terrain, unless the instance ignores it (mode 4096) */\n"
+"    float f = 1.0;\n"
+"    if ((u.mode.x & 4096) == 0) {\n"
+"        constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+"        f = los.sample(lin, float2((in.wxz.x / 4.0 + 0.5) / 520.0, (in.wxz.y / 4.0 + 0.5) / 513.0)).r;\n"
+"        f = clamp(f - 0.03, 0.0, 1.0) / (1.0 - 0.03);\n"
+"    }\n"
+"    return float4(clamp(rgb * light * u.tint.rgb * f, 0.0, 1.0), 1.0);\n"
+"}\n"
+"struct ShowU { float4 box, clip, target; };\n"
+"struct SV { float4 pos [[position]]; };\n"
+"vertex SV s3_show_vs(uint vid [[vertex_id]], constant ShowU &u [[buffer(0)]]) {\n"
+"    float2 c = float2((vid & 1u) ? u.clip.z : u.clip.x, (vid & 2u) ? u.clip.w : u.clip.y);\n"
+"    SV o;\n"
+"    o.pos = float4(c.x / u.target.x * 2.0 - 1.0, 1.0 - c.y / u.target.y * 2.0, 0.0, 1.0);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3_show_fs(SV in [[stage_in]], constant ShowU &u [[buffer(0)]],\n"
+"                           texture2d<float> pic [[texture(0)]]) {\n"
+"    int2 p = int2(floor(in.pos.xy - floor(u.box.xy)));\n"
+"    p = clamp(p, int2(0), int2(int(pic.get_width()) - 1, int(pic.get_height()) - 1));\n"
+"    return pic.read(uint2(p));\n"
+"}\n"
+"/* the HUD: a quad (48 bytes) six vertices, over the scene in list order */\n"
+"struct HQ { float4 r; float4 uv; uint tf; uint c1; uint c2; uint pad; };\n"
+"struct HudU { float4 size; int4 mode; };\n"
+"struct HV { float4 pos [[position]]; float2 uv; float4 col; uint flags [[flat]]; };\n"
+"vertex HV s3_hud_vs(uint vid [[vertex_id]], constant HudU &u [[buffer(0)]], const device HQ *q [[buffer(1)]]) {\n"
+"    HQ x = q[vid / 6u];\n"
+"    uint c = vid % 6u;\n"
+"    float2 t = float2((c == 1u || c == 3u || c == 4u) ? 1.0 : 0.0, (c == 2u || c == 4u || c == 5u) ? 1.0 : 0.0);\n"
+"    float2 p = mix(x.r.xy, x.r.zw, t);\n"
+"    HV o;\n"
+"    o.pos = float4(p.x / u.size.x * 2.0 - 1.0, 1.0 - p.y / u.size.y * 2.0, 0.0, 1.0);\n"
+"    o.uv = mix(x.uv.xy, x.uv.zw, t);\n"
+"    o.flags = x.tf >> 16;\n"
+"    float4 a = unpack_unorm4x8_to_float(x.c1), b = unpack_unorm4x8_to_float(x.c2);\n"
+"    o.col = (o.flags & 4u) != 0u ? mix(a, b, t.y) : a;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3_hud_fs(HV in [[stage_in]], constant HudU &u [[buffer(0)]],\n"
+"                          texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+"    float4 c = in.col;\n"
+"    if (u.mode.x != 0) {\n"
+"        float4 x = t.sample(s, in.uv);\n"
+"        if ((in.flags & 1u) != 0u) x = float4(1.0, 1.0, 1.0, x.r);\n"
+"        else if ((in.flags & 2u) != 0u) { float l = (x.r * 77.0 + x.g * 150.0 + x.b * 29.0) / 256.0; x = float4(l, l, l, x.a); }\n"
+"        c *= x;\n"
+"    }\n"
+"    return c;\n"
+"}\n";
+
+typedef struct S3Mesh {
+    id<MTLBuffer> vb, ib;
+    uint32_t nidx, nbones;
+} S3Mesh;
+
+typedef struct S3Tex {
+    id<MTLTexture> t;
+    uint16_t w, h;
+    uint8_t levels, wrap, opaque;   /* opaque: BC1, whose alpha is 1 whatever the GPU says */
+} S3Tex;
+
+static struct {
+    bool tried, ok, bc, cpu_bc;
+    id<MTLRenderPipelineState> splat, blend, side, model, show, show_shot, hud;
+    id<MTLDepthStencilState> depth, depth_blend, depth_none;
+    id<MTLTexture> canvas;          /* the HUD's canvas (the minimap) */
+    id<MTLBuffer> hudq[S3_RING];    /* the HUD's quads, a ring as the instances */
+    id<MTLSamplerState> repeat, clamp;
+    id<MTLTexture> heights, los, inst[S3_RING], bones[S3_RING];
+    id<MTLTexture> color, zbuf;     /* the scene's picture and its depth */
+    id<MTLBuffer> splats;           /* the terrain's splats, as the block has them */
+    struct { uint16_t tex; uint32_t stride, shapes; bool have; } am;    /* the alpha map */
+    int ring, hud_ring;
+    bool have, drawn_any;
+    uint32_t frame, epoch, gen[S3_NSECT], patch_gen[ROS_S3_PATCHES];
+    uint32_t page_done[ROS_S3_PAGES];       /* records uploaded from each page */
+    uint32_t page_epoch[ROS_S3_PAGES];
+    struct ros_scene3d *cur;        /* the last whole frame: its header, terrain list, heights,
+                                       tiles, instances and bones */
+    uint8_t *hdr_next;              /* a frame's first 2,048 bytes, while it is copied */
+    S3Mesh mesh[ROS_S3_MESH_IDS];
+    S3Tex tex[ROS_S3_TEX_IDS];
+    uint32_t skin[ROS_S3_SKIN_IDS][4];      /* the record's p[0..3]; p[3] the object colour */
+    bool skin_have[ROS_S3_SKIN_IDS];
+    struct { uint16_t diffuse; uint32_t base; float m[4]; bool have; } terr[ROS_S3_TERRAIN_IDS];
+    uint32_t drawn_frame, drawn_w, drawn_h, drawn_assets, assets;
+    uint64_t shown;
+} s3;
+
+static id<MTLRenderPipelineState> s3_pipe(id<MTLLibrary> lib, NSString *vs, NSString *fs,
+                                          MTLPixelFormat f, bool depth, MTLVertexDescriptor *vd, bool blend)
+{
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    NSError *err = nil;
+    id<MTLRenderPipelineState> p;
+
+    pd.vertexFunction = [[lib newFunctionWithName:vs] autorelease];
+    pd.fragmentFunction = [[lib newFunctionWithName:fs] autorelease];
+    pd.colorAttachments[0].pixelFormat = f;
+    if (depth) {
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    }
+    if (vd) {
+        pd.vertexDescriptor = vd;
+    }
+    if (blend) {
+        /* a blend splat over what is there: source alpha, one less it (the
+         * target's own alpha kept) */
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    }
+    if (blend && [fs isEqualToString:@"s3_hud_fs"]) {
+        /* the HUD: straight alpha over the scene, as the twin blends it */
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
+    p = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) {
+        metal_log("scene3d %s: %s", [fs UTF8String], [[err localizedDescription] UTF8String]);
+    }
+    [pd release];
+    return p;
+}
+
+static void s3_setup(void)
+{
+    NSError *err = nil;
+    MTLCompileOptions *opts;
+    id<MTLLibrary> lib;
+
+    if (s3.tried) {
+        return;
+    }
+    s3.tried = true;
+    s3.cur = calloc(1, sizeof(struct ros_scene3d));
+    s3.hdr_next = calloc(1, 2048);
+    if (!s3.cur || !s3.hdr_next) {
+        return;
+    }
+    opts = [[MTLCompileOptions alloc] init];
+    if (@available(macOS 15.0, *)) {
+        opts.mathMode = MTLMathModeSafe;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opts.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    }
+    lib = [m.device newLibraryWithSource:S3_SRC options:opts error:&err];
+    [opts release];
+    if (!lib) {
+        metal_log("scene3d: the program will not build: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+    vd.attributes[0].format = MTLVertexFormatFloat3, vd.attributes[0].offset = 0;
+    vd.attributes[1].format = MTLVertexFormatFloat3, vd.attributes[1].offset = 12;
+    vd.attributes[2].format = MTLVertexFormatFloat2, vd.attributes[2].offset = 24;
+    vd.attributes[3].format = MTLVertexFormatUChar4, vd.attributes[3].offset = 40;
+    vd.attributes[4].format = MTLVertexFormatUChar4, vd.attributes[4].offset = 44;
+    for (int k = 0; k < 5; k++) {
+        vd.attributes[k].bufferIndex = 1;
+    }
+    vd.layouts[1].stride = sizeof(struct ros_s3_vertex);
+    s3.splat = s3_pipe(lib, @"s3_splat_vs", @"s3_splat_fs", MTLPixelFormatRGBA8Unorm, true, nil, false);
+    s3.blend = s3_pipe(lib, @"s3_splat_vs", @"s3_splat_fs", MTLPixelFormatRGBA8Unorm, true, nil, true);
+    s3.side = s3_pipe(lib, @"s3_side_vs", @"s3_side_fs", MTLPixelFormatRGBA8Unorm, true, nil, false);
+    s3.model = s3_pipe(lib, @"s3_model_vs", @"s3_fs", MTLPixelFormatRGBA8Unorm, true, vd, false);
+    s3.show = s3_pipe(lib, @"s3_show_vs", @"s3_show_fs", MTLPixelFormatBGRA8Unorm, false, nil, false);
+    s3.show_shot = s3_pipe(lib, @"s3_show_vs", @"s3_show_fs", MTLPixelFormatRGBA8Unorm, false, nil, false);
+    s3.hud = s3_pipe(lib, @"s3_hud_vs", @"s3_hud_fs", MTLPixelFormatRGBA8Unorm, true, nil, true);
+    [lib release];
+    MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+    dd.depthCompareFunction = MTLCompareFunctionLess;
+    dd.depthWriteEnabled = YES;
+    s3.depth = [m.device newDepthStencilStateWithDescriptor:dd];
+    dd.depthCompareFunction = MTLCompareFunctionLessEqual;     /* the blends: on the opaque, unwritten */
+    dd.depthWriteEnabled = NO;
+    s3.depth_blend = [m.device newDepthStencilStateWithDescriptor:dd];
+    dd.depthCompareFunction = MTLCompareFunctionAlways;        /* the HUD: over everything */
+    dd.depthWriteEnabled = NO;
+    s3.depth_none = [m.device newDepthStencilStateWithDescriptor:dd];
+    [dd release];
+    for (int k = 0; k < 2; k++) {
+        MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+        sd.minFilter = MTLSamplerMinMagFilterLinear;
+        sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.mipFilter = MTLSamplerMipFilterNearest;
+        sd.sAddressMode = sd.tAddressMode = k ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
+        if (k) {
+            s3.clamp = [m.device newSamplerStateWithDescriptor:sd];
+        } else {
+            s3.repeat = [m.device newSamplerStateWithDescriptor:sd];
+        }
+        [sd release];
+    }
+    s3.heights = gp_texture(MTLPixelFormatR16Uint, ROS_S3_HSTRIDE, ROS_S3_VERTS, MTLTextureUsageShaderRead);
+    s3.los = gp_texture(MTLPixelFormatR8Unorm, ROS_S3_HSTRIDE, ROS_S3_VERTS, MTLTextureUsageShaderRead);
+    s3.canvas = gp_texture(MTLPixelFormatRGBA8Unorm, ROS_S3_CANVAS, ROS_S3_CANVAS, MTLTextureUsageShaderRead);
+    for (int k = 0; k < S3_RING; k++) {
+        s3.inst[k] = gp_texture(MTLPixelFormatRGBA32Uint, S3_INST_W, ROS_S3_INSTANCES * 4 / S3_INST_W,
+                                MTLTextureUsageShaderRead);
+        s3.bones[k] = gp_texture(MTLPixelFormatRGBA32Float, S3_BONE_W, ROS_S3_BONES * 3 / S3_BONE_W,
+                                 MTLTextureUsageShaderRead);
+    }
+    if (@available(macOS 11.0, *)) {
+        s3.bc = [m.device supportsBCTextureCompression];
+    } else {
+        s3.bc = true;
+    }
+    const char *e = getenv("ROSGD_SCENE3D_CPU_BC");
+    s3.cpu_bc = e && *e == '1';
+    s3.ok = s3.splat && s3.blend && s3.side && s3.model && s3.show && s3.show_shot && s3.depth
+            && s3.depth_blend && s3.heights && s3.los && s3.hud && s3.depth_none && s3.canvas;
+    metal_log("scene3d: the classic program; BC textures %s", !s3.bc ? "decoded here (the GPU has none)"
+              : s3.cpu_bc ? "decoded here (ROSGD_SCENE3D_CPU_BC)" : "on the GPU");
+}
+
+/* The first visible scene, and its live block, whole inside the region */
+static const MetalIcon *s3_first(struct ros_surf_scene3d *d)
+{
+    const MetalSurfacesView *v = &surf.view;
+
+    if (!surf.on || !v->nicons || !v->region) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < v->nicons; i++) {
+        const MetalIcon *ic = &v->icon[i];
+
+        if (ic->kind != ROSGD_SURF_SCENE3D || !ic->nrects) {
+            continue;
+        }
+        memcpy(d, ic->data, sizeof(*d));
+        /* a version 1 broker's block ends at the LOS grid (no HUD) */
+        if (d->size < ROS_S3_V1_SIZE || d->offset == 0xFFFFFFFFu
+            || (uint64_t)d->offset + d->size > v->region_size) {
+            continue;
+        }
+        return ic;
+    }
+    return NULL;
+}
+
+/* Every GPU object of the last asset set let go (a new epoch: another map) */
+static void s3_drop(void)
+{
+    for (int i = 0; i < ROS_S3_MESH_IDS; i++) {
+        [s3.mesh[i].vb release];
+        [s3.mesh[i].ib release];
+    }
+    for (int i = 0; i < ROS_S3_TEX_IDS; i++) {
+        [s3.tex[i].t release];
+    }
+    memset(s3.mesh, 0, sizeof(s3.mesh));
+    memset(s3.tex, 0, sizeof(s3.tex));
+    memset(s3.skin_have, 0, sizeof(s3.skin_have));
+    memset(s3.terr, 0, sizeof(s3.terr));
+    memset(s3.page_done, 0, sizeof(s3.page_done));
+    memset(&s3.am, 0, sizeof(s3.am));
+    s3.assets++;
+}
+
+static uint32_t s3_unpack5(uint32_t c, int below, int bits)
+{
+    uint32_t f = (c >> below) & ((1u << bits) - 1u);
+    return (f << (8 - bits)) | (f >> (bits - (8 - bits)));
+}
+
+/* A 4 x 4 block of BC1 (fmt 0 or 1), BC2 (2) or BC3 (3) to RGBA, as the
+ * twin decodes it (Antiquity's antiq-assets dds.rs, decode_block) */
+static void s3_bc_block(int fmt, const uint8_t *b, uint8_t px[16][4])
+{
+    const uint8_t *cb = fmt >= 2 ? b + 8 : b;
+    uint32_t rc0 = cb[0] | cb[1] << 8, rc1 = cb[2] | cb[3] << 8;
+    uint32_t sel = cb[4] | cb[5] << 8 | cb[6] << 16 | (uint32_t)cb[7] << 24;
+    uint32_t c[4][4];
+    uint32_t rc[2] = { rc0, rc1 };
+    for (int i = 0; i < 2; i++) {
+        c[i][0] = s3_unpack5(rc[i], 11, 5), c[i][1] = s3_unpack5(rc[i], 5, 6);
+        c[i][2] = s3_unpack5(rc[i], 0, 5), c[i][3] = 255;
+    }
+    if (fmt <= 1 && rc0 <= rc1) {
+        for (int k = 0; k < 3; k++) {
+            c[2][k] = (c[0][k] + c[1][k]) / 2;
+        }
+        c[2][3] = 255;
+        c[3][0] = c[3][1] = c[3][2] = 0, c[3][3] = fmt == 1 ? 0 : 255;
+    } else {
+        for (int k = 0; k < 3; k++) {
+            c[2][k] = (c[0][k] * 2 + c[1][k] + 1) / 3;
+            c[3][k] = (c[1][k] * 2 + c[0][k] + 1) / 3;
+        }
+        c[2][3] = c[3][3] = 255;
+    }
+    uint64_t abits = 0;
+    for (int k = 0; k < 8; k++) {
+        abits |= (uint64_t)b[k] << (8 * k);
+    }
+    uint32_t a5[8] = { 0 };
+    if (fmt == 3) {
+        uint32_t a0 = b[0], a1 = b[1];
+        if (a0 <= a1) {
+            uint32_t t[8] = { a0, a1, (4 * a0 + a1 + 2) / 5, (3 * a0 + 2 * a1 + 2) / 5,
+                              (2 * a0 + 3 * a1 + 2) / 5, (a0 + 4 * a1 + 2) / 5, 0, 255 };
+            memcpy(a5, t, sizeof(a5));
+        } else {
+            uint32_t t[8] = { a0, a1, (6 * a0 + a1 + 3) / 7, (5 * a0 + 2 * a1 + 3) / 7,
+                              (4 * a0 + 3 * a1 + 3) / 7, (3 * a0 + 4 * a1 + 3) / 7,
+                              (2 * a0 + 5 * a1 + 3) / 7, (a0 + 6 * a1 + 3) / 7 };
+            memcpy(a5, t, sizeof(a5));
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        uint32_t cs = (sel >> (2 * i)) & 3u, a;
+        if (fmt == 2) {
+            a = (uint32_t)((abits >> (4 * i)) & 0xFu);
+            a |= a << 4;
+        } else if (fmt == 3) {
+            a = a5[((abits >> 16) >> (3 * i)) & 7u];
+        } else if (fmt == 0) {
+            a = 255;
+        } else {
+            a = c[cs][3];
+        }
+        px[i][0] = (uint8_t)c[cs][0], px[i][1] = (uint8_t)c[cs][1];
+        px[i][2] = (uint8_t)c[cs][2], px[i][3] = (uint8_t)a;
+    }
+}
+
+static size_t s3_level_size(uint32_t f, uint32_t w, uint32_t h)
+{
+    size_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    switch (f) {
+    case S3_TF_BC1: case S3_TF_BC1A: return bw * bh * 8;
+    case S3_TF_BC2: case S3_TF_BC3: return bw * bh * 16;
+    case S3_TF_RGBA8: return (size_t)w * h * 4;
+    default: return (size_t)w * h;
+    }
+}
+
+/* A TEXTURE record: every level, as the GPU takes them where it can */
+static void s3_texture(const struct ros_s3_record *r, const uint8_t *data)
+{
+    uint32_t w = r->p[0] & 0xFFFFu, h = r->p[0] >> 16;
+    uint32_t f = r->p[1] & 0xFFu, n = (r->p[1] >> 8) & 0xFFu;
+    if (!r->id || r->id >= ROS_S3_TEX_IDS || !w || !h || w > 16384 || h > 16384 || f >= S3_TF_N) {
+        return;
+    }
+    if (n < 1) {
+        n = 1;
+    }
+    size_t need = 0;
+    uint32_t lw = w, lh = h, levels = 0;
+    for (uint32_t k = 0; k < n && k < 15; k++, levels++) {
+        need += s3_level_size(f, lw, lh);
+        lw = lw > 1 ? lw / 2 : 1, lh = lh > 1 ? lh / 2 : 1;
+    }
+    if (need > r->size) {
+        return;                         /* short: not drawn */
+    }
+    bool bcf = f <= S3_TF_BC3;
+    bool gpu = bcf && s3.bc && !s3.cpu_bc && !(w & 3) && !(h & 3);
+    MTLPixelFormat pf = !gpu ? MTLPixelFormatRGBA8Unorm
+                      : f == S3_TF_BC2 ? MTLPixelFormatBC2_RGBA
+                      : f == S3_TF_BC3 ? MTLPixelFormatBC3_RGBA : MTLPixelFormatBC1_RGBA;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w
+                                                                                 height:h mipmapped:NO];
+    td.mipmapLevelCount = levels;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [m.device newTextureWithDescriptor:td];
+    if (!t) {
+        return;
+    }
+    const uint8_t *src = data;
+    uint8_t *rgba = NULL;
+    lw = w, lh = h;
+    for (uint32_t k = 0; k < levels; k++) {
+        size_t ls = s3_level_size(f, lw, lh);
+        MTLRegion rg = MTLRegionMake2D(0, 0, lw, lh);
+        if (gpu) {
+            [t replaceRegion:rg mipmapLevel:k withBytes:src
+                 bytesPerRow:((lw + 3) / 4) * (f >= S3_TF_BC2 ? 16 : 8)];
+        } else {
+            rgba = realloc(rgba, (size_t)lw * lh * 4);
+            if (!rgba) {
+                break;
+            }
+            if (bcf) {
+                uint32_t bw = (lw + 3) / 4, bh = (lh + 3) / 4, bs = f >= S3_TF_BC2 ? 16 : 8;
+                uint8_t px[16][4];
+                for (uint32_t by = 0; by < bh; by++) {
+                    for (uint32_t bx = 0; bx < bw; bx++) {
+                        s3_bc_block((int)f, src + ((size_t)by * bw + bx) * bs, px);
+                        for (uint32_t y = 0; y < 4; y++) {
+                            for (uint32_t x = 0; x < 4; x++) {
+                                uint32_t gx = bx * 4 + x, gy = by * 4 + y;
+                                if (gx < lw && gy < lh) {
+                                    memcpy(rgba + ((size_t)gy * lw + gx) * 4, px[y * 4 + x], 4);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (f == S3_TF_RGBA8) {
+                memcpy(rgba, src, (size_t)lw * lh * 4);
+            } else {
+                for (size_t i = 0; i < (size_t)lw * lh; i++) {      /* R8: as the twin, a a a a */
+                    memset(rgba + i * 4, src[i], 4);
+                }
+            }
+            [t replaceRegion:rg mipmapLevel:k withBytes:rgba bytesPerRow:lw * 4];
+        }
+        src += ls;
+        lw = lw > 1 ? lw / 2 : 1, lh = lh > 1 ? lh / 2 : 1;
+    }
+    free(rgba);
+    S3Tex *x = &s3.tex[r->id];
+    [x->t release];
+    x->t = t;
+    x->w = (uint16_t)w, x->h = (uint16_t)h, x->levels = (uint8_t)levels;
+    x->wrap = (r->p[2] & ROS_S3_T_WRAP) != 0;
+    x->opaque = f == S3_TF_BC1;
+}
+
+/* A MESH record: its vertices and its indices, each in a buffer of its own */
+static void s3_mesh(const struct ros_s3_record *r, const uint8_t *data)
+{
+    uint32_t nv = r->p[0], ni = r->p[1];
+    size_t vbytes = (size_t)nv * sizeof(struct ros_s3_vertex);
+    if (!r->id || r->id >= ROS_S3_MESH_IDS || !nv || !ni || nv > 65536 || ni % 3
+        || vbytes + (size_t)ni * 2 > r->size) {
+        return;
+    }
+    /* the indices kept inside the vertices: a bad one is made 0 */
+    uint16_t *idx = malloc((size_t)ni * 2);
+    if (!idx) {
+        return;
+    }
+    memcpy(idx, data + vbytes, (size_t)ni * 2);
+    for (uint32_t i = 0; i < ni; i++) {
+        if (idx[i] >= nv) {
+            idx[i] = 0;
+        }
+    }
+    S3Mesh *x = &s3.mesh[r->id];
+    [x->vb release];
+    [x->ib release];
+    x->vb = [m.device newBufferWithBytes:data length:vbytes options:MTLResourceStorageModeShared];
+    x->ib = [m.device newBufferWithBytes:idx length:(size_t)ni * 2 options:MTLResourceStorageModeShared];
+    free(idx);
+    x->nidx = ni;
+    x->nbones = r->p[2] > 254 ? 254 : r->p[2];
+}
+
+/* The pages' new records, as far as the live block says each page goes */
+static void s3_assets(const struct ros_scene3d *h)
+{
+    const MetalSurfacesView *v = &surf.view;
+    uint32_t np = h->npages > ROS_S3_PAGES ? ROS_S3_PAGES : h->npages;
+
+    for (uint32_t i = 0; i < np; i++) {
+        const struct ros_s3_page_ref *pr = &h->page[i];
+        if (!pr->backing || pr->offset == 0xFFFFFFFFu || pr->size < ROS_S3_PAGE_DATA
+            || pr->size > ROS_S3_PAGE_MAX || (uint64_t)pr->offset + pr->size > v->region_size) {
+            continue;
+        }
+        const uint8_t *base = (const uint8_t *)v->region + pr->offset;
+        const struct ros_s3_page *pg = (const struct ros_s3_page *)base;
+        if (pg->magic != ROS_S3_PAGE_MAGIC || pg->version != ROS_S3_PAGE_VERSION || pg->epoch != h->epoch
+            || pg->index != i) {
+            continue;
+        }
+        if (s3.page_epoch[i] != h->epoch) {
+            s3.page_epoch[i] = h->epoch;
+            s3.page_done[i] = 0;
+        }
+        uint32_t nrec = pg->nrecords > ROS_S3_RECORDS ? ROS_S3_RECORDS : pg->nrecords;
+        while (s3.page_done[i] < nrec) {
+            struct ros_s3_record r;
+            memcpy(&r, &pg->rec[s3.page_done[i]], sizeof(r));
+            if (r.offset < ROS_S3_PAGE_DATA || (uint64_t)r.offset + r.size > pr->size) {
+                break;                  /* not there yet in what the live block names */
+            }
+            const uint8_t *d = base + r.offset;
+            switch (r.kind) {
+            case S3_R_MESH:
+                s3_mesh(&r, d);
+                break;
+            case S3_R_TEXTURE:
+                s3_texture(&r, d);
+                break;
+            case S3_R_SKIN:
+                if (r.id && r.id < ROS_S3_SKIN_IDS) {
+                    memcpy(s3.skin[r.id], r.p, sizeof(s3.skin[r.id]));
+                    s3.skin_have[r.id] = true;
+                }
+                break;
+            case S3_R_ALPHAMAP:
+                /* the twin's: the record with the least texture id */
+                if (r.p[0] && r.p[0] < ROS_S3_TEX_IDS && r.p[2] && (!s3.am.have || r.p[0] < s3.am.tex)) {
+                    s3.am.tex = (uint16_t)r.p[0], s3.am.stride = r.p[2], s3.am.shapes = r.p[3];
+                    s3.am.have = true;
+                }
+                break;
+            case S3_R_TERRAIN:
+                if (r.id && r.id < ROS_S3_TERRAIN_IDS && r.size >= 16) {
+                    s3.terr[r.id].diffuse = (uint16_t)r.p[0];
+                    s3.terr[r.id].base = r.p[2];
+                    memcpy(s3.terr[r.id].m, d, 16);
+                    s3.terr[r.id].have = true;
+                }
+                break;
+            default:
+                break;
+            }
+            s3.page_done[i]++;
+            s3.assets++;
+        }
+    }
+}
+
+/* The live block under its seqlock: the header, the terrain when its gen
+ * moved, the instances and bones; their textures into the ring's next.
+ * Returns whether there is a whole frame to draw. */
+static bool s3_take(const uint8_t *blk, uint32_t size)
+{
+    const struct ros_scene3d *b = (const struct ros_scene3d *)blk;
+    uint32_t f0;
+
+    memcpy(&f0, blk + offsetof(struct ros_scene3d, frame), 4);
+    if ((f0 & 1u) || b->magic != ROS_S3_MAGIC || b->version < ROS_S3_VERSION_MIN || b->version > ROS_S3_VERSION) {
+        return s3.have;
+    }
+    if (s3.have && f0 == s3.frame) {
+        return true;
+    }
+    memcpy(s3.hdr_next, blk, 2048);
+    const struct ros_scene3d *n = (const struct ros_scene3d *)s3.hdr_next;
+    uint32_t ni = n->ninstances > ROS_S3_INSTANCES ? ROS_S3_INSTANCES : n->ninstances;
+    uint32_t nb = n->nbones > ROS_S3_BONES ? ROS_S3_BONES : n->nbones;
+    bool epoch = !s3.have || n->epoch != s3.epoch;
+    bool terrain = epoch || n->gen[S3_TERRAIN] != s3.gen[S3_TERRAIN];
+    bool splats = epoch || n->gen[S3_SPLATS] != s3.gen[S3_SPLATS];
+    bool los = epoch || n->gen[S3_LOS] != s3.gen[S3_LOS];
+    bool v2 = n->version >= 2 && size >= sizeof(struct ros_scene3d);  /* else no HUD: nothing read
+                                                                          past the LOS grid */
+    bool hud = v2 && (epoch || n->gen[S3_HUD] != s3.gen[S3_HUD]);
+    bool canvas = v2 && (epoch || n->gen[S3_CANVAS] != s3.gen[S3_CANVAS]);
+    if (!v2) {
+        s3.cur->hud.nquads = 0;
+    }
+    uint32_t ns = 0;
+    /* the instances and bones into the next of the ring (the GPU may still
+     * read the last); the terrain in place (it changes when a map loads) */
+    int ring = (s3.ring + 1) % S3_RING;
+    uint32_t irows = (ni * 4 + S3_INST_W - 1) / S3_INST_W, brows = (nb * 3 + S3_BONE_W - 1) / S3_BONE_W;
+    if (irows) {
+        [s3.inst[ring] replaceRegion:MTLRegionMake2D(0, 0, S3_INST_W, irows) mipmapLevel:0
+                           withBytes:blk + offsetof(struct ros_scene3d, inst) bytesPerRow:S3_INST_W * 16];
+    }
+    if (brows) {
+        [s3.bones[ring] replaceRegion:MTLRegionMake2D(0, 0, S3_BONE_W, brows) mipmapLevel:0
+                            withBytes:blk + offsetof(struct ros_scene3d, bone) bytesPerRow:S3_BONE_W * 16];
+    }
+    memcpy(s3.cur->inst, b->inst, (size_t)ni * sizeof(b->inst[0]));
+    if (terrain) {
+        memcpy(s3.cur->height, b->height, sizeof(b->height));
+        memcpy(s3.cur->tile, b->tile, sizeof(b->tile));
+    }
+    if (splats) {
+        memcpy(s3.cur->splat_first, b->splat_first, sizeof(b->splat_first));
+        ns = s3.cur->splat_first[ROS_S3_PATCHES * ROS_S3_PATCHES];
+        ns = ns > ROS_S3_SPLATS ? ROS_S3_SPLATS : ns;
+        memcpy(s3.cur->splat, b->splat, (size_t)ns * 4);
+    }
+    if (los) {
+        memcpy(s3.cur->los, b->los, sizeof(b->los));
+    }
+    if (hud) {
+        memcpy(&s3.cur->hud, &b->hud, sizeof(b->hud));
+        uint32_t nq = s3.cur->hud.nquads > ROS_S3_QUADS ? ROS_S3_QUADS : s3.cur->hud.nquads;
+        s3.cur->hud.nquads = nq;
+        memcpy(s3.cur->quad, b->quad, (size_t)nq * sizeof(b->quad[0]));
+    }
+    if (canvas) {
+        uint32_t ch = b->hud.canvas_h > ROS_S3_CANVAS ? ROS_S3_CANVAS : b->hud.canvas_h;
+        memcpy(s3.cur->canvas, b->canvas, (size_t)ch * sizeof(b->canvas[0]));
+    }
+    uint32_t after;
+    memcpy(&after, blk + offsetof(struct ros_scene3d, frame), 4);
+    if (after != f0) {
+        return s3.have;                 /* torn: the last whole frame stands (its instances
+                                           in cur may be the new ones: drawn next frame) */
+    }
+    if (epoch && s3.have) {
+        s3_drop();
+    }
+    memcpy(s3.cur, s3.hdr_next, 2048);
+    if (terrain) {
+        [s3.heights replaceRegion:MTLRegionMake2D(0, 0, ROS_S3_HSTRIDE, ROS_S3_VERTS) mipmapLevel:0
+                        withBytes:s3.cur->height bytesPerRow:ROS_S3_HSTRIDE * 2];
+    }
+    if (los) {
+        [s3.los replaceRegion:MTLRegionMake2D(0, 0, ROS_S3_HSTRIDE, ROS_S3_VERTS) mipmapLevel:0
+                    withBytes:s3.cur->los bytesPerRow:ROS_S3_HSTRIDE];
+    }
+    if (canvas) {
+        [s3.canvas replaceRegion:MTLRegionMake2D(0, 0, ROS_S3_CANVAS, ROS_S3_CANVAS) mipmapLevel:0
+                       withBytes:s3.cur->canvas bytesPerRow:ROS_S3_CANVAS * 4];
+    }
+    if (hud) {
+        uint32_t nq = s3.cur->hud.nquads;
+        [s3.hudq[ring] release];
+        s3.hudq[ring] = nq ? [m.device newBufferWithBytes:s3.cur->quad length:(size_t)nq * sizeof(s3.cur->quad[0])
+                                                  options:MTLResourceStorageModeShared] : nil;
+        for (int k = 0; k < S3_RING; k++) {
+            if (k != ring) {
+                [s3.hudq[k] release];
+                s3.hudq[k] = nil;
+            }
+        }
+        s3.hud_ring = ring;
+    }
+    if (splats) {
+        [s3.splats release];
+        s3.splats = ns ? [m.device newBufferWithBytes:s3.cur->splat length:(size_t)ns * 4
+                                              options:MTLResourceStorageModeShared] : nil;
+    }
+    s3.ring = ring;
+    memcpy(s3.gen, n->gen, sizeof(s3.gen));
+    s3.epoch = n->epoch;
+    s3.frame = f0;
+    s3.have = true;
+    return true;
+}
+
+static void s3_unpack8(uint32_t w, float o[4])
+{
+    for (int k = 0; k < 4; k++) {
+        o[k] = (float)((w >> (8 * k)) & 255u) / 255.0f;
+    }
+}
+
+/* Before the frame's main pass: the scene drawn into its own picture the
+ * size of the icon's box in the target's pixels, when anything moved */
+static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    struct ros_surf_scene3d d;
+    const MetalIcon *ic = s3_first(&d);
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+
+    if (!ic) {
+        return;
+    }
+    s3_setup();
+    if (!s3.ok || !s3_take((const uint8_t *)v->region + d.offset, d.size)) {
+        return;
+    }
+    const struct ros_scene3d *h = s3.cur;
+    s3_assets(h);
+    uint32_t w = (uint32_t)lround(ic->w * sx), hh = (uint32_t)lround(ic->h * sy);
+    if (w < 1 || hh < 1 || w > 16384 || hh > 16384) {
+        return;
+    }
+    if (s3.color && s3.drawn_frame == s3.frame && s3.drawn_w == w && s3.drawn_h == hh
+        && s3.drawn_assets == s3.assets) {
+        return;                         /* drawn already */
+    }
+    if (!s3.color || s3.color.width != w || s3.color.height != hh) {
+        [s3.color release];
+        [s3.zbuf release];
+        s3.color = gp_texture(MTLPixelFormatRGBA8Unorm, w, hh,
+                              MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+        MTLTextureDescriptor *zd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:w height:hh mipmapped:NO];
+        zd.usage = MTLTextureUsageRenderTarget;
+        zd.storageMode = MTLStorageModePrivate;
+        s3.zbuf = [m.device newTextureWithDescriptor:zd];
+    }
+    if (!s3.color || !s3.zbuf) {
+        return;
+    }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    float sky[4];
+    for (int k = 0; k < 3; k++) {
+        float c = h->env.sky_rgb[k] < 0 ? 0 : h->env.sky_rgb[k] > 1 ? 1 : h->env.sky_rgb[k];
+        sky[k] = roundf(c * 255.0f) / 255.0f;
+    }
+    rp.colorAttachments[0].texture = s3.color;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(sky[0], sky[1], sky[2], 1);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.depthAttachment.texture = s3.zbuf;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.clearDepth = 1.0;
+    rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setDepthStencilState:s3.depth];
+    [enc setCullMode:MTLCullModeNone];
+    S3U u;
+    memset(&u, 0, sizeof(u));
+    memcpy(u.vp, h->view.viewproj, sizeof(u.vp));
+    memcpy(u.sun_dir, h->env.sun_dir, 16);
+    memcpy(u.sun_rgb, h->env.sun_rgb, 16);
+    memcpy(u.amb, h->env.ambient_rgb, 16);
+    u.vsize[0] = (float)w, u.vsize[1] = (float)hh;
+    u.tint[0] = u.tint[1] = u.tint[2] = u.tint[3] = 1.0f;
+    u.player[0] = u.player[1] = u.player[2] = u.object[0] = u.object[1] = u.object[2] = 1.0f;
+    /* the terrain (SCENE3D.md 6.3): the visible patches' sides, then their
+     * opaque splats, then their blends, a run of one texture a draw */
+    uint32_t patches = h->patches > ROS_S3_PATCHES ? ROS_S3_PATCHES : h->patches;
+    if (patches && !(h->flags & ROS_S3_F_NO_TERRAIN) && s3.splats) {
+        uint32_t n = patches * ROS_S3_PATCH, ns = (uint32_t)(s3.splats.length / 4);
+        uint32_t nt = h->nterrains > ROS_S3_TERRAINS ? ROS_S3_TERRAINS : h->nterrains;
+        uint8_t back[4];
+        memcpy(back, &h->back_rgba, 4);
+        for (int k = 0; k < 3; k++) {
+            u.side[k] = back[k] / 255.0f;
+        }
+        u.side[3] = h->env.water[2] != 0.0f ? h->env.water[0] : 0.0f;
+        u.terr[0] = (int32_t)(n + 1);
+        S3Tex *amt = s3.am.have && s3.tex[s3.am.tex].t ? &s3.tex[s3.am.tex] : NULL;
+        if (amt) {
+            u.am[0] = (float)s3.am.stride, u.am[1] = (float)amt->w, u.am[2] = (float)s3.am.shapes;
+        }
+        [enc setVertexTexture:s3.heights atIndex:0];
+        [enc setFragmentTexture:s3.los atIndex:1];
+        if (amt) {
+            [enc setFragmentTexture:amt->t atIndex:2];
+            [enc setFragmentSamplerState:amt->wrap ? s3.repeat : s3.clamp atIndex:1];
+        } else {
+            [enc setFragmentSamplerState:s3.clamp atIndex:1];
+        }
+        [enc setVertexBuffer:s3.splats offset:0 atIndex:1];
+        for (int pass = 0; pass < 3; pass++) {
+            [enc setRenderPipelineState:pass == 0 ? s3.side : pass == 1 ? s3.splat : s3.blend];
+            [enc setDepthStencilState:pass == 2 ? s3.depth_blend : s3.depth];
+            for (uint32_t pz = 0; pz < patches; pz++) {
+                for (uint32_t px = 0; px < patches; px++) {
+                    if (!(h->patch_vis[pz] >> px & 1u)) {
+                        continue;
+                    }
+                    if (pass == 0) {
+                        int32_t e[4][4];
+                        int ne = 0;
+                        if (px == 0) {
+                            int32_t a[4] = { 0, (int32_t)(pz * ROS_S3_PATCH), 0, 1 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        if (px == patches - 1) {
+                            int32_t a[4] = { (int32_t)n, (int32_t)(pz * ROS_S3_PATCH), 0, 1 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        if (pz == 0) {
+                            int32_t a[4] = { (int32_t)(px * ROS_S3_PATCH), 0, 1, 0 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        if (pz == patches - 1) {
+                            int32_t a[4] = { (int32_t)(px * ROS_S3_PATCH), (int32_t)n, 1, 0 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        for (int k = 0; k < ne; k++) {
+                            memcpy(u.edge, e[k], 16);
+                            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+                            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+                            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                                    vertexCount:ROS_S3_PATCH * 6];
+                        }
+                        continue;
+                    }
+                    uint32_t p = pz * ROS_S3_PATCHES + px;
+                    uint32_t a = h->splat_first[p], b = h->splat_first[p + 1];
+                    a = a > ns ? ns : a, b = b > ns ? ns : b;
+                    u.terr[2] = (int32_t)px, u.terr[3] = (int32_t)pz;
+                    for (uint32_t k = a; k < b;) {
+                        uint32_t w = s3.cur->splat[k], shape = (w >> 8) & 15u, tex = w >> 16;
+                        bool solid = shape == ROS_S3_SHAPE_SOLID;
+                        /* the run: one texture, one kind */
+                        uint32_t e = k + 1;
+                        while (e < b && (solid || shape < s3.am.shapes) && (s3.cur->splat[e] >> 16) == tex
+                               && (((s3.cur->splat[e] >> 8) & 15u) == ROS_S3_SHAPE_SOLID) == solid
+                               && (solid || ((s3.cur->splat[e] >> 8) & 15u) < s3.am.shapes)) {
+                            e++;
+                        }
+                        uint32_t first = k;
+                        k = e;
+                        if (solid != (pass == 1)) {
+                            continue;
+                        }
+                        S3Tex *t = NULL;
+                        float mtx[4] = { 0.25f, 0, 0, 0.25f };
+                        if (tex < nt) {
+                            uint16_t id = h->terrain[tex];
+                            if (id && id < ROS_S3_TERRAIN_IDS && s3.terr[id].have) {
+                                memcpy(mtx, s3.terr[id].m, 16);
+                                uint16_t di = s3.terr[id].diffuse;
+                                if (di && di < ROS_S3_TEX_IDS && s3.tex[di].t) {
+                                    t = &s3.tex[di];
+                                }
+                            }
+                        }
+                        if (!solid && (!t || !amt || shape >= s3.am.shapes)) {
+                            continue;           /* a blend with nothing to blend */
+                        }
+                        memcpy(u.tm, mtx, 16);
+                        u.mode[0] = solid ? 0 : 256, u.mode[1] = t != NULL, u.mode[2] = 0;
+                        if (t) {
+                            u.tsize[0] = t->w, u.tsize[1] = t->h, u.tsize[2] = t->levels - 1;
+                            [enc setFragmentTexture:t->t atIndex:0];
+                            [enc setFragmentSamplerState:t->wrap ? s3.repeat : s3.clamp atIndex:0];
+                        }
+                        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+                        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first * 6
+                                vertexCount:(e - first) * 6];
+                    }
+                }
+            }
+        }
+        [enc setDepthStencilState:s3.depth];
+        memset(u.edge, 0, sizeof(u.edge));
+    }
+    /* the models: a draw an instance */
+    uint32_t ni = h->ninstances > ROS_S3_INSTANCES ? ROS_S3_INSTANCES : h->ninstances;
+    if (ni) {
+        [enc setRenderPipelineState:s3.model];
+        [enc setFragmentTexture:s3.los atIndex:1];
+        [enc setVertexTexture:s3.inst[s3.ring] atIndex:1];
+        [enc setVertexTexture:s3.bones[s3.ring] atIndex:2];
+        for (uint32_t k = 0; k < ni; k++) {
+            const struct ros_s3_instance *in = &s3.cur->inst[k];
+            if (!in->mesh || in->mesh >= ROS_S3_MESH_IDS || !s3.mesh[in->mesh].vb) {
+                continue;
+            }
+            const S3Mesh *me = &s3.mesh[in->mesh];
+            S3Tex *t = NULL;
+            uint32_t shading = 0;
+            float obj[4] = { 1, 1, 1, 1 };
+            if (in->skin && in->skin < ROS_S3_SKIN_IDS && s3.skin_have[in->skin]) {
+                const uint32_t *sk = s3.skin[in->skin];
+                uint16_t base = (uint16_t)(sk[0] & 0xFFFFu);
+                shading = sk[2] & 0xFFFFu;
+                s3_unpack8(sk[3], obj);
+                if (base && base < ROS_S3_TEX_IDS && s3.tex[base].t) {
+                    t = &s3.tex[base];
+                }
+            }
+            s3_unpack8(h->player[in->player % ROS_S3_PLAYERS], u.player);
+            memcpy(u.object, obj, 16);
+            s3_unpack8(in->shading, u.tint);
+            u.tint[3] = in->alpha / 255.0f;
+            u.mode[0] = (int32_t)(shading | (in->flags & ROS_S3_I_NO_LOS ? 4096u : 0u));
+            u.mode[1] = t != NULL, u.mode[2] = t ? t->opaque : 0;
+            u.mode[3] = (int32_t)k;
+            u.terr[1] = (int32_t)me->nbones;
+            if (t) {
+                u.tsize[0] = t->w, u.tsize[1] = t->h, u.tsize[2] = t->levels - 1;
+                [enc setFragmentTexture:t->t atIndex:0];
+                [enc setFragmentSamplerState:t->wrap ? s3.repeat : s3.clamp atIndex:0];
+            }
+            [enc setVertexBuffer:me->vb offset:0 atIndex:1];
+            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:me->nidx
+                             indexType:MTLIndexTypeUInt16 indexBuffer:me->ib indexBufferOffset:0];
+        }
+    }
+    /* the HUD over it all: quads in order, a draw for each run of one texture */
+    uint32_t nq = h->hud.nquads > ROS_S3_QUADS ? ROS_S3_QUADS : h->hud.nquads;
+    id<MTLBuffer> hq = s3.hudq[s3.hud_ring];
+    if (nq && hq && hq.length >= (size_t)nq * sizeof(struct ros_s3_quad) && h->hud.width && h->hud.height) {
+        S3HudU hu;
+        memset(&hu, 0, sizeof(hu));
+        hu.size[0] = h->hud.width, hu.size[1] = h->hud.height;
+        [enc setRenderPipelineState:s3.hud];
+        [enc setDepthStencilState:s3.depth_none];
+        [enc setVertexBuffer:hq offset:0 atIndex:1];
+        [enc setFragmentSamplerState:s3.clamp atIndex:0];
+        for (uint32_t k = 0; k < nq;) {
+            uint16_t tex = s3.cur->quad[k].tex;
+            uint32_t e = k + 1;
+            while (e < nq && s3.cur->quad[e].tex == tex) {
+                e++;
+            }
+            id<MTLTexture> t = nil;
+            if (tex == ROS_S3_HUD_CANVAS) {
+                t = s3.canvas;
+            } else if (tex && tex < ROS_S3_TEX_IDS) {
+                t = s3.tex[tex].t;
+            }
+            if (tex && !t) {
+                k = e;              /* a texture not yet uploaded: those quads wait */
+                continue;
+            }
+            hu.mode[0] = t != nil;
+            if (t) {
+                [enc setFragmentTexture:t atIndex:0];
+            }
+            [enc setVertexBytes:&hu length:sizeof(hu) atIndex:0];
+            [enc setFragmentBytes:&hu length:sizeof(hu) atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:k * 6 vertexCount:(e - k) * 6];
+            k = e;
+        }
+    }
+    [enc endEncoding];
+    s3.drawn_frame = s3.frame, s3.drawn_w = w, s3.drawn_h = hh, s3.drawn_assets = s3.assets;
+    if (!s3.drawn_any || ++s3.shown % 900 == 0) {
+        metal_log("scene3d: frame %u, %ux%u, %u instances, %u bones, epoch %u", s3.frame, w, hh, ni,
+                  h->nbones, h->epoch);
+        s3.drawn_any = true;
+    }
+}
+
+/* The scene's picture in the icon's visible rectangles */
+static void surf_scene3d(id<MTLRenderCommandEncoder> enc, bool shot, CGSize target,
+                         uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    struct ros_surf_scene3d d;
+    const MetalIcon *ic = s3_first(&d);
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+    S3ShowU u;
+
+    if (!ic || !s3.ok || !s3.color) {
+        return;
+    }
+    memset(&u, 0, sizeof(u));
+    u.box[0] = ic->x * sx, u.box[1] = ic->y * sy, u.box[2] = ic->w * sx, u.box[3] = ic->h * sy;
+    u.target[0] = target.width, u.target[1] = target.height;
+    [enc setRenderPipelineState:shot ? s3.show_shot : s3.show];
+    [enc setFragmentTexture:s3.color atIndex:0];
+    for (uint32_t r = 0; r < ic->nrects; r++) {
+        const int16_t *q = v->rect[ic->rects + r];
+
+        u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+        u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+        if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
+            continue;
+        }
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+}
+
 /* Whether a listed clock is due to be drawn again: at the rate it asks,
  * else at each second */
 static bool surf_face_due(void)
@@ -5514,6 +6708,12 @@ static bool surf_face_due(void)
         if (v->icon[i].kind == ROSGD_SURF_TOWER && v->icon[i].nrects && v->icon[i].rate) {
             /* a tower's smooth and rich drawings move (the lamps, fire):
              * as a tile map's */
+            double s = 1.0 / ([m.window isKeyWindow] ? MIN(v->icon[i].rate, 60u) : 4u);
+
+            step = step ? MIN(step, s) : s;
+        }
+        if (v->icon[i].kind == ROSGD_SURF_SCENE3D && v->icon[i].nrects && v->icon[i].rate) {
+            /* a scene asks to be drawn unasked (water, P5): as a tower */
             double s = 1.0 / ([m.window isKeyWindow] ? MIN(v->icon[i].rate, 60u) : 4u);
 
             step = step ? MIN(step, s) : s;
@@ -5877,6 +7077,7 @@ static bool metal_render_frame(void)
        then shows it like any other layer */
     if (have_fb) {
         surf_gamepane_render(cb);
+        surf_scene3d_render(cb, target, v.xres, v.yres);
     }
     enc = [cb renderCommandEncoderWithDescriptor:rp];
     if (have_fb && !fb.scale && !fb_build_scale()) {
@@ -5905,6 +7106,7 @@ static bool metal_render_frame(void)
         surf_gamepanes(enc, target, v.xres, v.yres);
         surf_tiles(enc, false, target, v.xres, v.yres);
         surf_tower(enc, false, target, v.xres, v.yres);
+        surf_scene3d(enc, false, target, v.xres, v.yres);
         surf_faces(enc, surf.face, target, v.xres, v.yres);
     }
 
@@ -6173,6 +7375,7 @@ static bool metal_screenshot_to(NSString *path)
             srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             srp.colorAttachments[0].storeAction = MTLStoreActionStore;
             surf_gamepane_render(cb);
+            surf_scene3d_render(cb, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             senc = [cb renderCommandEncoderWithDescriptor:srp];
             [senc setRenderPipelineState:fb.shot];
             [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
@@ -6190,6 +7393,7 @@ static bool metal_screenshot_to(NSString *path)
             surf_gamepanes(senc, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_tiles(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_tower(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+            surf_scene3d(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_faces(senc, surf.face_shot, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             [senc endEncoding];
             source = composite;

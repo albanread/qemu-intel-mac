@@ -140,8 +140,12 @@ typedef struct RosgdV2 {
     uint32_t offset[ROSGD_V2_SURFACES];
 } RosgdV2;
 
-/* The compositor's pages in the region (rosgd/include/rosgd/presentwire.h) */
-#define ROSGD_PAGES_OFFSET  (128u << 20)
+/* The compositor's pages in the region (rosgd/include/rosgd/presentwire.h):
+ * past the box's backings, 256 MB since 28 Oct 2026 (a 3D scene's pages);
+ * a box built before then has them at 128 MB, where they are looked for if
+ * they are not at 256 */
+#define ROSGD_PAGES_OFFSET  (256u << 20)
+#define ROSGD_PAGES_OFFSET_OLD (128u << 20)
 #define ROSGD_PAGES_MAGIC   0x53475052u     /* "RPGS" */
 #define ROSGD_PAGES         64u
 #define ROSGD_PAGE_XRGB     2u
@@ -622,10 +626,16 @@ static bool vg_pages(void *host, uint64_t size, RosgdPages *t)
     const RosgdPages *src;
     uint32_t s0;
 
-    if (!host || size < ROSGD_PAGES_OFFSET + sizeof(*t)) {
+    if (!host || size < ROSGD_PAGES_OFFSET_OLD + sizeof(*t)) {
         return false;
     }
-    src = (const RosgdPages *)((const uint8_t *)host + ROSGD_PAGES_OFFSET);
+    src = NULL;
+    if (size >= ROSGD_PAGES_OFFSET + sizeof(*t)) {
+        src = (const RosgdPages *)((const uint8_t *)host + ROSGD_PAGES_OFFSET);
+    }
+    if (!src || qatomic_load_acquire(&src->magic) != ROSGD_PAGES_MAGIC) {
+        src = (const RosgdPages *)((const uint8_t *)host + ROSGD_PAGES_OFFSET_OLD);
+    }
     if (qatomic_load_acquire(&src->magic) != ROSGD_PAGES_MAGIC) {
         return false;
     }
@@ -785,7 +795,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
             continue;
         }
         if ((e->kind == 1 || e->kind == 2 || e->kind == ROSGD_SURF_GAMEPANE || e->kind == ROSGD_SURF_TILES
-             || e->kind == ROSGD_SURF_TOWER)
+             || e->kind == ROSGD_SURF_TOWER || e->kind == ROSGD_SURF_SCENE3D)
             && out->nicons < METAL_ICONS && e->w > 0 && e->h > 0) {
             /* the clock's face, the meter's graph, a game pane: drawn by
              * the window rather than copied out of guest memory */
@@ -1022,6 +1032,7 @@ static const char *vg_kind(uint32_t k)
     case ROSGD_SURF_GAMEPANE: return "game pane";
     case ROSGD_SURF_TILES: return "tile map";
     case ROSGD_SURF_TOWER: return "tower";
+    case ROSGD_SURF_SCENE3D: return "3D scene";
     default: return "?";
     }
 }

@@ -4205,6 +4205,84 @@ static void surf_vdus(id<MTLRenderCommandEncoder> enc, bool shot, CGSize target,
     }
 }
 
+/* The program's own pointer (OS_Word 21,0 and OS_Byte 106 in its
+ * display), drawn in place of the desktop's while the pointer, at gx, gy
+ * guest pixels, is over a display's visible picture: its 2 bpp shape in
+ * the header's three colours, a pixel of it two of the display's OS units
+ * square, its active point at the pointer.  True if it was drawn. */
+static bool vd_pointer(id<MTLRenderCommandEncoder> enc, double gx, double gy,
+                       uint32_t xres, uint32_t yres)
+{
+    static id<MTLBuffer> img;
+    static uint32_t made_off, made_gen, made_n;
+    const MetalSurfacesView *v = &surf.view;
+
+    if (!ptr.pipe) {
+        return false;
+    }
+    for (uint32_t i = 0; i < v->nvdus; i++) {
+        const MetalVdu *e = &v->vdu[i];
+        VdHead *h = vd_head(e);
+        uint32_t n, wb, rows, gen;
+        bool over = false;
+        double pw, ph, sx, sy;
+        float rect[4];
+        uint32_t dim[2] = { 32, 32 };
+
+        if (!h || !(n = h->ptr_number) || n > 4 || !h->width || !h->height || h->xeig > 3 || h->yeig > 3) {
+            continue;
+        }
+        for (uint32_t r = 0; r < e->nrects && !over; r++) {
+            const int16_t *q = v->rect[e->rects + r];
+
+            over = gx >= q[0] && gx < q[2] && gy >= q[1] && gy < q[3];
+        }
+        if (!over) {
+            continue;
+        }
+        wb = MIN(h->ptr_w[n - 1], 8u), rows = MIN(h->ptr_h[n - 1], 32u);
+        gen = __atomic_load_n(&h->ptr_gen, __ATOMIC_ACQUIRE);
+        if (!img) {
+            img = [m.device newBufferWithLength:32 * 32 * 4 options:MTLResourceStorageModeShared];
+        }
+        if (!img) {
+            return false;
+        }
+        if (made_off != e->offset || made_gen != gen || made_n != n) {
+            uint32_t *px = (uint32_t *)[img contents];
+
+            memset(px, 0, 32 * 32 * 4);
+            for (uint32_t y = 0; y < rows; y++) {
+                for (uint32_t x = 0; x < wb * 4; x++) {
+                    uint32_t c = (h->ptr_shape[n - 1][y * 8 + x / 4] >> ((x & 3) * 2)) & 3;
+                    uint32_t w = h->ptr_colour[c];
+
+                    if (c) {            /* &BBGGRR00 to 0xAARRGGBB */
+                        px[y * 32 + x] = 0xFF000000u | ((w >> 8) & 255) << 16
+                                         | ((w >> 16) & 255) << 8 | ((w >> 24) & 255);
+                    }
+                }
+            }
+            made_off = e->offset, made_gen = gen, made_n = n;
+        }
+        pw = e->w * 2.0 / (double)(h->width << h->xeig);
+        ph = e->h * 2.0 / (double)(h->height << h->yeig);
+        sx = gx - h->ptr_hx[n - 1] * pw;
+        sy = gy - h->ptr_hy[n - 1] * ph;
+        rect[0] = (float)(2.0 * sx / (double)xres - 1.0);
+        rect[1] = (float)(1.0 - 2.0 * sy / (double)yres);
+        rect[2] = (float)(rect[0] + 2.0 * 32 * pw / (double)xres);
+        rect[3] = (float)(rect[1] - 2.0 * 32 * ph / (double)yres);
+        [enc setRenderPipelineState:ptr.pipe];
+        [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
+        [enc setFragmentBytes:dim length:sizeof(dim) atIndex:0];
+        [enc setFragmentBuffer:img offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        return true;
+    }
+    return false;
+}
+
 /* The clock's face and the meter's graph, into the drawable at its own
  * resolution, clipped to what can be seen of each, over the scaled
  * frame (enc is its encoder) */
@@ -7698,12 +7776,17 @@ static bool metal_render_frame(void)
             rect[3] = (float)(rect[1] - 2.0 * sh / (double)v.yres);
             dim[0] = (uint32_t)ptr.img_w;
             dim[1] = (uint32_t)ptr.img_h;
-            [enc setRenderPipelineState:ptr.pipe];
-            [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
-            [enc setFragmentBytes:dim length:sizeof(dim) atIndex:0];
-            [enc setFragmentBuffer:ptr.image offset:0 atIndex:1];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle
-                    vertexStart:0 vertexCount:3];
+            /* over a virtual display whose program set a pointer of its
+             * own, that one, in place of the desktop's */
+            if (!(ptr.has_hot && surf.on
+                  && vd_pointer(enc, sx + ptr.hot_x / k, sy + ptr.hot_y / k, v.xres, v.yres))) {
+                [enc setRenderPipelineState:ptr.pipe];
+                [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
+                [enc setFragmentBytes:dim length:sizeof(dim) atIndex:0];
+                [enc setFragmentBuffer:ptr.image offset:0 atIndex:1];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0 vertexCount:3];
+            }
         }
     }
     [enc endEncoding];

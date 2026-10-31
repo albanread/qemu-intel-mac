@@ -3848,6 +3848,363 @@ static void surf_gamepanes(id<MTLRenderCommandEncoder> enc, CGSize target,
     });
 }
 
+/* ---- a virtual display (ROSGD_SURF_VDU) ------------------------------------
+ *
+ * Design 54, 6.1: a GraphTask window's picture.  The display's banks are
+ * a block of the region, behind a header (the box's
+ * include/rosgd/vdusurf.h, mirrored by VdHead): the mode, the bank and
+ * the teletext half on show, the palette, and the rows changed since the
+ * window last took the picture.  Here the rows changed are copied as they
+ * are (1 to 32 bits a pixel, a row of bytes each) into a texture of bytes,
+ * and one quad in each visible piece of the window converts and scales
+ * them: an index through the palette, or the 16 and 32 bpp formats taken
+ * apart.  The guest neither converts nor copies anything for a frame.
+ *
+ * The taking is a handshake with the guest: change is read, then the rows,
+ * then change again (a move between means all of it), and once copied,
+ * ack is the change read.  The guest begins a new row range only once ack
+ * has caught up, and otherwise widens the old one, so a change made while
+ * the rows were being copied is copied again at the next look.
+ *
+ * NOTHING HERE TRUSTS THE BLOCK: the magic, the version, every size and
+ * offset against the block's size in the entry, the depth and format.
+ */
+#define VD_MAGIC    0x55534456u         /* "VDSU" */
+#define VD_VERSION  1u
+#define VD_HEAD     4096u
+#define VD_MAX      8192u               /* the widest and tallest picture taken */
+
+typedef struct VdHead {
+    uint32_t magic, version, frame, change, ack, shown;
+    uint32_t width, height, line_length, log2bpp, format, flags, xeig, yeig;
+    uint32_t bank[2], screen_size, flash_other;
+    uint32_t shown_bank, flash, dmg_y0, dmg_y1, pal_gen;
+    uint32_t ptr_number, ptr_gen, ptr_w[4], ptr_h[4];
+    int32_t ptr_hx[4], ptr_hy[4];
+    uint32_t ptr_colour[4];
+    uint32_t reserved[19];
+    uint32_t palette[256];
+    uint8_t ptr_shape[4][256];
+} VdHead;
+_Static_assert(offsetof(VdHead, palette) == 256, "the palette where the box writes it");
+_Static_assert(sizeof(VdHead) <= VD_HEAD, "the header in its room");
+
+/* the uniforms, as VdU in the shader below */
+typedef struct VdU {
+    float box[4];                       /* the picture on the target, target pixels */
+    float clip[4];                      /* the rectangle being drawn */
+    float target[2];
+    uint32_t w, h, ll, l2, format, flags;
+    uint32_t pad[4];
+} VdU;
+_Static_assert(sizeof(VdU) == 80, "VdU as the shader has it");
+
+static NSString * const VD_SRC = @""
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct VdU { float4 box; float4 clip; float2 target; uint w; uint h; uint ll; uint l2;\n"
+"             uint format; uint flags; uint4 pad; };\n"
+"struct VdV { float4 pos [[position]]; float2 uv; };\n"
+"vertex VdV vd_vs(uint id [[vertex_id]], constant VdU &U [[buffer(0)]])\n"
+"{\n"
+"    float2 c = float2(id & 1, (id >> 1) & 1);\n"
+"    float2 p = mix(U.clip.xy, U.clip.zw, c);\n"
+"    VdV o;\n"
+"    o.pos = float4(p / U.target * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"    o.uv = (p - U.box.xy) / U.box.zw;\n"
+"    return o;\n"
+"}\n"
+"/* 5 bits to 8 and 6 to 8, as SpriteExtend widens them */\n"
+"static uint w5(uint c) { return (c << 3) | (c >> 2); }\n"
+"static uint w6(uint c) { return (c << 2) | (c >> 4); }\n"
+"fragment float4 vd_fs(VdV v [[stage_in]], constant VdU &U [[buffer(0)]],\n"
+"                      constant uint *pal [[buffer(1)]], texture2d<uint> bank [[texture(0)]])\n"
+"{\n"
+"    int x = clamp(int(floor(v.uv.x * float(U.w))), 0, int(U.w) - 1);\n"
+"    int y = clamp(int(floor(v.uv.y * float(U.h))), 0, int(U.h) - 1);\n"
+"    uint r, g, b;\n"
+"    if (U.l2 <= 3u) {\n"
+"        /* packed: the leftmost pixel in the lowest bits of its byte */\n"
+"        uint bpp = 1u << U.l2;\n"
+"        uint bit = uint(x) * bpp;\n"
+"        uint by = bank.read(uint2(bit >> 3, uint(y))).r;\n"
+"        uint i = (by >> (bit & 7u)) & ((1u << bpp) - 1u);\n"
+"        uint p = pal[i];                /* &BBGGRR00 */\n"
+"        r = (p >> 8) & 255u, g = (p >> 16) & 255u, b = (p >> 24) & 255u;\n"
+"    } else if (U.l2 == 4u) {\n"
+"        uint q = bank.read(uint2(uint(x) * 2u, uint(y))).r\n"
+"               | bank.read(uint2(uint(x) * 2u + 1u, uint(y))).r << 8;\n"
+"        if (U.format == 2u) {           /* 5:6:5 */\n"
+"            r = w5(q & 31u), g = w6((q >> 5) & 63u), b = w5((q >> 11) & 31u);\n"
+"        } else if (U.format == 3u) {    /* 4:4:4:4 */\n"
+"            r = (q & 15u) * 17u, g = ((q >> 4) & 15u) * 17u, b = ((q >> 8) & 15u) * 17u;\n"
+"        } else {                        /* 1:5:5:5 */\n"
+"            r = w5(q & 31u), g = w5((q >> 5) & 31u), b = w5((q >> 10) & 31u);\n"
+"        }\n"
+"    } else {\n"
+"        r = bank.read(uint2(uint(x) * 4u, uint(y))).r;\n"
+"        g = bank.read(uint2(uint(x) * 4u + 1u, uint(y))).r;\n"
+"        b = bank.read(uint2(uint(x) * 4u + 2u, uint(y))).r;\n"
+"    }\n"
+"    if ((U.flags & 1u) != 0u) {         /* RGB order: red in the high bits */\n"
+"        uint t = r; r = b; b = t;\n"
+"    }\n"
+"    return float4(float(r), float(g), float(b), 255.0) / 255.0;\n"
+"}\n";
+
+typedef struct VdSlot {
+    bool used, have;
+    uint32_t offset, seen;
+    uint32_t mode;                      /* the header's frame the textures are for */
+    uint32_t w, h, ll, l2, format, flags;
+    uint32_t ack;                       /* the change last taken */
+    id<MTLTexture> tex;                 /* the bank on show: ll x h bytes */
+    id<MTLBuffer> stage[METAL_RING];
+    uint32_t palette[256];
+} VdSlot;
+
+static struct {
+    bool tried;
+    id<MTLRenderPipelineState> pipe, pipe_shot;
+    VdSlot s[METAL_VDUS];
+    uint32_t tick, ring;
+} vd;
+
+static id<MTLRenderPipelineState> vd_pipe(id<MTLLibrary> lib, MTLPixelFormat f)
+{
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    NSError *err = nil;
+    id<MTLRenderPipelineState> p;
+
+    pd.vertexFunction = [lib newFunctionWithName:@"vd_vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"vd_fs"];
+    pd.colorAttachments[0].pixelFormat = f;
+    p = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) {
+        metal_log("virtual display: %s", [[err localizedDescription] UTF8String]);
+    }
+    return p;
+}
+
+static void vd_setup(void)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+
+    if (vd.tried) {
+        return;
+    }
+    vd.tried = true;
+    lib = [m.device newLibraryWithSource:VD_SRC options:nil error:&err];
+    if (!lib) {
+        metal_log("virtual display: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+    vd.pipe = vd_pipe(lib, m.layer.pixelFormat);
+    vd.pipe_shot = vd_pipe(lib, MTLPixelFormatRGBA8Unorm);
+}
+
+/* The header, if the block is one and whole within its size */
+static VdHead *vd_head(const MetalVdu *e)
+{
+    const MetalSurfacesView *v = &surf.view;
+    VdHead *h;
+
+    if (!v->region || e->size < VD_HEAD || (uint64_t)e->offset + e->size > v->region_size) {
+        return NULL;
+    }
+    h = (VdHead *)((uint8_t *)v->region + e->offset);
+    return h->magic == VD_MAGIC && h->version == VD_VERSION ? h : NULL;
+}
+
+static VdSlot *vd_slot(uint32_t offset, bool make)
+{
+    VdSlot *s = NULL;
+
+    for (int i = 0; i < METAL_VDUS; i++) {
+        if (vd.s[i].used && vd.s[i].offset == offset) {
+            return &vd.s[i];
+        }
+    }
+    if (!make) {
+        return NULL;
+    }
+    for (int i = 0; i < METAL_VDUS && !s; i++) {
+        if (!vd.s[i].used) {
+            s = &vd.s[i];
+        }
+    }
+    if (!s) {
+        s = &vd.s[0];
+        for (int i = 1; i < METAL_VDUS; i++) {
+            if (vd.s[i].seen < s->seen) {
+                s = &vd.s[i];
+            }
+        }
+    }
+    [s->tex release];
+    for (int k = 0; k < METAL_RING; k++) {
+        [s->stage[k] release];
+    }
+    memset(s, 0, sizeof(*s));
+    s->used = true;
+    s->offset = offset;
+    return s;
+}
+
+/* Whether a display on the screen has a change the window has not taken */
+static bool vd_due(void)
+{
+    const MetalSurfacesView *v = &surf.view;
+
+    for (uint32_t i = 0; surf.on && i < v->nvdus; i++) {
+        VdHead *h = vd_head(&v->vdu[i]);
+        VdSlot *s = vd_slot(v->vdu[i].offset, false);
+
+        if (h && (!s || !s->have || __atomic_load_n(&h->change, __ATOMIC_ACQUIRE) != s->ack)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Each display's changed rows into its texture, through this frame's
+ * stage buffer, ahead of the frame's passes; then the change acked */
+static void vd_take(id<MTLCommandBuffer> cb)
+{
+    const MetalSurfacesView *v = &surf.view;
+    id<MTLBlitCommandEncoder> blit = nil;
+
+    if (!surf.on || !v->nvdus) {
+        return;
+    }
+    vd_setup();
+    if (!vd.pipe) {
+        return;
+    }
+    vd.tick++;
+    vd.ring = (vd.ring + 1) % METAL_RING;
+    for (uint32_t i = 0; i < v->nvdus; i++) {
+        const MetalVdu *e = &v->vdu[i];
+        VdHead *h = vd_head(e);
+        VdSlot *s;
+        uint32_t f0, f1, w, ht, ll, l2, fmt, flags, bank, ss, half, change, y0, y1;
+        bool full;
+
+        if (!h) {
+            continue;
+        }
+        f0 = __atomic_load_n(&h->frame, __ATOMIC_ACQUIRE);
+        w = h->width, ht = h->height, ll = h->line_length, l2 = h->log2bpp;
+        fmt = h->format, flags = h->flags, ss = h->screen_size;
+        bank = h->bank[h->shown_bank & 1], half = h->flash;
+        f1 = __atomic_load_n(&h->frame, __ATOMIC_ACQUIRE);
+        if ((f0 & 1) || f0 != f1) {
+            continue;                   /* a mode being written: the last picture */
+        }
+        if (!w || !ht || w > VD_MAX || ht > VD_MAX || l2 > 5 || fmt > 4
+            || ll < ((w << l2) + 7) / 8 || ll > 4 * VD_MAX || (uint64_t)ll * ht > ss
+            || (half && half != h->flash_other) || (uint64_t)half + (uint64_t)ll * ht > ss
+            || bank < VD_HEAD || (uint64_t)bank + ss > e->size) {
+            continue;
+        }
+        s = vd_slot(e->offset, true);
+        s->seen = vd.tick;
+        full = !s->have || s->mode != f0 || s->w != w || s->h != ht || s->ll != ll || s->l2 != l2;
+        if (full && (s->ll != ll || s->h != ht || !s->tex)) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:ll height:ht mipmapped:NO];
+
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            [s->tex release];
+            s->tex = [m.device newTextureWithDescriptor:td];
+            for (int k = 0; k < METAL_RING; k++) {
+                [s->stage[k] release];
+                s->stage[k] = [m.device newBufferWithLength:(NSUInteger)ll * ht
+                                                    options:MTLResourceStorageModeShared];
+            }
+            if (!s->tex || !s->stage[METAL_RING - 1]) {
+                s->have = false;
+                continue;
+            }
+        }
+        s->mode = f0, s->w = w, s->h = ht, s->ll = ll, s->l2 = l2, s->format = fmt, s->flags = flags;
+        change = __atomic_load_n(&h->change, __ATOMIC_ACQUIRE);
+        memcpy(s->palette, h->palette, sizeof(s->palette));
+        if (!full && change == s->ack) {
+            continue;                   /* nothing new */
+        }
+        y0 = h->dmg_y0, y1 = h->dmg_y1;
+        if (full || __atomic_load_n(&h->change, __ATOMIC_ACQUIRE) != change || y1 > ht || y0 >= y1) {
+            y0 = 0, y1 = ht;            /* moved while read, or out of range: all of it */
+        }
+        memcpy((uint8_t *)[s->stage[vd.ring] contents] + (size_t)y0 * ll,
+               (const uint8_t *)h + bank + half + (size_t)y0 * ll, (size_t)(y1 - y0) * ll);
+        if (!blit) {
+            blit = [cb blitCommandEncoder];
+        }
+        [blit copyFromBuffer:s->stage[vd.ring]
+                sourceOffset:(NSUInteger)y0 * ll
+           sourceBytesPerRow:ll
+         sourceBytesPerImage:(NSUInteger)(y1 - y0) * ll
+                  sourceSize:MTLSizeMake(ll, y1 - y0, 1)
+                   toTexture:s->tex
+            destinationSlice:0
+            destinationLevel:0
+           destinationOrigin:MTLOriginMake(0, y0, 0)];
+        s->ack = change;
+        s->have = true;
+        __atomic_store_n(&h->ack, change, __ATOMIC_RELEASE);
+        h->shown++;                     /* the window's count: the Wimp's times shown */
+    }
+    if (blit) {
+        [blit endEncoding];
+    }
+}
+
+/* Each display's picture, where the Wimp places it and where it is seen */
+static void surf_vdus(id<MTLRenderCommandEncoder> enc, bool shot, CGSize target,
+                      uint32_t xres, uint32_t yres)
+{
+    const MetalSurfacesView *v = &surf.view;
+    double sx = target.width / MAX(xres, 1u), sy = target.height / MAX(yres, 1u);
+    id<MTLRenderPipelineState> pipe = shot ? vd.pipe_shot : vd.pipe;
+
+    if (!surf.on || !v->nvdus || !pipe) {
+        return;
+    }
+    for (uint32_t i = 0; i < v->nvdus; i++) {
+        const MetalVdu *e = &v->vdu[i];
+        VdSlot *s = vd_slot(e->offset, false);
+        VdU u;
+
+        if (!s || !s->have || !s->tex) {
+            continue;
+        }
+        memset(&u, 0, sizeof(u));
+        u.box[0] = e->x * sx, u.box[1] = e->y * sy;
+        u.box[2] = e->w * sx, u.box[3] = e->h * sy;
+        u.target[0] = target.width, u.target[1] = target.height;
+        u.w = s->w, u.h = s->h, u.ll = s->ll, u.l2 = s->l2, u.format = s->format, u.flags = s->flags;
+        [enc setRenderPipelineState:pipe];
+        [enc setFragmentBytes:s->palette length:sizeof(s->palette) atIndex:1];
+        [enc setFragmentTexture:s->tex atIndex:0];
+        for (uint32_t r = 0; r < e->nrects; r++) {
+            const int16_t *q = v->rect[e->rects + r];
+
+            u.clip[0] = floor(q[0] * sx), u.clip[1] = floor(q[1] * sy);
+            u.clip[2] = ceil(q[2] * sx), u.clip[3] = ceil(q[3] * sy);
+            if (u.clip[2] <= u.clip[0] || u.clip[3] <= u.clip[1]) {
+                continue;
+            }
+            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+    }
+}
+
 /* The clock's face and the meter's graph, into the drawable at its own
  * resolution, clipped to what can be seen of each, over the scaled
  * frame (enc is its encoder) */
@@ -6833,6 +7190,9 @@ static bool surf_face_due(void)
     if (!surf.on) {
         return false;
     }
+    if (vd_due()) {
+        return true;                    /* a virtual display has changed: at once */
+    }
     for (uint32_t i = 0; i < v->nicons; i++) {
         if (v->icon[i].kind == 1 && v->icon[i].nrects) {
             /* the rate the clock asks (a smooth second hand) while the
@@ -7224,6 +7584,7 @@ static bool metal_render_frame(void)
     if (have_fb) {
         surf_gamepane_render(cb);
         surf_scene3d_render(cb, target, v.xres, v.yres);
+        vd_take(cb);                    /* the virtual displays' changed rows */
     }
     enc = [cb renderCommandEncoderWithDescriptor:rp];
     if (have_fb && !fb.scale && !fb_build_scale()) {
@@ -7249,6 +7610,7 @@ static bool metal_render_frame(void)
     }
 
     if (have_fb && surf.on) {
+        surf_vdus(enc, false, target, v.xres, v.yres);
         surf_gamepanes(enc, target, v.xres, v.yres);
         surf_tiles(enc, false, target, v.xres, v.yres);
         surf_tower(enc, false, target, v.xres, v.yres);
@@ -7536,6 +7898,7 @@ static bool metal_screenshot_to(NSString *path)
             [senc drawPrimitives:MTLPrimitiveTypeTriangle
                      vertexStart:0 vertexCount:3];
             /* the icons this window draws itself, as the window shows them */
+            surf_vdus(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_gamepanes(senc, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_tiles(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
             surf_tower(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);

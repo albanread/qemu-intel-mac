@@ -79,6 +79,11 @@ typedef struct MetalBoard {
     /* The HostNet doorbell (metal.h): 1 open, 0 closed; and the switch. */
     int (*sockets)(void);
     void (*hostnet_apply)(bool on);
+
+    /* The grab (design 55): a rectangle of the composed frame the guest
+     * asked for, and the answer (metal.h's metal_glue_grab_*); NULL: none */
+    bool (*grab_pending)(MetalGrab *g);
+    void (*grab_done)(uint32_t seq, uint32_t status, uint32_t frame);
 } MetalBoard;
 
 /* From a type_init constructor, before the machine exists. */

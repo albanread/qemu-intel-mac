@@ -156,8 +156,12 @@ typedef struct MetalSurface {
      * copies of the backings in a GPU's own memory */
     uint32_t damage, ndamage;
     uint32_t window;                /* the Wimp's handle: a backing's copy is its */
+    uint32_t gen;                   /* its backing's generation: a copy is kept by it */
+    uint32_t aoff;                  /* all of it in the list's stage, when its damage is
+                                       all: its place there (w * 4 a row), or METAL_NO_STAGE */
 } MetalSurface;
 #define METAL_DAMAGE_ALL 0xFFFFFFFFu
+#define METAL_NO_STAGE   0xFFFFFFFFu
 /* An icon whose picture the window draws itself (screen.h's
  * ROS_SURF_CLOCK, ROS_SURF_MONITOR): DeskClock's face and DeskMeter's
  * graph, at the window's own resolution */
@@ -199,6 +203,12 @@ typedef struct MetalSurfacesView {
     MetalSurface s[METAL_SURFACES];
     uint32_t nrects;
     int16_t rect[METAL_SURF_RECTS][4];  /* x0 y0 x1 y1, half-open */
+    /* staging (block v2 version 4): the list's changed pixels, copied by
+     * the Wimp at the publish, at stage_off in the region (METAL_NO_STAGE:
+     * none, the backings are read); a damage rectangle's pixels at
+     * stage_off + rsoff[its index], (x1 - x0) * 4 bytes a row */
+    uint32_t stage_off, stage_size;
+    uint32_t rsoff[METAL_SURF_RECTS];
     uint32_t nicons;
     MetalIcon icon[METAL_ICONS];
     /* Every external window's page place (ROS_SURF_PAGE), whoever draws
@@ -223,6 +233,23 @@ int metal_glue_surfaces_view(MetalSurfacesView *out);
 void metal_glue_surfaces_ack(uint32_t frame);
 bool metal_glue_surfaces_pending(void);
 void metal_glue_beat(void);
+
+/*
+ * The grab (design 55): the guest asks for a rectangle of the frame this
+ * window composes -- what the screen really shows, for a magnifier -- in
+ * block v2.  pending fills *g when a request is waiting (seq != ack); the
+ * window writes the rectangle into the region at g->offset, w * 4 bytes a
+ * row, top row first, R G B 0, black off the screen, and calls done with
+ * the request's seq (status 0, or why not).  Thread: UI.
+ */
+typedef struct MetalGrab {
+    uint32_t seq;
+    int32_t x, y;                   /* top left, guest pixels, y down */
+    uint32_t w, h;
+    uint32_t offset, size;          /* the buffer in the region */
+} MetalGrab;
+bool metal_glue_grab_pending(MetalGrab *g);
+void metal_glue_grab_done(uint32_t seq, uint32_t status, uint32_t frame);
 
 #ifdef __OBJC__
 /* metal-browser.m: the host channel and the browser's pages, for metal.m */

@@ -92,6 +92,9 @@ typedef struct VgMode {
 #define ROSGD_PRESENT_WINDOWS_ONLY 2u           /* the clock's and the meter's faces are
                                                    their tasks' own, not drawn here */
 #define ROSGD_PRESENT_REGION    4u              /* backings are drawn only from the region */
+#define ROSGD_PRESENT_STAGING   16u             /* the pixels from a list's staging buffer
+                                                   (version 4), never from a backing */
+#define ROSGD_PRESENT_GRAB      32u             /* it answers block v2's grab (design 55) */
 #define ROSGD_PRESENT_SNAPSHOT  8u              /* the ack once the damage is copied: the Wimp
                                                    draws into no backing till then */
 #define ROSGD_SCREEN_SURF       (ROSGD_SCREEN_PRESENT + 16u)
@@ -138,7 +141,23 @@ typedef struct RosgdV2 {
     uint64_t shm_base;          /* version 3: the region, guest-physical */
     uint32_t shm_size, shm_used;
     uint32_t offset[ROSGD_V2_SURFACES];
+    /* version 4: staging -- the list's changed pixels in one of two
+     * buffers in the region, copied there by the Wimp at the publish */
+    uint32_t stage;             /* 1 + the buffer, 0 none */
+    uint32_t stage_size;
+    uint32_t stage_offset[2];
+    uint32_t gen[ROSGD_V2_SURFACES];
+    uint32_t aoff[ROSGD_V2_SURFACES];
+    uint32_t sdoff[ROSGD_V2_SDAMAGE];
+    /* the grab (design 55): a rectangle of the composed frame, asked for
+     * by the guest; found by its magic */
+    struct {
+        uint32_t magic, seq, ack, status;
+        int16_t x, y, w, h;
+        uint32_t offset, size, frame;
+    } grab;
 } RosgdV2;
+#define ROSGD_GRAB_MAGIC        0x42415247u     /* "GRAB" */
 
 /* The compositor's pages in the region (rosgd/include/rosgd/presentwire.h):
  * past the box's backings, 256 MB since 28 Oct 2026 (a 3D scene's pages);
@@ -164,6 +183,8 @@ typedef struct RosgdPages {
 QEMU_BUILD_BUG_ON(sizeof(RosgdPage) != 48);
 QEMU_BUILD_BUG_ON(sizeof(RosgdV2Surface) != 96);
 QEMU_BUILD_BUG_ON(offsetof(RosgdV2, shm_base) != 38944);
+QEMU_BUILD_BUG_ON(offsetof(RosgdV2, stage) != 39472);
+QEMU_BUILD_BUG_ON(offsetof(RosgdV2, grab) != 44608);
 QEMU_BUILD_BUG_ON(sizeof(RosgdV2) > ROSGD_V2_SIZE);
 
 /* The backing of the resource scanout 0 shows: a copy of its iovec,
@@ -392,7 +413,8 @@ static void vg_announce(const VgBacking *b, const VgMode *m)
     p.state = cpu_to_le32(2);
     p.beat = cpu_to_le32(++beat);
     p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION
-                         | (mode == VG_SURF_ON ? ROSGD_PRESENT_SNAPSHOT : 0));
+                         | (mode == VG_SURF_ON ? ROSGD_PRESENT_SNAPSHOT | ROSGD_PRESENT_STAGING
+                                                 | ROSGD_PRESENT_GRAB : 0));
     iov_from_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_PRESENT,
                  &p, sizeof(p));
     if (mode != VG_SURF_PROBE) {
@@ -678,6 +700,47 @@ static bool vg_surfaces_pending(void)
     return !(f & 1) && f != vg_taken;
 }
 
+/* The grab (design 55): a request waiting in block v2 */
+static bool vg_grab_pending(MetalGrab *g)
+{
+    size_t off;
+    typeof(((RosgdV2 *)0)->grab) gr;
+
+    if (vg_surfaces_mode() != VG_SURF_ON || !view.g || !view.mode.described
+        || !(off = vg_v2_offset(&view.b, &view.mode))
+        || iov_to_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, grab), &gr,
+                      sizeof(gr)) != sizeof(gr)
+        || le32_to_cpu(gr.magic) != ROSGD_GRAB_MAGIC || gr.seq == gr.ack) {
+        return false;
+    }
+    g->seq = le32_to_cpu(gr.seq);
+    g->x = (int16_t)le16_to_cpu(gr.x);
+    g->y = (int16_t)le16_to_cpu(gr.y);
+    g->w = (uint16_t)le16_to_cpu(gr.w);
+    g->h = (uint16_t)le16_to_cpu(gr.h);
+    g->offset = le32_to_cpu(gr.offset);
+    g->size = le32_to_cpu(gr.size);
+    return true;
+}
+
+/* ... answered: status and frame, then the ack the guest waits on */
+static void vg_grab_done(uint32_t seq, uint32_t status, uint32_t frame)
+{
+    size_t off;
+    uint32_t le;
+
+    if (!view.g || !view.mode.described || !(off = vg_v2_offset(&view.b, &view.mode))) {
+        return;
+    }
+    le = cpu_to_le32(status);
+    iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, grab.status), &le, 4);
+    le = cpu_to_le32(frame);
+    iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, grab.frame), &le, 4);
+    smp_wmb();
+    le = cpu_to_le32(seq);
+    iov_from_buf(view.b.iov, view.b.niov, off + offsetof(RosgdV2, grab.ack), &le, 4);
+}
+
 static int vg_surfaces_view(MetalSurfacesView *out)
 {
     static RosgdV2 *v;
@@ -754,6 +817,13 @@ static int vg_surfaces_view(MetalSurfacesView *out)
     out->region = host;
     out->region_size = host ? v->shm_size : 0;
     out->look = v->look;
+    /* this list's staging buffer, if it has one: where it starts in the region */
+    out->stage_off = METAL_NO_STAGE;
+    if (v->version >= 4 && (v->stage == 1 || v->stage == 2) && host
+        && (uint64_t)v->stage_offset[v->stage - 1] + v->stage_size <= v->shm_size) {
+        out->stage_off = v->stage_offset[v->stage - 1];
+        out->stage_size = v->stage_size;
+    }
     out->n = 0;
     out->nrects = 0;
     out->nicons = 0;
@@ -828,6 +898,9 @@ static int vg_surfaces_view(MetalSurfacesView *out)
         d->offset = o;
         d->stride = e->stride;
         d->window = e->window;
+        d->gen = v->version >= 4 ? v->gen[k] : 0;
+        d->aoff = out->stage_off != METAL_NO_STAGE && v->aoff[k] != ROSGD_V2_NO_OFFSET
+                  ? v->aoff[k] : METAL_NO_STAGE;
         d->radius = e->data[1];
         d->shadow_dx = e->shadow_dx, d->shadow_dy = e->shadow_dy;
         d->shadow_blur = e->shadow_blur, d->shadow_strength = e->shadow_strength;
@@ -863,6 +936,8 @@ static int vg_surfaces_view(MetalSurfacesView *out)
 
                 out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
                 out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+                out->rsoff[out->nrects] = out->stage_off != METAL_NO_STAGE
+                                          ? v->sdoff[e->damage + r] : METAL_NO_STAGE;
                 out->nrects++;
             }
             d->ndamage = out->nrects - d->damage;
@@ -1016,6 +1091,8 @@ static const MetalBoard vg_board = {
     .surfaces_view  = vg_surfaces_view,
     .surfaces_ack   = vg_surfaces_ack,
     .surfaces_pending = vg_surfaces_pending,
+    .grab_pending   = vg_grab_pending,
+    .grab_done      = vg_grab_done,
     .beat           = vg_beat,
     .capture        = vg_capture,
 };

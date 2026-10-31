@@ -2852,7 +2852,7 @@ typedef struct SQuad {
  * damage each new list carries; let go when unused a while */
 #define SURF_TEX 160
 static struct {
-    uint32_t window, offset, w, h, stride;
+    uint32_t window, offset, w, h, stride, gen;
     id<MTLTexture> tex;
     uint32_t idle;                      /* lists since it was last in one */
 } stex[SURF_TEX];
@@ -3052,7 +3052,7 @@ static id<MTLTexture> surf_texture(const MetalSurface *e, bool *whole)
     for (k = 0; k < SURF_TEX; k++) {
         if (stex[k].tex && stex[k].window == e->window && stex[k].offset == e->offset
             && stex[k].w == (uint32_t)e->w && stex[k].h == (uint32_t)e->h
-            && stex[k].stride == e->stride) {
+            && stex[k].stride == e->stride && stex[k].gen == e->gen) {
             return stex[k].tex;
         }
         if (spare < 0 && (!stex[k].tex || stex[k].idle > 120)) {
@@ -3074,7 +3074,7 @@ static id<MTLTexture> surf_texture(const MetalSurface *e, bool *whole)
         stex[k].tex = [m.device newTextureWithDescriptor:td];
     }
     stex[k].window = e->window, stex[k].offset = e->offset;
-    stex[k].w = e->w, stex[k].h = e->h, stex[k].stride = e->stride;
+    stex[k].w = e->w, stex[k].h = e->h, stex[k].stride = e->stride, stex[k].gen = e->gen;
     stex[k].idle = 0;
     *whole = stex[k].tex != nil;
     return stex[k].tex;
@@ -3086,7 +3086,7 @@ static id<MTLTexture> surf_texture_of(const MetalSurface *e)
     for (int k = 0; k < SURF_TEX; k++) {
         if (stex[k].tex && stex[k].window == e->window && stex[k].offset == e->offset
             && stex[k].w == (uint32_t)e->w && stex[k].h == (uint32_t)e->h
-            && stex[k].stride == e->stride) {
+            && stex[k].stride == e->stride && stex[k].gen == e->gen) {
             return stex[k].tex;
         }
     }
@@ -3112,11 +3112,134 @@ static void surf_blit(id<MTLBlitCommandEncoder> b, id<MTLTexture> t, const Metal
     destinationOrigin:MTLOriginMake(x0, y0, 0)];
 }
 
-/* A new list taken: its damage copied out of the backings into their
- * textures, by the GPU, waited for, and then the list acked -- the Wimp
- * draws into the backings again only after that.  Called at every pass of
- * the loop, a frame presented or not (and with the window minimised), so
- * that the Wimp is never kept waiting for a frame nobody sees. */
+/*
+ * Staging (31 Oct, the redraw review): the damage is copied out of the
+ * region by the CPU, into a buffer of the host's own, and the list acked
+ * at once; the GPU then copies from that buffer into the textures, in its
+ * queue's order, behind the frames in flight.  Copied by the GPU straight
+ * from the region, the ack had to wait for the copy, and so for every
+ * frame queued before it -- up to three, on a slow GPU past the Wimp's
+ * 40 ms, after which the Wimp drew on without waiting and windows were
+ * copied half drawn.  A buffer is used again once its copy has completed;
+ * with none free, or too much to copy, the copy is the GPU's from the
+ * region and waited for, as before.
+ */
+#define SURF_STAGES 4
+#define SURF_STAGE_MAX (64u << 20)
+
+static struct {
+    id<MTLBuffer> buf;
+    int busy;                           /* a copy from it not yet completed (atomic) */
+} sstage[SURF_STAGES];
+
+static uint64_t surf_staged, surf_unstaged;     /* lists taken each way */
+
+/* the pacing line's: how the lists went, every thousand */
+static void surf_stage_note(void)
+{
+    if ((surf_staged + surf_unstaged) % 1000 == 0) {
+        metal_log("surfaces: %llu lists staged, %llu copied from the region and waited for",
+                  (unsigned long long)surf_staged, (unsigned long long)surf_unstaged);
+    }
+}
+
+/* a rectangle clipped to its backing: false if empty */
+static bool surf_clip(const MetalSurface *e, int *x0, int *y0, int *x1, int *y1)
+{
+    *x0 = MAX(*x0, 0), *y0 = MAX(*y0, 0), *x1 = MIN(*x1, e->w), *y1 = MIN(*y1, e->h);
+    return *x1 > *x0 && *y1 > *y0;
+}
+
+/* a free staging buffer of at least n bytes, or -1 */
+static int surf_stage_get(uint64_t n)
+{
+    for (int k = 0; k < SURF_STAGES; k++) {
+        if (__atomic_load_n(&sstage[k].busy, __ATOMIC_ACQUIRE)) {
+            continue;
+        }
+        if (!sstage[k].buf || sstage[k].buf.length < n) {
+            uint64_t len = MAX(n, (uint64_t)8 << 20);
+
+            [sstage[k].buf release];
+            sstage[k].buf = [m.device newBufferWithLength:len options:MTLResourceStorageModeShared];
+            if (!sstage[k].buf) {
+                continue;
+            }
+        }
+        return k;
+    }
+    return -1;
+}
+
+/* One rectangle of a backing into the staging buffer at *at, and the copy
+ * from there into its texture encoded */
+static uint64_t surf_stage_rect(id<MTLBlitCommandEncoder> b, id<MTLTexture> t, const MetalSurface *e,
+                                id<MTLBuffer> sb, uint64_t *at, int x0, int y0, int x1, int y1,
+                                const uint8_t *src, size_t srow, int ox, int oy)
+{
+    if (!surf_clip(e, &x0, &y0, &x1, &y1)) {
+        return 0;
+    }
+    uint8_t *dst = (uint8_t *)sb.contents + *at;
+    size_t row = (size_t)(x1 - x0) * 4;
+
+    /* src is the pixel at (ox, oy), srow bytes a row: the backing itself,
+     * or what the Wimp staged of it */
+    for (int y = y0; y < y1; y++) {
+        memcpy(dst + (size_t)(y - y0) * row, src + (size_t)(y - oy) * srow + (size_t)(x0 - ox) * 4, row);
+    }
+    [b copyFromBuffer:sb
+         sourceOffset:*at
+    sourceBytesPerRow:row
+  sourceBytesPerImage:row * (size_t)(y1 - y0)
+           sourceSize:MTLSizeMake(x1 - x0, y1 - y0, 1)
+            toTexture:t
+     destinationSlice:0
+     destinationLevel:0
+    destinationOrigin:MTLOriginMake(x0, y0, 0)];
+    *at += row * (size_t)(y1 - y0);
+    return row * (size_t)(y1 - y0);
+}
+
+/* Whether n bytes at off are within the list's stage (the guest's word) */
+static bool surf_in_stage(const MetalSurfacesView *v, uint32_t off, uint64_t n)
+{
+    return v->stage_off != METAL_NO_STAGE && off != METAL_NO_STAGE && (uint64_t)off + n <= v->stage_size;
+}
+
+/* What a list's copies need of a staging buffer, in bytes */
+static uint64_t surf_stage_need(const MetalSurfacesView *v)
+{
+    uint64_t n = 0;
+
+    for (uint32_t i = 0; i < v->n; i++) {
+        const MetalSurface *e = &v->s[i];
+
+        if (e->format != 0) {
+            continue;
+        }
+        /* no texture yet: one is made, and filled whole */
+        if (!surf_texture_of(e) || e->ndamage == METAL_DAMAGE_ALL) {
+            n += (uint64_t)e->w * e->h * 4;
+        } else {
+            for (uint32_t r = 0; r < e->ndamage; r++) {
+                const int16_t *q = v->rect[e->damage + r];
+                int x0 = q[0], y0 = q[1], x1 = q[2], y1 = q[3];
+
+                if (surf_clip(e, &x0, &y0, &x1, &y1)) {
+                    n += (uint64_t)(x1 - x0) * (y1 - y0) * 4;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+/* A new list taken: its damage copied out of the backings, and then the
+ * list acked -- the Wimp draws into the backings again only after that.
+ * Called at every pass of the loop, a frame presented or not (and with the
+ * window minimised), so that the Wimp is never kept waiting for a frame
+ * nobody sees. */
 static void surf_take(void)
 {
     const MetalSurfacesView *v = &surf.taken;
@@ -3126,6 +3249,95 @@ static void surf_take(void)
 
     if (v->frame == surf.uploaded_frame) {
         return;
+    }
+    if (surf.on && surf.tex_mode && surf.region.contents) {
+        uint64_t need = surf_stage_need(v);
+        int k = need && need <= SURF_STAGE_MAX ? surf_stage_get(need) : -1;
+
+        if (k >= 0) {
+            id<MTLBuffer> sb = sstage[k].buf;
+            uint64_t at = 0;
+
+            for (int j = 0; j < SURF_TEX; j++) {
+                stex[j].idle++;
+            }
+            cb = [m.queue commandBuffer];
+            for (uint32_t i = 0; i < v->n; i++) {
+                const MetalSurface *e = &v->s[i];
+                bool whole;
+                id<MTLTexture> t;
+
+                if (e->format != 0 || !(t = surf_texture(e, &whole))) {
+                    continue;
+                }
+                for (int j = 0; j < SURF_TEX; j++) {
+                    if (stex[j].tex == t) {
+                        stex[j].idle = 0;
+                    }
+                }
+                if (!whole && e->ndamage == 0) {
+                    continue;
+                }
+                if (!b) {
+                    b = [cb blitCommandEncoder];
+                }
+                const uint8_t *reg = (const uint8_t *)surf.region.contents;
+
+                if (whole || e->ndamage == METAL_DAMAGE_ALL) {
+                    /* all of it: from the stage when the Wimp staged it
+                     * whole, else from the backing (a copy made again
+                     * here, which the list did not know of) */
+                    if (surf_in_stage(v, e->aoff, (uint64_t)e->w * e->h * 4)) {
+                        bytes += surf_stage_rect(b, t, e, sb, &at, 0, 0, e->w, e->h,
+                                                 reg + v->stage_off + e->aoff, (size_t)e->w * 4, 0, 0);
+                    } else {
+                        bytes += surf_stage_rect(b, t, e, sb, &at, 0, 0, e->w, e->h,
+                                                 reg + e->offset, e->stride, 0, 0);
+                    }
+                } else {
+                    for (uint32_t r = 0; r < e->ndamage; r++) {
+                        const int16_t *q = v->rect[e->damage + r];
+                        uint32_t so = v->rsoff[e->damage + r];
+
+                        if (surf_in_stage(v, so, (uint64_t)MAX(q[2] - q[0], 0) * MAX(q[3] - q[1], 0) * 4)) {
+                            if (q[2] > q[0] && q[3] > q[1]) {
+                                bytes += surf_stage_rect(b, t, e, sb, &at, q[0], q[1], q[2], q[3],
+                                                         reg + v->stage_off + so,
+                                                         (size_t)(q[2] - q[0]) * 4, q[0], q[1]);
+                            }
+                        } else {
+                            bytes += surf_stage_rect(b, t, e, sb, &at, q[0], q[1], q[2], q[3],
+                                                     reg + e->offset, e->stride, 0, 0);
+                        }
+                    }
+                }
+            }
+            if (b) {
+                int *busy = &sstage[k].busy;
+
+                [b endEncoding];
+                __atomic_store_n(busy, 1, __ATOMIC_RELEASE);
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                    (void)done;
+                    __atomic_store_n(busy, 0, __ATOMIC_RELEASE);
+                }];
+                [cb commit];
+                surf.copied += bytes;
+                surf.copies++;
+            }
+            surf_staged++;
+            surf_stage_note();
+            /* the pixels are the host's own now: the backings are the
+             * Wimp's again */
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            surf.uploaded_frame = v->frame;
+            metal_glue_surfaces_ack(v->frame);
+            return;
+        }
+        if (need) {                     /* nothing to copy is no wait */
+            surf_unstaged++;
+            surf_stage_note();
+        }
     }
     if (surf.on && surf.tex_mode) {
         for (int k = 0; k < SURF_TEX; k++) {
@@ -5530,8 +5742,20 @@ typedef struct S3U {                /* a draw's uniforms: the same in the shader
     int32_t terr[4];                /* vertices a side, the mesh's bones, the patch's px, pz */
     int32_t edge[4];                /* a side: its first vertex i, j and its step */
     float vsize[4];                 /* the target's width and height */
+    float haze[4];                  /* version 3 (SCENE3D.md 14): the haze; w the edge,
+                                       0 none, 1 a circle, 2 a square */
+    float edg[4];                   /* the edge: centre x, z, r0 (clear), r1 (haze) */
+    float eye[4];                   /* the eye */
 } S3U;
-_Static_assert(sizeof(S3U) == 288, "a scene draw's uniforms are 288 bytes");
+_Static_assert(sizeof(S3U) == 336, "a scene draw's uniforms are 336 bytes");
+
+typedef struct S3SkyU {             /* the sky's uniforms (SCENE3D.md 14.4) */
+    float rx[4], ry[4], rz[4];      /* the ray: rx ndc.x + ry ndc.y + rz */
+    float zen[4], hor[4], cloud[4]; /* the env's sky rows */
+    float haze[4];                  /* sky_rgb */
+    float sun_dir[4], sun_rgb[4];
+    float misc[4];                  /* seconds, the wind's angle, the quality drawn, 0 */
+} S3SkyU;
 
 typedef struct S3ShowU {
     float box[4], clip[4], target[4];
@@ -5549,13 +5773,27 @@ static NSString * const S3_SRC = @""
 "    float4 vp[4];\n"
 "    float4 sun_dir, sun_rgb, amb, player, object, tint, tm, tsize, am, side;\n"
 "    int4 mode, terr, edge;\n"
-"    float4 vsize;\n"
+"    float4 vsize, haze, edg, eye;\n"
 "};\n"
-"struct V { float4 pos [[position]]; float2 uv; float3 n; float2 wxz; float lod [[flat]]; };\n"
+"struct V { float4 pos [[position]]; float2 uv; float3 n; float2 wxz; float wy; float lod [[flat]]; };\n"
 "static float4 clip_of(constant S3U &u, float3 p) {\n"
 "    return u.vp[0] * p.x + u.vp[1] * p.y + u.vp[2] * p.z + u.vp[3];\n"
 "}\n"
 "static float4 metal_z(float4 c) { return float4(c.x, c.y, (c.z + c.w) * 0.5, c.w); }\n"
+"/* GLSL's smoothstep, for a > b too */\n"
+"static float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }\n"
+"/* version 3: the map's edge into the haze, which darkens below the horizon (SCENE3D.md 14.4) */\n"
+"static float3 edge_c(constant S3U &u, float3 p, float3 c) {\n"
+"    if (u.haze.w == 0.0) return c;\n"
+"    float dx = p.x - u.edg.x, dz = p.z - u.edg.y;\n"
+"    float r = u.haze.w > 1.5 ? max(abs(dx), abs(dz)) : sqrt(dx * dx + dz * dz);\n"
+"    float e = ss(u.edg.w, u.edg.z, r);\n"
+"    if (e >= 1.0) return c;\n"
+"    float3 d = p - u.eye.xyz;\n"
+"    float l = max(sqrt(d.x * d.x + d.y * d.y + d.z * d.z), 1e-6);\n"
+"    float3 hz = u.haze.rgb * (1.0 - 0.12 * ss(0.0, 0.5, -d.y / l));\n"
+"    return hz + (c - hz) * e;\n"
+"}\n"
 "static int hraw(texture2d<ushort> h, int i, int j) { return int(h.read(uint2(i, j)).r); }\n"
 "static float3 tpos(texture2d<ushort> h, int i, int j, int verts) {\n"
 "    int hi = clamp(i, 0, verts - 1), hj = clamp(j, 0, verts - 1);\n"
@@ -5590,7 +5828,7 @@ static NSString * const S3_SRC = @""
 "    float l = r > 1.0 ? 0.5 * log2(r) : 0.0;\n"
 "    return min(floor(l), u.tsize.z);\n"
 "}\n"
-"struct TV { float4 pos [[position]]; float2 wxz; float3 light; float lod [[flat]]; int2 g [[flat]]; uint sc [[flat]]; };\n"
+"struct TV { float4 pos [[position]]; float2 wxz; float wy; float3 light; float lod [[flat]]; int2 g [[flat]]; uint sc [[flat]]; };\n"
 "/* a splat: a quad over its tile, its splat by vid / 6 */\n"
 "vertex TV s3_splat_vs(uint vid [[vertex_id]], constant S3U &u [[buffer(0)]],\n"
 "                     const device uint *spl [[buffer(1)]], texture2d<ushort> hg [[texture(0)]]) {\n"
@@ -5615,6 +5853,7 @@ static NSString * const S3_SRC = @""
 "    TV o;\n"
 "    o.pos = metal_z(c[me]);\n"
 "    o.wxz = float2(float(ci) * 4.0, float(cj) * 4.0);\n"
+"    o.wy = tpos(hg, ci, cj, verts).y;\n"
 "    o.light = u.sun_rgb.rgb * ndl;\n"
 "    o.lod = u.mode.y != 0 ? tri_lod(u, c[0], c[1], c[2], uv[0], uv[1], uv[2]) : 0.0;\n"
 "    o.g = int2(gi, gj);\n"
@@ -5631,7 +5870,7 @@ static NSString * const S3_SRC = @""
 "    float4 base = u.mode.y != 0 ? tex.sample(smp, uv, level(in.lod)) : float4(0.5, 0.5, 0.5, 1.0);\n"
 "    float f = los.sample(lin, float2((x / 4.0 + 0.5) / 520.0, (z / 4.0 + 0.5) / 513.0)).r;\n"
 "    f = clamp(f - 0.03, 0.0, 1.0) / (1.0 - 0.03);\n"
-"    float3 c = clamp(base.rgb * (in.light + u.amb.rgb) * f, 0.0, 1.0);\n"
+"    float3 c = edge_c(u, float3(x, in.wy, z), clamp(base.rgb * (in.light + u.amb.rgb) * f, 0.0, 1.0));\n"
 "    if ((u.mode.x & 256) == 0) return float4(c, 1.0);\n"
 "    uint shape = in.sc & 15u, code = (in.sc >> 4) & 7u;\n"
 "    float s = x / 4.0 - float(in.g.x), t = z / 4.0 - float(in.g.y);\n"
@@ -5701,6 +5940,7 @@ static NSString * const S3_SRC = @""
 "    o.uv = v.uv;\n"
 "    o.n = n;\n"
 "    o.wxz = float2(p.x, p.z);\n"
+"    o.wy = p.y;\n"
 "    o.lod = -1.0;\n"
 "    return o;\n"
 "}\n"
@@ -5733,7 +5973,58 @@ static NSString * const S3_SRC = @""
 "        f = los.sample(lin, float2((in.wxz.x / 4.0 + 0.5) / 520.0, (in.wxz.y / 4.0 + 0.5) / 513.0)).r;\n"
 "        f = clamp(f - 0.03, 0.0, 1.0) / (1.0 - 0.03);\n"
 "    }\n"
-"    return float4(clamp(rgb * light * u.tint.rgb * f, 0.0, 1.0), 1.0);\n"
+"    return float4(edge_c(u, float3(in.wxz.x, in.wy, in.wxz.y), clamp(rgb * light * u.tint.rgb * f, 0.0, 1.0)), 1.0);\n"
+"}\n"
+"/* the sky (SCENE3D.md 14.4): a triangle over the screen at the far plane */\n"
+"struct SkyU { float4 rx, ry, rz, zen, hor, cloud, haze, sun_dir, sun_rgb, misc; };\n"
+"struct SkyV { float4 pos [[position]]; float3 ray; };\n"
+"vertex SkyV s3_sky_vs(uint vid [[vertex_id]], constant SkyU &u [[buffer(0)]]) {\n"
+"    float2 c = float2(vid == 1u ? 3.0 : -1.0, vid == 2u ? 3.0 : -1.0);\n"
+"    SkyV o;\n"
+"    o.pos = float4(c, 1.0, 1.0);\n"
+"    o.ray = u.rx.xyz * c.x + u.ry.xyz * c.y + u.rz.xyz;\n"
+"    return o;\n"
+"}\n"
+"static float hashf(uint i, uint j) {\n"
+"    uint k = (i * 0x8da6b343u) ^ (j * 0xd8163841u);\n"
+"    k ^= k >> 15; k *= 0x2c1b3c6du; k ^= k >> 12; k *= 0x297a2d39u; k ^= k >> 15;\n"
+"    return float(k >> 8) * (1.0 / 16777216.0);\n"
+"}\n"
+"static float vnoise(float2 p) {\n"
+"    float2 f = floor(p), t = p - f, w = t * t * (3.0 - 2.0 * t);\n"
+"    uint i = uint(int(f.x)), j = uint(int(f.y));\n"
+"    float a = hashf(i, j), b = hashf(i + 1u, j), c = hashf(i, j + 1u), d = hashf(i + 1u, j + 1u);\n"
+"    float top = a + (b - a) * w.x, bot = c + (d - c) * w.x;\n"
+"    return top + (bot - top) * w.y;\n"
+"}\n"
+"fragment float4 s3_sky_fs(SkyV in [[stage_in]], constant SkyU &u [[buffer(0)]]) {\n"
+"    float3 d = nz(in.ray);\n"
+"    float h = d.y, g = h * (2.0 - h);\n"
+"    float3 col = u.hor.rgb + (u.zen.rgb - u.hor.rgb) * g;\n"
+"    float mu = max(-(d.x * u.sun_dir.x + d.y * u.sun_dir.y + d.z * u.sun_dir.z), 0.0);\n"
+"    float3 glow = float3(0.0);\n"
+"    int q = int(u.misc.z);\n"
+"    if (q >= 1) {\n"
+"        float m2 = mu * mu, m4 = m2 * m2, m8 = m4 * m4, m16 = m8 * m8, m32 = m16 * m16, m64 = m32 * m32;\n"
+"        glow = u.sun_rgb.rgb * (0.18 * m8 + 0.35 * m64);\n"
+"        col += glow + u.sun_rgb.rgb * (0.8 * ss(0.9990, 0.9996, mu));\n"
+"    }\n"
+"    float cover = u.zen.w;\n"
+"    if (q < 2) {\n"
+"        col += (u.cloud.rgb - col) * (cover * 0.5);\n"
+"    } else if (h > 0.0) {\n"
+"        float inv = 1.0 / (h + 0.12), t = u.misc.x * 0.01;\n"
+"        float2 qp = float2(d.x * inv + t * cos(u.misc.y) + 1024.0, d.z * inv + t * sin(u.misc.y) + 1024.0);\n"
+"        float n = 0.5 * vnoise(qp) + 0.3 * vnoise(float2(qp.x * 2.03 + 17.0, qp.y * 2.03 + 9.0))\n"
+"                + 0.2 * vnoise(float2(qp.x * 4.11 + 5.0, qp.y * 4.11 + 31.0));\n"
+"        float th = 0.75 - 0.5 * cover;\n"
+"        float a = ss(th - 0.12, th + 0.12, n) * ss(0.0, 0.2, h);\n"
+"        float3 cc = u.cloud.rgb * (0.8 + 0.2 * mu) + 0.5 * glow;\n"
+"        col += (cc - col) * a;\n"
+"    }\n"
+"    float k = ss(0.0, u.hor.w, h);\n"
+"    float3 hz = u.haze.rgb * (1.0 - 0.12 * ss(0.0, 0.5, -h));\n"
+"    return float4(clamp(hz + (col - hz) * k, 0.0, 1.0), 1.0);\n"
 "}\n"
 "struct ShowU { float4 box, clip, target; };\n"
 "struct SV { float4 pos [[position]]; };\n"
@@ -5787,11 +6078,14 @@ typedef struct S3Tex {
     id<MTLTexture> t;
     uint16_t w, h;
     uint8_t levels, wrap, opaque;   /* opaque: BC1, whose alpha is 1 whatever the GPU says */
+    uint8_t srgb_tried;             /* smooth and rich: */
+    id<MTLTexture> srgb;            /* its sRGB view, when it is a colour */
 } S3Tex;
 
 static struct {
     bool tried, ok, bc, cpu_bc;
     id<MTLRenderPipelineState> splat, blend, side, model, show, show_shot, hud;
+    id<MTLRenderPipelineState> sky;  /* version 3's sky (none: the clear colour shows) */
     id<MTLDepthStencilState> depth, depth_blend, depth_none;
     id<MTLTexture> canvas;          /* the HUD's canvas (the minimap) */
     id<MTLBuffer> hudq[S3_RING];    /* the HUD's quads, a ring as the instances */
@@ -5812,7 +6106,7 @@ static struct {
     S3Tex tex[ROS_S3_TEX_IDS];
     uint32_t skin[ROS_S3_SKIN_IDS][4];      /* the record's p[0..3]; p[3] the object colour */
     bool skin_have[ROS_S3_SKIN_IDS];
-    struct { uint16_t diffuse; uint32_t base; float m[4]; bool have; } terr[ROS_S3_TERRAIN_IDS];
+    struct { uint16_t diffuse; uint32_t base; float m[4]; bool have; uint16_t norm, spec; } terr[ROS_S3_TERRAIN_IDS];
     uint32_t drawn_frame, drawn_w, drawn_h, drawn_assets, assets;
     uint64_t shown;
 } s3;
@@ -5902,6 +6196,7 @@ static void s3_setup(void)
     s3.show = s3_pipe(lib, @"s3_show_vs", @"s3_show_fs", MTLPixelFormatBGRA8Unorm, false, nil, false);
     s3.show_shot = s3_pipe(lib, @"s3_show_vs", @"s3_show_fs", MTLPixelFormatRGBA8Unorm, false, nil, false);
     s3.hud = s3_pipe(lib, @"s3_hud_vs", @"s3_hud_fs", MTLPixelFormatRGBA8Unorm, true, nil, true);
+    s3.sky = s3_pipe(lib, @"s3_sky_vs", @"s3_sky_fs", MTLPixelFormatRGBA8Unorm, true, nil, false);
     [lib release];
     MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
     dd.depthCompareFunction = MTLCompareFunctionLess;
@@ -5983,6 +6278,7 @@ static void s3_drop(void)
     }
     for (int i = 0; i < ROS_S3_TEX_IDS; i++) {
         [s3.tex[i].t release];
+        [s3.tex[i].srgb release];
     }
     memset(s3.mesh, 0, sizeof(s3.mesh));
     memset(s3.tex, 0, sizeof(s3.tex));
@@ -6100,6 +6396,9 @@ static void s3_texture(const struct ros_s3_record *r, const uint8_t *data)
                                                                                  height:h mipmapped:NO];
     td.mipmapLevelCount = levels;
     td.usage = MTLTextureUsageShaderRead;
+    if (f != S3_TF_R8) {
+        td.usage |= MTLTextureUsagePixelFormatView;     /* smooth and rich: an sRGB view */
+    }
     id<MTLTexture> t = [m.device newTextureWithDescriptor:td];
     if (!t) {
         return;
@@ -6149,6 +6448,8 @@ static void s3_texture(const struct ros_s3_record *r, const uint8_t *data)
     free(rgba);
     S3Tex *x = &s3.tex[r->id];
     [x->t release];
+    [x->srgb release];
+    x->srgb = nil, x->srgb_tried = 0;
     x->t = t;
     x->w = (uint16_t)w, x->h = (uint16_t)h, x->levels = (uint8_t)levels;
     x->wrap = (r->p[2] & ROS_S3_T_WRAP) != 0;
@@ -6238,6 +6539,8 @@ static void s3_assets(const struct ros_scene3d *h)
             case S3_R_TERRAIN:
                 if (r.id && r.id < ROS_S3_TERRAIN_IDS && r.size >= 16) {
                     s3.terr[r.id].diffuse = (uint16_t)r.p[0];
+                    s3.terr[r.id].norm = (uint16_t)(r.p[0] >> 16);     /* smooth and rich */
+                    s3.terr[r.id].spec = (uint16_t)r.p[1];
                     s3.terr[r.id].base = r.p[2];
                     memcpy(s3.terr[r.id].m, d, 16);
                     s3.terr[r.id].have = true;
@@ -6374,6 +6677,1185 @@ static void s3_unpack8(uint32_t w, float o[4])
     }
 }
 
+/* ---- the scene's smooth and rich programs (Antiquity's docs/SCENE3D.md 13) --
+ * The header's quality byte chooses: 0 classic (above), 1 smooth, 2 rich.
+ * Smooth lights every pixel (the sun through the material's normal map, its
+ * specular map's highlight), samples the colour textures through sRGB views
+ * so that they filter in linear light (the alpha test too) and fogs by
+ * distance from the eye.  Rich adds a shadow map from the sun over the
+ * visible terrain (one, 2048 square, four bilinear lookups), the ambient
+ * occlusion maps, the foliage's soft edges within 150 m of the eye (a
+ * second, blended pass round what the alpha test kept) and the sea drawn
+ * as water (waves, the sky by Fresnel, the sun's glint, clearer in the
+ * shallows).  Two libraries are built, rich (S3Q_RICH 1) and smooth
+ * (S3Q_RICH 0), and smooth is drawn with the smaller; if rich will not
+ * build, rich is drawn smooth; if neither will, every quality is drawn
+ * classic; the log says which.
+ * ROSGD_SCENE3D_FAIL_RICH=1 (or _FAIL_SMOOTH=1) breaks one on purpose, for
+ * the fallback's test.  The arithmetic is the twin's (Antiquity's
+ * crates/antiq-scene/src/quality.rs), in the same order. */
+
+typedef struct S3F {                /* the frame's: the same in the shader (256 bytes) */
+    float lvp[16];                  /* world to the shadow map: x, y -1..1, depth 0..1 */
+    float eye[4];                   /* the eye; w the quality drawn */
+    float sun[4];                   /* the map's sun colour; w the highlight's power */
+    float amb[4];                   /* the map's ambient colour */
+    float sunl[4];                  /* the sun's colour decoded to linear */
+    float fogc[4];                  /* the fog's colour, linear; w its density */
+    float fogp[4];                  /* x the least seen through the fog */
+    float sky[4];                   /* the sky's colour, linear */
+    float water[4];                 /* height, wind angle, 1 if any, seconds */
+    float shadow[4];                /* texels a side, 1 / that, depth bias, normal offset (m) */
+    float sun_dir[4];
+    float spare[2][4];
+} S3F;
+_Static_assert(sizeof(S3F) == 256, "a scene frame's uniforms are 256 bytes");
+
+typedef struct S3X {                /* a draw's extra: the same in the shader (64 bytes) */
+    float nsz[4], ssz[4], asz[4];   /* normal, specular, occlusion map: w, h, last level, 1 if there */
+    int32_t q[4];                   /* pass (0 opaque, 1 blended), colour decoded by the view,
+                                       shadows, 0 */
+} S3X;
+_Static_assert(sizeof(S3X) == 64, "a scene draw's extra uniforms are 64 bytes");
+
+#define S3Q_N 2048                  /* the shadow map's side (quality.rs SHADOW_N) */
+#define S3Q_CASTER_ROOM 24.0f       /* metres above the ground a caster may stand */
+
+static NSString * const S3Q_SRC = @""
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct S3U {\n"
+"    float4 vp[4];\n"
+"    float4 sun_dir, sun_rgb, amb, player, object, tint, tm, tsize, am, side;\n"
+"    int4 mode, terr, edge;\n"
+"    float4 vsize, haze, edg, eye;\n"
+"};\n"
+"struct S3F {\n"
+"    float4 lvp[4];\n"
+"    float4 eye, sun, amb, sunl, fogc, fogp, sky, water, shadow, sun_dir;\n"
+"    float4 spare[2];\n"
+"};\n"
+"struct S3X { float4 nsz, ssz, asz; int4 q; };\n"
+"static float4 clip_of(constant S3U &u, float3 p) { return u.vp[0] * p.x + u.vp[1] * p.y + u.vp[2] * p.z + u.vp[3]; }\n"
+"static float4 metal_z(float4 c) { return float4(c.x, c.y, (c.z + c.w) * 0.5, c.w); }\n"
+"static float lin1(float c) { c = max(c, 0.0); return c <= 0.04045 ? c / 12.92 : fast::pow((c + 0.055) / 1.055, 2.4); }\n"
+"static float3 lin3(float3 c) { return float3(lin1(c.x), lin1(c.y), lin1(c.z)); }\n"
+"/* the light decoded by a cubic, the picture encoded by a fit in two square\n"
+" * roots: within half a level of the sRGB curves, and cheap (quality.rs) */\n"
+"static float3 linL(float3 x) { return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878); }\n"
+"static float enc1(float c) {\n"
+"    c = clamp(c, 0.0, 1.0);\n"
+"    if (c <= 0.0031308) return c * 12.92;\n"
+"    float s1 = sqrt(c), s2 = sqrt(s1);\n"
+"    return clamp(0.823708457 * s1 + 0.306517655 * s2 - 0.052050669 * c - 0.078628272, 0.0, 1.0);\n"
+"}\n"
+"static float3 enc3(float3 c) { return float3(enc1(c.x), enc1(c.y), enc1(c.z)); }\n"
+"static float dot3(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }\n"
+"static float3 nz(float3 v) { float l = sqrt(v.x * v.x + v.y * v.y + v.z * v.z); return l > 0.0 ? v / l : v; }\n"
+"static float lod_of(float r, float last) { return min(floor(r > 1.0 ? 0.5 * log2(r) : 0.0), last); }\n"
+"/* the fog: how much is seen through it, a vertex; the colour, a pixel */\n"
+"static float fog_vis(constant S3F &f, float3 p) {\n"
+"    float3 d = p - f.eye.xyz;\n"
+"    float k = sqrt(d.x * d.x + d.y * d.y + d.z * d.z) * f.fogc.w;\n"
+"    float v = fast::exp(-(k * k));\n"
+"    return clamp(v * (1.0 - f.fogp.x) + f.fogp.x, 0.0, 1.0);\n"
+"}\n"
+"static float3 fog_mix(constant S3F &f, float3 c, float v) { return f.fogc.rgb + (c - f.fogc.rgb) * v; }\n"
+"static float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }\n"
+"/* version 3: the map's edge into the haze, in linear light (SCENE3D.md 14.4) */\n"
+"static float3 edge_q(constant S3U &u, constant S3F &f, float3 p, float3 c) {\n"
+"    if (u.haze.w == 0.0) return c;\n"
+"    float dx = p.x - u.edg.x, dz = p.z - u.edg.y;\n"
+"    float r = u.haze.w > 1.5 ? max(abs(dx), abs(dz)) : sqrt(dx * dx + dz * dz);\n"
+"    float e = ss(u.edg.w, u.edg.z, r);\n"
+"    if (e >= 1.0) return c;\n"
+"    float3 d = p - f.eye.xyz;\n"
+"    float l = max(sqrt(d.x * d.x + d.y * d.y + d.z * d.z), 1e-6);\n"
+"    float3 hz = f.sky.rgb * (1.0 - 0.245 * ss(0.0, 0.5, -d.y / l));\n"
+"    return hz + (c - hz) * e;\n"
+"}\n"
+"static float3 bend(float3 n, float3 t, float3 b, float3 tn) {\n"
+"    t = nz(t - n * dot3(n, t));\n"
+"    b = nz(b - n * dot3(n, b));\n"
+"    return nz(t * tn.x + b * tn.y + n * tn.z);\n"
+"}\n"
+"static float highlight(constant S3F &f, float3 n, float3 p) {\n"
+"    float3 v = nz(f.eye.xyz - p);\n"
+"    float3 h = nz(v - f.sun_dir.xyz);\n"
+"    return fast::pow(max(dot3(n, h), 0.0), f.sun.w);\n"
+"}\n"
+"static float los_at(texture2d<float> los, float2 wxz) {\n"
+"    constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+"    float f = los.sample(lin, float2((wxz.x / 4.0 + 0.5) / 520.0, (wxz.y / 4.0 + 0.5) / 513.0)).r;\n"
+"    return clamp(f - 0.03, 0.0, 1.0) / (1.0 - 0.03);\n"
+"}\n"
+"#if S3Q_RICH\n"
+"static float lit_at(depth2d<float> sm, int2 i, float d, int n) {\n"
+"    i = clamp(i, int2(0), int2(n - 1));\n"
+"    return sm.read(uint2(i)) < d ? 0.0 : 1.0;\n"
+"}\n"
+"static float pcf(depth2d<float> sm, float2 st, float d, int n) {\n"
+"    float2 b = floor(st), fr = st - b;\n"
+"    int2 i = int2(b);\n"
+"    float a = lit_at(sm, i, d, n), e = lit_at(sm, i + int2(1, 0), d, n);\n"
+"    float c = lit_at(sm, i + int2(0, 1), d, n), g = lit_at(sm, i + int2(1, 1), d, n);\n"
+"    float top = a + (e - a) * fr.x, bot = c + (g - c) * fr.x;\n"
+"    return top + (bot - top) * fr.y;\n"
+"}\n"
+"/* the sunlight reaching p: the shadow map, rows from y = +1 (as the twin's) */\n"
+"static float sunlight(constant S3F &f, depth2d<float> sm, float3 p, float3 ng) {\n"
+"    if (f.shadow.x == 0.0) return 1.0;\n"
+"    float3 q = p + ng * f.shadow.w;\n"
+"    float x = f.lvp[0].x * q.x + f.lvp[1].x * q.y + f.lvp[2].x * q.z + f.lvp[3].x;\n"
+"    float y = f.lvp[0].y * q.x + f.lvp[1].y * q.y + f.lvp[2].y * q.z + f.lvp[3].y;\n"
+"    float z = f.lvp[0].z * q.x + f.lvp[1].z * q.y + f.lvp[2].z * q.z + f.lvp[3].z;\n"
+"    if (x < -1.0 || x > 1.0 || y < -1.0 || y > 1.0) return 1.0;\n"
+"    float d = z - f.shadow.z;\n"
+"    int n = int(f.shadow.x);\n"
+"    float s = (x * 0.5 + 0.5) * f.shadow.x - 0.5, t = (0.5 - 0.5 * y) * f.shadow.x - 0.5;\n"
+"    return pcf(sm, float2(s, t), d, n);\n"
+"}\n"
+"/* the ground's height at (x, z), bilinear between the vertices */\n"
+"static float ground(texture2d<ushort> hg, float x, float z) {\n"
+"    float fx = x / 4.0, fz = z / 4.0, x0 = floor(fx), z0 = floor(fz), tx = fx - x0, tz = fz - z0;\n"
+"    int i = int(x0), j = int(z0);\n"
+"    float a = float(hg.read(uint2(clamp(i, 0, 519), clamp(j, 0, 512))).r) * (1.0 / 92.0);\n"
+"    float b = float(hg.read(uint2(clamp(i + 1, 0, 519), clamp(j, 0, 512))).r) * (1.0 / 92.0);\n"
+"    float c = float(hg.read(uint2(clamp(i, 0, 519), clamp(j + 1, 0, 512))).r) * (1.0 / 92.0);\n"
+"    float e = float(hg.read(uint2(clamp(i + 1, 0, 519), clamp(j + 1, 0, 512))).r) * (1.0 / 92.0);\n"
+"    float top = a + (b - a) * tx, bot = c + (e - c) * tx;\n"
+"    return top + (bot - top) * tz;\n"
+"}\n"
+"/* the sea: three trains of waves with the wind, Fresnel to the sky, the sun's glint */\n"
+"static float3 wave_normal(constant S3F &f, float x, float z) {\n"
+"    const float4 W[3] = { float4(0.0, 9.0, 0.08, 1.6), float4(0.6, 5.0, 0.04, 1.2), float4(-0.5, 3.1, 0.025, 0.9) };\n"
+"    float dx = 0.0, dz = 0.0;\n"
+"    for (int k = 0; k < 3; k++) {\n"
+"        float a = f.water.y + W[k].x, dirx = cos(a), dirz = sin(a);\n"
+"        float kk = 6.2831853 / W[k].y;\n"
+"        float ph = kk * (dirx * x + dirz * z) - kk * W[k].w * f.water.w;\n"
+"        float c = W[k].z * kk * cos(ph);\n"
+"        dx += c * dirx;\n"
+"        dz += c * dirz;\n"
+"    }\n"
+"    return nz(float3(-dx, 1.0, -dz));\n"
+"}\n"
+"static float4 sea(constant S3F &f, float3 body, float depth, float3 p, float sh) {\n"
+"    float3 n = wave_normal(f, p.x, p.z), sd = f.sun_dir.xyz;\n"
+"    float3 v = nz(f.eye.xyz - p);\n"
+"    float k = 1.0 - max(dot3(n, v), 0.0);\n"
+"    float fres = 0.02 + 0.98 * (k * k * k * k * k);\n"
+"    float ndl = max(-dot3(n, sd), 0.0);\n"
+"    float dn = dot3(sd, n);\n"
+"    float3 r = sd - 2.0 * dn * n;\n"
+"    float glint = fast::pow(max(dot3(r, v), 0.0), 120.0) * sh * 0.8;\n"
+"    float3 lit = body * linL(f.sun.rgb * ndl * sh + f.amb.rgb);\n"
+"    float3 c = lit + (f.sky.rgb - lit) * fres + f.sunl.rgb * glint;\n"
+"    return float4(c, 0.45 + 0.55 * clamp(depth / 2.0, 0.0, 1.0));\n"
+"}\n"
+"#endif\n"
+"static int hraw(texture2d<ushort> h, int i, int j) { return int(h.read(uint2(i, j)).r); }\n"
+"static float3 tpos(texture2d<ushort> h, int i, int j, int verts) {\n"
+"    int hi = clamp(i, 0, verts - 1), hj = clamp(j, 0, verts - 1);\n"
+"    return float3(float(i) * 4.0, float(h.read(uint2(hi, hj)).r) * (1.0 / 92.0), float(j) * 4.0);\n"
+"}\n"
+"static float3 edgev(float3 p, float3 b) { float3 d = p - b; float l = sqrt(d.x * d.x + d.y * d.y + d.z * d.z); return l > 0.0 ? d / l : d; }\n"
+"static float3 crs(float3 a, float3 b) { return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }\n"
+"static float3 vnormal(texture2d<ushort> h, int i, int j, int verts) {\n"
+"    float3 b = tpos(h, i, j, verts), z = float3(0.0);\n"
+"    float3 left = i > 0 ? edgev(tpos(h, i - 1, j, verts), b) : z;\n"
+"    float3 right = i < verts - 1 ? edgev(tpos(h, i + 1, j, verts), b) : z;\n"
+"    float3 up = j > 0 ? edgev(tpos(h, i, j - 1, verts), b) : z;\n"
+"    float3 down = j < verts - 1 ? edgev(tpos(h, i, j + 1, verts), b) : z;\n"
+"    float3 n = crs(up, left) + crs(left, down) + crs(down, right) + crs(right, up);\n"
+"    float l = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);\n"
+"    return l > 0.00001 ? n / l : n;\n"
+"}\n"
+"/* the twin's level for a triangle and a texture of size sz (w, h, last level) */\n"
+"static float tri_lod(constant S3U &u, float4 c0, float4 c1, float4 c2, float2 t0, float2 t1, float2 t2, float3 sz) {\n"
+"    if (c0.w <= 0.0 || c1.w <= 0.0 || c2.w <= 0.0) return 0.0;\n"
+"    float w = u.vsize.x, h = u.vsize.y;\n"
+"    float x0 = (c0.x * (1.0 / c0.w) + 1.0) * 0.5 * w, y0 = (1.0 - c0.y * (1.0 / c0.w)) * 0.5 * h;\n"
+"    float x1 = (c1.x * (1.0 / c1.w) + 1.0) * 0.5 * w, y1 = (1.0 - c1.y * (1.0 / c1.w)) * 0.5 * h;\n"
+"    float x2 = (c2.x * (1.0 / c2.w) + 1.0) * 0.5 * w, y2 = (1.0 - c2.y * (1.0 / c2.w)) * 0.5 * h;\n"
+"    float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);\n"
+"    float uva = abs((t1.x - t0.x) * (t2.y - t0.y) - (t2.x - t0.x) * (t1.y - t0.y)) * sz.x * sz.y;\n"
+"    return lod_of(uva / abs(area), sz.z);\n"
+"}\n"
+"constant int2 SA[6] = { int2(0,0), int2(1,0), int2(0,1), int2(1,0), int2(1,1), int2(0,1) };\n"
+"constant int2 SB[6] = { int2(0,0), int2(1,0), int2(1,1), int2(1,1), int2(0,1), int2(0,0) };\n"
+"struct TQ { float4 pos [[position]]; float3 p; float3 n; float fogv; float4 lods [[flat]]; int2 g [[flat]]; uint sc [[flat]]; };\n"
+"vertex TQ s3q_splat_vs(uint vid [[vertex_id]], constant S3U &u [[buffer(0)]], constant S3F &f [[buffer(2)]],\n"
+"                      constant S3X &x [[buffer(3)]],\n"
+"                      const device uint *spl [[buffer(1)]], texture2d<ushort> hg [[texture(0)]]) {\n"
+"    uint w = spl[vid / 6u];\n"
+"    int gi = u.terr.z * 16 + int(w & 15u), gj = u.terr.w * 16 + int((w >> 4) & 15u), verts = u.terr.x;\n"
+"    bool d = hraw(hg, gi, gj) + hraw(hg, gi + 1, gj + 1) < hraw(hg, gi, gj + 1) + hraw(hg, gi + 1, gj);\n"
+"    uint c6 = vid % 6u, tri = c6 / 3u * 3u;\n"
+"    float4 c[3]; float2 uv[3]; int2 k[3]; float3 pp[3];\n"
+"    for (uint q = 0; q < 3u; q++) {\n"
+"        k[q] = d ? SA[tri + q] : SB[tri + q];\n"
+"        pp[q] = tpos(hg, gi + k[q].x, gj + k[q].y, verts);\n"
+"        c[q] = clip_of(u, pp[q]);\n"
+"        uv[q] = float2(u.tm.x * pp[q].x + u.tm.y * pp[q].z, u.tm.z * pp[q].x + u.tm.w * pp[q].z);\n"
+"    }\n"
+"    uint me = c6 - tri;\n"
+"    TQ o;\n"
+"    o.pos = metal_z(c[me]);\n"
+"    o.p = pp[me];\n"
+"    o.fogv = fog_vis(f, pp[me]);\n"
+"    o.n = vnormal(hg, gi + k[me].x, gj + k[me].y, verts);\n"
+"    o.lods = float4(u.mode.y != 0 ? tri_lod(u, c[0], c[1], c[2], uv[0], uv[1], uv[2], u.tsize.xyz) : 0.0,\n"
+"                    x.nsz.w != 0.0 ? tri_lod(u, c[0], c[1], c[2], uv[0], uv[1], uv[2], x.nsz.xyz) : 0.0,\n"
+"                    x.ssz.w != 0.0 ? tri_lod(u, c[0], c[1], c[2], uv[0], uv[1], uv[2], x.ssz.xyz) : 0.0, 0.0);\n"
+"    o.g = int2(gi, gj);\n"
+"    o.sc = (w >> 8) & 127u;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3q_splat_fs(TQ in [[stage_in]], constant S3U &u [[buffer(0)]], constant S3F &f [[buffer(2)]],\n"
+"                             constant S3X &x [[buffer(3)]],\n"
+"                             texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]],\n"
+"                             texture2d<float> los [[texture(1)]], texture2d<float> am [[texture(2)]],\n"
+"                             sampler asmp [[sampler(1)]], texture2d<float> nrm [[texture(3)]],\n"
+"                             texture2d<float> spc [[texture(4)]], sampler xsmp [[sampler(2)]]\n"
+"#if S3Q_RICH\n"
+"                             , depth2d<float> sm [[texture(6)]]\n"
+"#endif\n"
+"                             ) {\n"
+"    float3 p = in.p;\n"
+"    float2 uv = float2(u.tm.x * p.x + u.tm.y * p.z, u.tm.z * p.x + u.tm.w * p.z);\n"
+"    float g = lin1(0.5);\n"
+"    float4 base = float4(g, g, g, 1.0);\n"
+"    if (u.mode.y != 0) {\n"
+"        base = tex.sample(smp, uv, level(in.lods.x));\n"
+"        if (x.q.y == 0) base.rgb = lin3(base.rgb);\n"
+"    }\n"
+"    float3 n = nz(in.n), nb = n;\n"
+"    if (x.nsz.w != 0.0) {\n"
+"        float det = u.tm.x * u.tm.w - u.tm.y * u.tm.z;\n"
+"        if (abs(det) > 1e-12) {\n"
+"            float3 tn = nrm.sample(xsmp, uv, level(in.lods.y)).rgb * 2.0 - 1.0;\n"
+"            nb = bend(n, float3(u.tm.w / det, 0.0, -u.tm.z / det), float3(-u.tm.y / det, 0.0, u.tm.x / det), tn);\n"
+"        }\n"
+"    }\n"
+"    float ndl = clamp(-dot3(nb, f.sun_dir.xyz), 0.0, 1.0);\n"
+"    float sh = 1.0;\n"
+"#if S3Q_RICH\n"
+"    if (x.q.z != 0) sh = sunlight(f, sm, p, n);\n"
+"#endif\n"
+"    float3 spec = float3(0.0);\n"
+"    if (x.ssz.w != 0.0) spec = spc.sample(xsmp, uv, level(in.lods.z)).rgb * highlight(f, nb, p);\n"
+"    float3 lit = base.rgb * linL(f.sun.rgb * ndl * sh + f.amb.rgb) + f.sunl.rgb * spec * sh;\n"
+"    lit = fog_mix(f, lit, in.fogv);\n"
+"    float lf = los_at(los, p.xz);\n"
+"    float3 c = enc3(edge_q(u, f, p, lf < 1.0 ? lit * lin1(lf) : lit));\n"
+"    if ((u.mode.x & 256) == 0) return float4(c, 1.0);\n"
+"    uint shape = in.sc & 15u, code = (in.sc >> 4) & 7u;\n"
+"    float s = p.x / 4.0 - float(in.g.x), t = p.z / 4.0 - float(in.g.y);\n"
+"    float a = (code & 1u) != 0u ? t : s, b = (code & 1u) != 0u ? s : t;\n"
+"    if ((code & 2u) != 0u) a = 1.0 - a;\n"
+"    if ((code & 4u) != 0u) b = 1.0 - b;\n"
+"    float u0 = float(shape * uint(u.am.x) + 2u) / u.am.y, u1 = float((shape + 1u) * uint(u.am.x) - 2u) / u.am.y;\n"
+"    float al = 1.0 - am.sample(asmp, float2(u0 + a * (u1 - u0), b), level(0.0)).r;\n"
+"    return float4(c, al);\n"
+"}\n"
+"struct MV {\n"
+"    float3 pos [[attribute(0)]];\n"
+"    float3 nrm [[attribute(1)]];\n"
+"    float2 uv [[attribute(2)]];\n"
+"    uchar4 bone [[attribute(3)]];\n"
+"    uchar4 wt [[attribute(4)]];\n"
+"    float2 uv1 [[attribute(5)]];\n"
+"};\n"
+"static float3 row3(float4 r0, float4 r1, float4 r2, float3 p, float w) {\n"
+"    return float3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w * w,\n"
+"                  r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w * w,\n"
+"                  r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w * w);\n"
+"}\n"
+"/* the classic program's skinning: the bone pool, or the instance's transform */\n"
+"static void pose(MV v, constant S3U &u, texture2d<uint> inst, texture2d<float> bones, thread float3 &p, thread float3 &n) {\n"
+"    uint at = uint(u.mode.w) * 4u;\n"
+"    uint2 ip = uint2(at % 2048u, at / 2048u);\n"
+"    float4 m0 = as_type<float4>(inst.read(ip)), m1 = as_type<float4>(inst.read(ip + uint2(1, 0)));\n"
+"    float4 m2 = as_type<float4>(inst.read(ip + uint2(2, 0)));\n"
+"    uint first = inst.read(ip + uint2(3, 0)).y;\n"
+"    uint nb = uint(u.terr.y);\n"
+"    p = float3(0.0), n = float3(0.0);\n"
+"    if (first != 0xFFFFFFFFu && first + nb + 1u <= 49152u) {\n"
+"        for (uint q = 0; q < 4u; q++) {\n"
+"            uint b = uint(v.bone[q]);\n"
+"            if (b == 255u || b > nb) break;\n"
+"            uint x = (first + b) * 3u;\n"
+"            uint2 bp = uint2(x % 1536u, x / 1536u);\n"
+"            float4 r0 = bones.read(bp), r1 = bones.read(bp + uint2(1, 0)), r2 = bones.read(bp + uint2(2, 0));\n"
+"            float w = float(v.wt[q]) / 255.0;\n"
+"            p += row3(r0, r1, r2, v.pos, 1.0) * w;\n"
+"            n += row3(r0, r1, r2, v.nrm, 0.0) * w;\n"
+"        }\n"
+"        n = nz(n);\n"
+"    } else {\n"
+"        p = row3(m0, m1, m2, v.pos, 1.0);\n"
+"        n = nz(row3(m0, m1, m2, v.nrm, 0.0));\n"
+"    }\n"
+"}\n"
+"struct VQ { float4 pos [[position]]; float2 uv; float2 uv1; float3 n; float3 p; float fogv; };\n"
+"vertex VQ s3q_model_vs(MV v [[stage_in]], constant S3U &u [[buffer(0)]], constant S3F &f [[buffer(2)]],\n"
+"                      texture2d<uint> inst [[texture(1)]], texture2d<float> bones [[texture(2)]]) {\n"
+"    float3 p, n;\n"
+"    pose(v, u, inst, bones, p, n);\n"
+"    VQ o;\n"
+"    o.pos = metal_z(clip_of(u, p));\n"
+"    o.uv = v.uv;\n"
+"    o.uv1 = v.uv1;\n"
+"    o.n = n;\n"
+"    o.p = p;\n"
+"    o.fogv = fog_vis(f, p);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 s3q_fs(VQ in [[stage_in]], constant S3U &u [[buffer(0)]], constant S3F &f [[buffer(2)]],\n"
+"                       constant S3X &x [[buffer(3)]],\n"
+"                       texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]],\n"
+"                       texture2d<float> los [[texture(1)]], texture2d<float> nrm [[texture(3)]],\n"
+"                       texture2d<float> spc [[texture(4)]], texture2d<float> aot [[texture(5)]],\n"
+"                       sampler xsmp [[sampler(2)]]\n"
+"#if S3Q_RICH\n"
+"                       , depth2d<float> sm [[texture(6)]], texture2d<ushort> hg [[texture(7)]]\n"
+"#endif\n"
+"                       ) {\n"
+"    /* the derivatives first, while every pixel of the quad is here */\n"
+"    float2 dux = dfdx(in.uv), duy = dfdy(in.uv), dax = dfdx(in.uv1), day = dfdy(in.uv1);\n"
+"    float3 dpx = dfdx(in.p), dpy = dfdy(in.p);\n"
+"    float ruv = abs(dux.x * duy.y - dux.y * duy.x), ruv1 = abs(dax.x * day.y - dax.y * day.x);\n"
+"    float g = lin1(0.5);\n"
+"    float4 base = float4(g, g, g, 1.0);\n"
+"    if (u.mode.y != 0) {\n"
+"        float2 t = in.uv * u.tsize.xy;\n"
+"        float2 dx = dfdx(t), dy = dfdy(t);\n"
+"        base = tex.sample(smp, in.uv, level(lod_of(abs(dx.x * dy.y - dx.y * dy.x), u.tsize.z)));\n"
+"        if (u.mode.z != 0) base.a = 1.0;\n"
+"        if (x.q.y == 0) base.rgb = lin3(base.rgb);\n"
+"    }\n"
+"    bool trans = (u.mode.x & 4) != 0;\n"
+"    bool water = false;\n"
+"#if S3Q_RICH\n"
+"    water = x.q.x == 1 && (u.mode.x & 64) != 0 && f.eye.w >= 2.0;\n"
+"#endif\n"
+"    float alpha = 1.0;\n"
+"    if (water) {\n"
+"        if (base.a < 0.5) discard_fragment();\n"
+"    } else if (x.q.x == 0) {\n"
+"        if (trans && base.a < 0.5) discard_fragment();\n"
+"    } else {\n"
+"        if (!trans || base.a >= 0.5 || base.a < 0.1) discard_fragment();\n"
+"        alpha = base.a * 2.0;\n"
+"    }\n"
+"    float3 n = nz(in.n), p = in.p;\n"
+"    float sh = 1.0;\n"
+"#if S3Q_RICH\n"
+"    if (x.q.z != 0 && (u.mode.x & 128) == 0) sh = sunlight(f, sm, p, n);\n"
+"#endif\n"
+"    float3 lit;\n"
+"    if (water) {\n"
+"#if S3Q_RICH\n"
+"        float4 w = sea(f, base.rgb, f.water.x - ground(hg, p.x, p.z), p, sh);\n"
+"        lit = w.rgb;\n"
+"        alpha = w.a;\n"
+"#else\n"
+"        lit = base.rgb;\n"
+"#endif\n"
+"    } else {\n"
+"        float3 rgb = base.rgb;\n"
+"        /* the player's, the object's colour and the tint come decoded */\n"
+"        if ((u.mode.x & 1) != 0) rgb = rgb * (u.player.rgb + (1.0 - u.player.rgb) * base.a);\n"
+"        else if ((u.mode.x & 2) != 0) rgb = rgb * (u.object.rgb + (1.0 - u.object.rgb) * base.a);\n"
+"        float3 nb = n;\n"
+"        if (x.nsz.w != 0.0) {\n"
+"            float det = dux.x * duy.y - duy.x * dux.y;\n"
+"            if (abs(det) > 1e-12) {\n"
+"                float3 tt = (dpx * duy.y - dpy * dux.y) / det, bb = (dpy * dux.x - dpx * duy.x) / det;\n"
+"                float3 tn = nrm.sample(xsmp, in.uv, level(lod_of(ruv * x.nsz.x * x.nsz.y, x.nsz.z))).rgb * 2.0 - 1.0;\n"
+"                nb = bend(n, tt, bb, tn);\n"
+"            }\n"
+"        }\n"
+"        float ndl = max(-dot3(nb, f.sun_dir.xyz), 0.0);\n"
+"        float ao = 1.0;\n"
+"        if (x.asz.w != 0.0) ao = aot.sample(xsmp, in.uv1, level(lod_of(ruv1 * x.asz.x * x.asz.y, x.asz.z))).r;\n"
+"        float3 spec = float3(0.0);\n"
+"        float glow = 0.0;\n"
+"        if (x.ssz.w != 0.0) {\n"
+"            float4 s = spc.sample(xsmp, in.uv, level(lod_of(ruv * x.ssz.x * x.ssz.y, x.ssz.z)));\n"
+"            spec = s.rgb * highlight(f, nb, p);\n"
+"            glow = s.a;\n"
+"        }\n"
+"        lit = rgb * linL(f.sun.rgb * ndl * sh + f.amb.rgb * ao) + f.sunl.rgb * spec * sh;\n"
+"        if ((u.mode.x & 16) != 0 && x.ssz.w != 0.0) lit = lit + (rgb - lit) * glow;\n"
+"    }\n"
+"    lit = lit * u.tint.rgb;\n"
+"    lit = fog_mix(f, lit, in.fogv);\n"
+"    float lf = (u.mode.x & 4096) == 0 ? los_at(los, p.xz) : 1.0;\n"
+"    return float4(enc3(edge_q(u, f, p, lf < 1.0 ? lit * lin1(lf) : lit)), alpha);\n"
+"}\n"
+"#if S3Q_RICH\n"
+"/* the shadow map: the casters' depths from the sun */\n"
+"struct CV { float4 pos [[position]]; float2 uv; };\n"
+"static float4 to_map(constant S3F &f, float3 p) {\n"
+"    float x = f.lvp[0].x * p.x + f.lvp[1].x * p.y + f.lvp[2].x * p.z + f.lvp[3].x;\n"
+"    float y = f.lvp[0].y * p.x + f.lvp[1].y * p.y + f.lvp[2].y * p.z + f.lvp[3].y;\n"
+"    float z = f.lvp[0].z * p.x + f.lvp[1].z * p.y + f.lvp[2].z * p.z + f.lvp[3].z;\n"
+"    return float4(x, y, z, 1.0);\n"
+"}\n"
+"vertex CV s3q_cast_vs(MV v [[stage_in]], constant S3U &u [[buffer(0)]], constant S3F &f [[buffer(2)]],\n"
+"                     texture2d<uint> inst [[texture(1)]], texture2d<float> bones [[texture(2)]]) {\n"
+"    float3 p, n;\n"
+"    pose(v, u, inst, bones, p, n);\n"
+"    CV o;\n"
+"    o.pos = to_map(f, p);\n"
+"    o.uv = v.uv;\n"
+"    return o;\n"
+"}\n"
+"fragment void s3q_cast_fs(CV in [[stage_in]], constant S3U &u [[buffer(0)]],\n"
+"                          texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {\n"
+"    if ((u.mode.x & 4) != 0 && u.mode.y != 0 && tex.sample(smp, in.uv, level(0.0)).a < 0.5) discard_fragment();\n"
+"}\n"
+"vertex CV s3q_cast_splat_vs(uint vid [[vertex_id]], constant S3U &u [[buffer(0)]], constant S3F &f [[buffer(2)]],\n"
+"                           const device uint *spl [[buffer(1)]], texture2d<ushort> hg [[texture(0)]]) {\n"
+"    uint w = spl[vid / 6u];\n"
+"    int gi = u.terr.z * 16 + int(w & 15u), gj = u.terr.w * 16 + int((w >> 4) & 15u), verts = u.terr.x;\n"
+"    bool d = hraw(hg, gi, gj) + hraw(hg, gi + 1, gj + 1) < hraw(hg, gi, gj + 1) + hraw(hg, gi + 1, gj);\n"
+"    uint c6 = vid % 6u;\n"
+"    int2 k = d ? SA[c6] : SB[c6];\n"
+"    CV o;\n"
+"    o.pos = to_map(f, tpos(hg, gi + k.x, gj + k.y, verts));\n"
+"    o.uv = float2(0.0);\n"
+"    return o;\n"
+"}\n"
+"#endif\n";
+
+static struct {
+    bool tried;
+    int best;                       /* the best quality built: 2, 1 or 0 */
+    bool built[2];                  /* the smooth [0] and rich [1] programs */
+    id<MTLRenderPipelineState> splat_[2], blend_[2], model_[2], model_blend_[2];
+    id<MTLRenderPipelineState> splat, blend, model, model_blend;    /* the ones drawing now */
+    id<MTLRenderPipelineState> cast, cast_splat;
+    id<MTLDepthStencilState> depth_test;    /* less, not written: the blended models */
+    id<MTLSamplerState> aux;        /* the normal, specular and occlusion maps: repeat */
+    id<MTLTexture> shadow;          /* the shadow map, S3Q_N square */
+    MTLVertexDescriptor *vd;        /* the model vertex with its second UV set */
+    bool timing;                    /* ROSGD_SCENE3D_TIME=1: the scene's GPU time logged */
+    double gpu_ms;
+    uint32_t timed;
+} s3q;
+
+/* the quality's pipelines from one library: blend as the classic ones */
+static id<MTLRenderPipelineState> s3q_pipe(id<MTLLibrary> lib, NSString *vs, NSString *fs, MTLPixelFormat f,
+                                           MTLVertexDescriptor *vd, bool blend)
+{
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    NSError *err = nil;
+    id<MTLRenderPipelineState> p;
+    id<MTLFunction> v = [lib newFunctionWithName:vs], fr = fs ? [lib newFunctionWithName:fs] : nil;
+
+    if (!v || (fs && !fr)) {
+        metal_log("scene3d: %s / %s not in the library", [vs UTF8String], fs ? [fs UTF8String] : "-");
+        [v release];
+        [fr release];
+        [pd release];
+        return nil;
+    }
+    pd.vertexFunction = v;
+    pd.fragmentFunction = fr;
+    pd.colorAttachments[0].pixelFormat = f;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    if (vd) {
+        pd.vertexDescriptor = vd;
+    }
+    if (blend) {
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    }
+    p = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) {
+        metal_log("scene3d %s: %s", fs ? [fs UTF8String] : [vs UTF8String], [[err localizedDescription] UTF8String]);
+    }
+    [v release];
+    [fr release];
+    [pd release];
+    return p;
+}
+
+/* One quality's library and pipelines: true if all of them built */
+static bool s3q_build(int rich)
+{
+    NSError *err = nil;
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    const char *e = getenv(rich ? "ROSGD_SCENE3D_FAIL_RICH" : "ROSGD_SCENE3D_FAIL_SMOOTH");
+    bool fail = e && *e == '1';
+    NSString *src = [NSString stringWithFormat:@"#define S3Q_RICH %d\n%@%@", rich, S3Q_SRC,
+                                               fail ? @"\nthis will not build;\n" : @""];
+
+    if (@available(macOS 15.0, *)) {
+        opts.mathMode = MTLMathModeSafe;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opts.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    }
+    id<MTLLibrary> lib = [m.device newLibraryWithSource:src options:opts error:&err];
+    [opts release];
+    if (!lib) {
+        metal_log("scene3d: the %s program will not build: %s", rich ? "rich" : "smooth",
+                  [[err localizedDescription] UTF8String]);
+        return false;
+    }
+    s3q.splat_[rich] = s3q_pipe(lib, @"s3q_splat_vs", @"s3q_splat_fs", MTLPixelFormatRGBA8Unorm, nil, false);
+    s3q.blend_[rich] = s3q_pipe(lib, @"s3q_splat_vs", @"s3q_splat_fs", MTLPixelFormatRGBA8Unorm, nil, true);
+    s3q.model_[rich] = s3q_pipe(lib, @"s3q_model_vs", @"s3q_fs", MTLPixelFormatRGBA8Unorm, s3q.vd, false);
+    s3q.model_blend_[rich] = s3q_pipe(lib, @"s3q_model_vs", @"s3q_fs", MTLPixelFormatRGBA8Unorm, s3q.vd, true);
+    bool ok = s3q.splat_[rich] && s3q.blend_[rich] && s3q.model_[rich] && s3q.model_blend_[rich];
+    if (rich && ok) {
+        s3q.cast = s3q_pipe(lib, @"s3q_cast_vs", @"s3q_cast_fs", MTLPixelFormatInvalid, s3q.vd, false);
+        s3q.cast_splat = s3q_pipe(lib, @"s3q_cast_splat_vs", nil, MTLPixelFormatInvalid, nil, false);
+        ok = s3q.cast && s3q.cast_splat;
+    }
+    [lib release];
+    if (!ok) {
+        metal_log("scene3d: the %s program's pipelines will not all build", rich ? "rich" : "smooth");
+        [s3q.splat_[rich] release], [s3q.blend_[rich] release], [s3q.model_[rich] release];
+        [s3q.model_blend_[rich] release];
+        s3q.splat_[rich] = s3q.blend_[rich] = s3q.model_[rich] = s3q.model_blend_[rich] = nil;
+        if (rich) {
+            [s3q.cast release], [s3q.cast_splat release];
+            s3q.cast = s3q.cast_splat = nil;
+        }
+    }
+    s3q.built[rich] = ok;
+    return ok;
+}
+
+/* The best quality that builds: rich, else smooth, else classic alone */
+static void s3q_setup(void)
+{
+    if (s3q.tried) {
+        return;
+    }
+    s3q.tried = true;
+    s3q.vd = [[MTLVertexDescriptor vertexDescriptor] retain];
+    s3q.vd.attributes[0].format = MTLVertexFormatFloat3, s3q.vd.attributes[0].offset = 0;
+    s3q.vd.attributes[1].format = MTLVertexFormatFloat3, s3q.vd.attributes[1].offset = 12;
+    s3q.vd.attributes[2].format = MTLVertexFormatFloat2, s3q.vd.attributes[2].offset = 24;
+    s3q.vd.attributes[3].format = MTLVertexFormatUChar4, s3q.vd.attributes[3].offset = 40;
+    s3q.vd.attributes[4].format = MTLVertexFormatUChar4, s3q.vd.attributes[4].offset = 44;
+    s3q.vd.attributes[5].format = MTLVertexFormatFloat2, s3q.vd.attributes[5].offset = 32;
+    for (int k = 0; k < 6; k++) {
+        s3q.vd.attributes[k].bufferIndex = 1;
+    }
+    s3q.vd.layouts[1].stride = sizeof(struct ros_s3_vertex);
+    MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+    dd.depthCompareFunction = MTLCompareFunctionLess;
+    dd.depthWriteEnabled = NO;
+    s3q.depth_test = [m.device newDepthStencilStateWithDescriptor:dd];
+    [dd release];
+    MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+    sd.minFilter = MTLSamplerMinMagFilterLinear;
+    sd.magFilter = MTLSamplerMinMagFilterLinear;
+    sd.mipFilter = MTLSamplerMipFilterNearest;
+    sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeRepeat;
+    s3q.aux = [m.device newSamplerStateWithDescriptor:sd];
+    [sd release];
+    const char *t = getenv("ROSGD_SCENE3D_TIME");
+    s3q.timing = t && *t == '1';
+    /* both: smooth draws with its own, smaller program */
+    if (s3q.depth_test && s3q.aux) {
+        s3q_build(1);
+        s3q_build(0);
+    }
+    if (s3q.built[1]) {
+        MTLTextureDescriptor *zd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:S3Q_N height:S3Q_N mipmapped:NO];
+        zd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        zd.storageMode = MTLStorageModePrivate;
+        s3q.shadow = [m.device newTextureWithDescriptor:zd];
+    }
+    s3q.best = s3q.built[1] && s3q.shadow ? 2 : s3q.built[0] || s3q.built[1] ? 1 : 0;
+    metal_log("scene3d: quality programs built: %s", s3q.best == 2 && s3q.built[0] ? "rich and smooth"
+              : s3q.best == 2 ? "rich (smooth is drawn by the rich program)"
+              : s3q.best == 1 ? "smooth (rich left out: rich is drawn smooth)"
+              : "none (smooth and rich are drawn classic)");
+}
+
+static float s3q_lin(float c)
+{
+    c = c > 0 ? c : 0;
+    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static void s3q_norm(float v[3])
+{
+    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 0) {
+        v[0] /= l, v[1] /= l, v[2] /= l;
+    }
+}
+
+/* The sun's view of the visible terrain (quality.rs light_matrix): false
+ * when no patch is visible */
+static bool s3q_light(const struct ros_scene3d *h, float m[16], float *texel, float *dz)
+{
+    uint32_t patches = h->patches > ROS_S3_PATCHES ? ROS_S3_PATCHES : h->patches;
+    float f[3] = { h->env.sun_dir[0], h->env.sun_dir[1], h->env.sun_dir[2] }, a[3], r[3], u[3];
+    float lo[3] = { INFINITY, INFINITY, INFINITY }, hi[3] = { -INFINITY, -INFINITY, -INFINITY };
+    float water = h->env.water[2] != 0.0f ? h->env.water[0] : -INFINITY;
+    bool any = false;
+
+    if (!patches || (h->flags & ROS_S3_F_NO_TERRAIN)) {
+        return false;
+    }
+    s3q_norm(f);
+    a[0] = 0, a[1] = 0, a[2] = 1;
+    if (!(fabsf(f[2]) < 0.9f)) {
+        a[0] = 1, a[2] = 0;
+    }
+    r[0] = a[1] * f[2] - a[2] * f[1], r[1] = a[2] * f[0] - a[0] * f[2], r[2] = a[0] * f[1] - a[1] * f[0];
+    s3q_norm(r);
+    u[0] = f[1] * r[2] - f[2] * r[1], u[1] = f[2] * r[0] - f[0] * r[2], u[2] = f[0] * r[1] - f[1] * r[0];
+    for (uint32_t pz = 0; pz < patches; pz++) {
+        for (uint32_t px = 0; px < patches; px++) {
+            if (!(h->patch_vis[pz] >> px & 1u)) {
+                continue;
+            }
+            any = true;
+            uint16_t l = 0xFFFF, t = 0;
+            for (uint32_t j = pz * ROS_S3_PATCH; j <= (pz + 1) * ROS_S3_PATCH; j++) {
+                for (uint32_t i = px * ROS_S3_PATCH; i <= (px + 1) * ROS_S3_PATCH; i++) {
+                    uint16_t v = h->height[j][i];
+                    l = v < l ? v : l, t = v > t ? v : t;
+                }
+            }
+            float y0 = l * ROS_S3_HEIGHT_SCALE, y1 = t * ROS_S3_HEIGHT_SCALE;
+            y1 = (y1 > water ? y1 : water) + S3Q_CASTER_ROOM;
+            if (px == 0 || pz == 0 || px == patches - 1 || pz == patches - 1) {
+                y0 = y0 < 0 ? y0 : 0;
+            }
+            float x0 = (float)(px * ROS_S3_PATCH) * ROS_S3_UNITS, z0 = (float)(pz * ROS_S3_PATCH) * ROS_S3_UNITS;
+            float x1 = x0 + ROS_S3_PATCH * ROS_S3_UNITS, z1 = z0 + ROS_S3_PATCH * ROS_S3_UNITS;
+            for (int c = 0; c < 8; c++) {
+                float p[3] = { c & 1 ? x1 : x0, c & 2 ? y1 : y0, c & 4 ? z1 : z0 };
+                float q[3] = { r[0] * p[0] + r[1] * p[1] + r[2] * p[2], u[0] * p[0] + u[1] * p[1] + u[2] * p[2],
+                               f[0] * p[0] + f[1] * p[1] + f[2] * p[2] };
+                for (int k = 0; k < 3; k++) {
+                    lo[k] = q[k] < lo[k] ? q[k] : lo[k], hi[k] = q[k] > hi[k] ? q[k] : hi[k];
+                }
+            }
+        }
+    }
+    if (!any) {
+        return false;
+    }
+    for (int k = 0; k < 3; k++) {
+        lo[k] -= 2.0f, hi[k] += 2.0f;
+    }
+    float dx = hi[0] - lo[0], dy = hi[1] - lo[1];
+    float sx = 2.0f / dx, sy = 2.0f / dy;
+    *dz = hi[2] - lo[2];
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = sx * r[0], m[4] = sx * r[1], m[8] = sx * r[2], m[12] = -(hi[0] + lo[0]) / dx;
+    m[1] = sy * u[0], m[5] = sy * u[1], m[9] = sy * u[2], m[13] = -(hi[1] + lo[1]) / dy;
+    m[2] = f[0] / *dz, m[6] = f[1] / *dz, m[10] = f[2] / *dz, m[14] = -lo[2] / *dz;
+    m[15] = 1.0f;
+    *texel = (dx > dy ? dx : dy) / S3Q_N;
+    return true;
+}
+
+/* The frame's uniforms (quality.rs frame) */
+static void s3q_frame(const struct ros_scene3d *h, int q, S3F *f)
+{
+    const struct ros_s3_env *e = &h->env;
+    memset(f, 0, sizeof(*f));
+    for (int k = 0; k < 3; k++) {
+        f->eye[k] = h->view.eye[k];
+        f->sun[k] = e->sun_rgb[k];
+        f->amb[k] = e->ambient_rgb[k];
+        f->sunl[k] = s3q_lin(e->sun_rgb[k]);
+        f->fogc[k] = s3q_lin(e->fog_rgb[k]);
+        f->sky[k] = s3q_lin(e->sky_rgb[k]);
+        f->sun_dir[k] = e->sun_dir[k];
+    }
+    f->eye[3] = (float)q;
+    f->sun[3] = 50.0f;                  /* quality.rs SPEC_POWER */
+    f->fogc[3] = e->fog[0] > 0 ? e->fog[0] : 0;
+    f->fogp[0] = e->fog[1] < 0 ? 0 : e->fog[1] > 1 ? 1 : e->fog[1];
+    f->water[0] = e->water[0], f->water[1] = e->water[1], f->water[2] = e->water[2], f->water[3] = e->time[0];
+    float texel, dz;
+    if (q >= 2 && s3q.shadow && s3q_light(h, f->lvp, &texel, &dz)) {
+        f->shadow[0] = S3Q_N, f->shadow[1] = 1.0f / S3Q_N, f->shadow[2] = 0.06f / dz, f->shadow[3] = 1.5f * texel;
+    }
+}
+
+/* Whether an instance stands farther from the eye than rich draws the
+ * foliage's soft edges (quality.rs FRINGE_M) */
+static bool s3q_far(const struct ros_scene3d *h, const struct ros_s3_instance *in)
+{
+    float dx = in->m[0][3] - h->view.eye[0], dy = in->m[1][3] - h->view.eye[1], dz = in->m[2][3] - h->view.eye[2];
+    return dx * dx + dy * dy + dz * dz > 150.0f * 150.0f;
+}
+
+/* A map's size into a draw's extra: w, h, last level, 1 */
+static void s3q_size(const S3Tex *t, float o[4])
+{
+    if (t && t->t) {
+        o[0] = t->w, o[1] = t->h, o[2] = t->levels - 1, o[3] = 1;
+    } else {
+        o[0] = o[1] = o[2] = o[3] = 0;
+    }
+}
+
+static S3Tex *s3q_tex(uint32_t id)
+{
+    return id && id < ROS_S3_TEX_IDS && s3.tex[id].t ? &s3.tex[id] : NULL;
+}
+
+/* A colour texture through its sRGB view (made when first wanted), or the
+ * texture itself with *decoded false */
+static id<MTLTexture> s3q_colour(S3Tex *t, bool *decoded)
+{
+    if (!t->srgb && !t->srgb_tried) {
+        t->srgb_tried = 1;
+        MTLPixelFormat f = t->t.pixelFormat;
+        MTLPixelFormat sf = f == MTLPixelFormatBC1_RGBA ? MTLPixelFormatBC1_RGBA_sRGB
+                          : f == MTLPixelFormatBC2_RGBA ? MTLPixelFormatBC2_RGBA_sRGB
+                          : f == MTLPixelFormatBC3_RGBA ? MTLPixelFormatBC3_RGBA_sRGB
+                          : f == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatInvalid;
+        if (sf != MTLPixelFormatInvalid && (t->t.usage & MTLTextureUsagePixelFormatView)) {
+            t->srgb = [t->t newTextureViewWithPixelFormat:sf];
+        }
+    }
+    *decoded = t->srgb != nil;
+    return t->srgb ? t->srgb : t->t;
+}
+
+/* An instance's skin: its textures and shading bits */
+static uint32_t s3q_skin(const struct ros_s3_instance *in, S3Tex **base, S3Tex **nrm, S3Tex **spc, S3Tex **ao,
+                         float obj[4])
+{
+    uint32_t shading = 0;
+    *base = *nrm = *spc = *ao = NULL;
+    obj[0] = obj[1] = obj[2] = obj[3] = 1;
+    if (in->skin && in->skin < ROS_S3_SKIN_IDS && s3.skin_have[in->skin]) {
+        const uint32_t *sk = s3.skin[in->skin];
+        shading = sk[2] & 0xFFFFu;
+        s3_unpack8(sk[3], obj);
+        *base = s3q_tex(sk[0] & 0xFFFFu);
+        *nrm = s3q_tex(sk[0] >> 16);
+        *spc = s3q_tex(sk[1] & 0xFFFFu);
+        *ao = s3q_tex(sk[1] >> 16);
+    }
+    return shading;
+}
+
+/* Rich: the shadow map drawn before the scene's pass (its own encoder) */
+static void s3q_shadow_pass(id<MTLCommandBuffer> cb, const struct ros_scene3d *h, const S3F *f)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = s3q.shadow;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.clearDepth = 1.0;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    MTLViewport vp = { 0, 0, S3Q_N, S3Q_N, 0, 1 };
+    [enc setViewport:vp];
+    [enc setDepthStencilState:s3.depth];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setVertexBytes:f length:sizeof(*f) atIndex:2];
+    S3U u;
+    memset(&u, 0, sizeof(u));
+    uint32_t patches = h->patches > ROS_S3_PATCHES ? ROS_S3_PATCHES : h->patches;
+    if (patches && !(h->flags & ROS_S3_F_NO_TERRAIN) && s3.splats) {
+        uint32_t ns = (uint32_t)(s3.splats.length / 4);
+        u.terr[0] = (int32_t)(patches * ROS_S3_PATCH + 1);
+        [enc setRenderPipelineState:s3q.cast_splat];
+        [enc setVertexTexture:s3.heights atIndex:0];
+        [enc setVertexBuffer:s3.splats offset:0 atIndex:1];
+        for (uint32_t pz = 0; pz < patches; pz++) {
+            for (uint32_t px = 0; px < patches; px++) {
+                if (!(h->patch_vis[pz] >> px & 1u)) {
+                    continue;
+                }
+                uint32_t p = pz * ROS_S3_PATCHES + px, a = h->splat_first[p], b = h->splat_first[p + 1], e;
+                a = a > ns ? ns : a, b = b > ns ? ns : b;
+                for (e = a; e < b && ((s3.cur->splat[e] >> 8) & 15u) == ROS_S3_SHAPE_SOLID; e++) {
+                }
+                if (e > a) {
+                    u.terr[2] = (int32_t)px, u.terr[3] = (int32_t)pz;
+                    [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:a * 6 vertexCount:(e - a) * 6];
+                }
+            }
+        }
+    }
+    uint32_t ni = h->ninstances > ROS_S3_INSTANCES ? ROS_S3_INSTANCES : h->ninstances;
+    [enc setRenderPipelineState:s3q.cast];
+    [enc setVertexTexture:s3.inst[s3.ring] atIndex:1];
+    [enc setVertexTexture:s3.bones[s3.ring] atIndex:2];
+    [enc setFragmentSamplerState:s3.repeat atIndex:0];
+    for (uint32_t k = 0; k < ni; k++) {
+        const struct ros_s3_instance *in = &s3.cur->inst[k];
+        if (!(in->flags & ROS_S3_I_CAST) || !in->mesh || in->mesh >= ROS_S3_MESH_IDS || !s3.mesh[in->mesh].vb) {
+            continue;
+        }
+        S3Tex *t, *n, *s, *o;
+        float obj[4];
+        uint32_t shading = s3q_skin(in, &t, &n, &s, &o, obj);
+        if (shading & ROS_S3_K_WATER) {
+            continue;
+        }
+        const S3Mesh *me = &s3.mesh[in->mesh];
+        u.mode[0] = (int32_t)shading, u.mode[1] = t != NULL, u.mode[3] = (int32_t)k;
+        u.terr[1] = (int32_t)me->nbones;
+        if (t) {
+            [enc setFragmentTexture:t->t atIndex:0];
+            [enc setFragmentSamplerState:t->wrap ? s3.repeat : s3.clamp atIndex:0];
+        }
+        [enc setVertexBuffer:me->vb offset:0 atIndex:1];
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:me->nidx
+                         indexType:MTLIndexTypeUInt16 indexBuffer:me->ib indexBufferOffset:0];
+    }
+    [enc endEncoding];
+}
+
+/* Version 3 (Antiquity's SCENE3D.md 14): a draw's haze and edge */
+static void s3_edge_uniforms(S3U *u, const struct ros_scene3d *h)
+{
+    memset(u->haze, 0, sizeof(u->haze));
+    if (h->version < 3 || !(h->env.edge[3] > 0.0f)) {
+        return;
+    }
+    memcpy(u->haze, h->env.sky_rgb, 12);
+    u->haze[3] = h->flags & ROS_S3_F_SQUARE_EDGE ? 2.0f : 1.0f;
+    memcpy(u->edg, h->env.edge, 16);
+    memcpy(u->eye, h->view.eye, 16);
+}
+
+/* Version 3: the sky, after the opaque passes, where nothing was drawn (a
+ * triangle over the screen at the far plane, tested less-or-equal) */
+static void s3_sky(id<MTLRenderCommandEncoder> enc, const struct ros_scene3d *h, int q)
+{
+    if (h->version < 3 || !s3.sky) {
+        return;
+    }
+    const float *P = h->view.proj, *V = h->view.view;
+    if (P[0] == 0.0f || P[5] == 0.0f) {
+        return;
+    }
+    S3SkyU u;
+    memset(&u, 0, sizeof(u));
+    /* ray = ex row0 + ey row1 + row2 (rows of the view's 3x3), ex = (nx - P8) / P0,
+     * ey = (ny - P9) / P5 */
+    for (int k = 0; k < 3; k++) {
+        float r0 = V[k * 4], r1 = V[k * 4 + 1], r2 = V[k * 4 + 2];
+        u.rx[k] = r0 / P[0];
+        u.ry[k] = r1 / P[5];
+        u.rz[k] = r2 - P[8] / P[0] * r0 - P[9] / P[5] * r1;
+    }
+    memcpy(u.zen, h->env.sky_zenith, 16);
+    memcpy(u.hor, h->env.sky_horizon, 16);
+    memcpy(u.cloud, h->env.sky_cloud, 16);
+    memcpy(u.haze, h->env.sky_rgb, 16);
+    memcpy(u.sun_dir, h->env.sun_dir, 16);
+    memcpy(u.sun_rgb, h->env.sun_rgb, 16);
+    u.misc[0] = h->env.time[0], u.misc[1] = h->env.water[1], u.misc[2] = (float)q;
+    [enc setRenderPipelineState:s3.sky];
+    [enc setDepthStencilState:s3.depth_blend];
+    [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc setDepthStencilState:s3.depth];
+}
+
+/* Before the scene's pass: the quality to draw (0 classic), its frame
+ * uniforms, and in rich the shadow map */
+static int s3q_prepare(id<MTLCommandBuffer> cb, const struct ros_scene3d *h, S3F *f)
+{
+    int q = h->quality > 2 ? 2 : h->quality;
+    if (!q) {
+        return 0;
+    }
+    s3q_setup();
+    q = q < s3q.best ? q : s3q.best;
+    if (!q) {
+        return 0;
+    }
+    s3q_frame(h, q, f);
+    int k = q >= 2 || !s3q.built[0];         /* which program draws */
+    s3q.splat = s3q.splat_[k], s3q.blend = s3q.blend_[k];
+    s3q.model = s3q.model_[k], s3q.model_blend = s3q.model_blend_[k];
+    if (q >= 2 && f->shadow[0] > 0) {
+        s3q_shadow_pass(cb, h, f);
+    }
+    return q;
+}
+
+/* The scene at smooth or rich, in the scene's pass: the sides (classic),
+ * the opaque splats, the blends, the models (opaque), the models' blended
+ * pass (the foliage's edges; the rich sea).  The HUD follows as in classic. */
+static void s3q_draw(id<MTLRenderCommandEncoder> enc, const struct ros_scene3d *h, int q, const S3F *f,
+                     uint32_t w, uint32_t hh)
+{
+    S3U u;
+    S3X x;
+    memset(&u, 0, sizeof(u));
+    memset(&x, 0, sizeof(x));
+    memcpy(u.vp, h->view.viewproj, sizeof(u.vp));
+    memcpy(u.sun_dir, h->env.sun_dir, 16);
+    memcpy(u.sun_rgb, h->env.sun_rgb, 16);
+    memcpy(u.amb, h->env.ambient_rgb, 16);
+    u.vsize[0] = (float)w, u.vsize[1] = (float)hh;
+    u.tint[0] = u.tint[1] = u.tint[2] = u.tint[3] = 1.0f;
+    u.player[0] = u.player[1] = u.player[2] = u.object[0] = u.object[1] = u.object[2] = 1.0f;
+    x.q[2] = q >= 2 && f->shadow[0] > 0;
+    s3_edge_uniforms(&u, h);
+    [enc setVertexBytes:f length:sizeof(*f) atIndex:2];
+    [enc setFragmentBytes:f length:sizeof(*f) atIndex:2];
+    [enc setFragmentSamplerState:s3q.aux atIndex:2];
+    if (q >= 2) {
+        [enc setFragmentTexture:s3q.shadow atIndex:6];
+        [enc setFragmentTexture:s3.heights atIndex:7];
+    }
+    uint32_t patches = h->patches > ROS_S3_PATCHES ? ROS_S3_PATCHES : h->patches;
+    if (patches && !(h->flags & ROS_S3_F_NO_TERRAIN) && s3.splats) {
+        uint32_t n = patches * ROS_S3_PATCH, ns = (uint32_t)(s3.splats.length / 4);
+        uint32_t nt = h->nterrains > ROS_S3_TERRAINS ? ROS_S3_TERRAINS : h->nterrains;
+        uint8_t back[4];
+        memcpy(back, &h->back_rgba, 4);
+        for (int k = 0; k < 3; k++) {
+            u.side[k] = back[k] / 255.0f;
+        }
+        u.side[3] = h->env.water[2] != 0.0f ? h->env.water[0] : 0.0f;
+        u.terr[0] = (int32_t)(n + 1);
+        S3Tex *amt = s3.am.have && s3.tex[s3.am.tex].t ? &s3.tex[s3.am.tex] : NULL;
+        if (amt) {
+            u.am[0] = (float)s3.am.stride, u.am[1] = (float)amt->w, u.am[2] = (float)s3.am.shapes;
+        }
+        [enc setVertexTexture:s3.heights atIndex:0];
+        [enc setFragmentTexture:s3.los atIndex:1];
+        if (amt) {
+            [enc setFragmentTexture:amt->t atIndex:2];
+            [enc setFragmentSamplerState:amt->wrap ? s3.repeat : s3.clamp atIndex:1];
+        } else {
+            [enc setFragmentSamplerState:s3.clamp atIndex:1];
+        }
+        [enc setVertexBuffer:s3.splats offset:0 atIndex:1];
+        /* version 3 draws no sides: the haze beyond the edge is the sky's */
+        for (int pass = h->version >= 3 ? 1 : 0; pass < 3; pass++) {
+            [enc setRenderPipelineState:pass == 0 ? s3.side : pass == 1 ? s3q.splat : s3q.blend];
+            [enc setDepthStencilState:pass == 2 ? s3.depth_blend : s3.depth];
+            for (uint32_t pz = 0; pz < patches; pz++) {
+                for (uint32_t px = 0; px < patches; px++) {
+                    if (!(h->patch_vis[pz] >> px & 1u)) {
+                        continue;
+                    }
+                    if (pass == 0) {
+                        int32_t e[4][4];
+                        int ne = 0;
+                        if (px == 0) {
+                            int32_t a[4] = { 0, (int32_t)(pz * ROS_S3_PATCH), 0, 1 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        if (px == patches - 1) {
+                            int32_t a[4] = { (int32_t)n, (int32_t)(pz * ROS_S3_PATCH), 0, 1 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        if (pz == 0) {
+                            int32_t a[4] = { (int32_t)(px * ROS_S3_PATCH), 0, 1, 0 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        if (pz == patches - 1) {
+                            int32_t a[4] = { (int32_t)(px * ROS_S3_PATCH), (int32_t)n, 1, 0 };
+                            memcpy(e[ne++], a, 16);
+                        }
+                        for (int k = 0; k < ne; k++) {
+                            memcpy(u.edge, e[k], 16);
+                            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+                            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+                            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                                    vertexCount:ROS_S3_PATCH * 6];
+                        }
+                        continue;
+                    }
+                    uint32_t p = pz * ROS_S3_PATCHES + px;
+                    uint32_t a = h->splat_first[p], b = h->splat_first[p + 1];
+                    a = a > ns ? ns : a, b = b > ns ? ns : b;
+                    u.terr[2] = (int32_t)px, u.terr[3] = (int32_t)pz;
+                    for (uint32_t k = a; k < b;) {
+                        uint32_t sw = s3.cur->splat[k], shape = (sw >> 8) & 15u, tex = sw >> 16;
+                        bool solid = shape == ROS_S3_SHAPE_SOLID;
+                        uint32_t e = k + 1;
+                        while (e < b && (solid || shape < s3.am.shapes) && (s3.cur->splat[e] >> 16) == tex
+                               && (((s3.cur->splat[e] >> 8) & 15u) == ROS_S3_SHAPE_SOLID) == solid
+                               && (solid || ((s3.cur->splat[e] >> 8) & 15u) < s3.am.shapes)) {
+                            e++;
+                        }
+                        uint32_t first = k;
+                        k = e;
+                        if (solid != (pass == 1)) {
+                            continue;
+                        }
+                        S3Tex *t = NULL, *tn = NULL, *ts = NULL;
+                        float mtx[4] = { 0.25f, 0, 0, 0.25f };
+                        if (tex < nt) {
+                            uint16_t id = h->terrain[tex];
+                            if (id && id < ROS_S3_TERRAIN_IDS && s3.terr[id].have) {
+                                memcpy(mtx, s3.terr[id].m, 16);
+                                t = s3q_tex(s3.terr[id].diffuse);
+                                tn = s3q_tex(s3.terr[id].norm);
+                                ts = s3q_tex(s3.terr[id].spec);
+                            }
+                        }
+                        if (!solid && (!t || !amt || shape >= s3.am.shapes)) {
+                            continue;
+                        }
+                        memcpy(u.tm, mtx, 16);
+                        u.mode[0] = solid ? 0 : 256, u.mode[1] = t != NULL, u.mode[2] = 0;
+                        if (t) {
+                            bool dec;
+                            u.tsize[0] = t->w, u.tsize[1] = t->h, u.tsize[2] = t->levels - 1;
+                            [enc setFragmentTexture:s3q_colour(t, &dec) atIndex:0];
+                            [enc setFragmentSamplerState:t->wrap ? s3.repeat : s3.clamp atIndex:0];
+                            x.q[1] = dec;
+                        }
+                        s3q_size(tn, x.nsz);
+                        s3q_size(ts, x.ssz);
+                        if (tn) {
+                            [enc setFragmentTexture:tn->t atIndex:3];
+                        }
+                        if (ts) {
+                            [enc setFragmentTexture:ts->t atIndex:4];
+                        }
+                        [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+                        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+                        [enc setVertexBytes:&x length:sizeof(x) atIndex:3];
+                        [enc setFragmentBytes:&x length:sizeof(x) atIndex:3];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first * 6
+                                vertexCount:(e - first) * 6];
+                    }
+                }
+            }
+        }
+        [enc setDepthStencilState:s3.depth];
+        memset(u.edge, 0, sizeof(u.edge));
+    }
+    /* the models: the opaque pass, then the blended one */
+    uint32_t ni = h->ninstances > ROS_S3_INSTANCES ? ROS_S3_INSTANCES : h->ninstances;
+    memset(x.asz, 0, sizeof(x.asz));
+    [enc setFragmentTexture:s3.los atIndex:1];
+    [enc setVertexTexture:s3.inst[s3.ring] atIndex:1];
+    [enc setVertexTexture:s3.bones[s3.ring] atIndex:2];
+    for (int pass = 0; pass < (q >= 2 ? 2 : 1); pass++) {
+        if (pass == 1) {
+            s3_sky(enc, h, q);          /* between the opaque and the blended */
+        }
+        [enc setRenderPipelineState:pass ? s3q.model_blend : s3q.model];
+        [enc setDepthStencilState:pass ? s3q.depth_test : s3.depth];
+        x.q[0] = pass;
+        for (uint32_t k = 0; k < ni; k++) {
+            const struct ros_s3_instance *in = &s3.cur->inst[k];
+            if (!in->mesh || in->mesh >= ROS_S3_MESH_IDS || !s3.mesh[in->mesh].vb) {
+                continue;
+            }
+            S3Tex *t, *tn, *ts, *ta;
+            float obj[4];
+            uint32_t shading = s3q_skin(in, &t, &tn, &ts, &ta, obj);
+            bool sea = q >= 2 && (shading & ROS_S3_K_WATER);
+            if (pass == 0 ? sea : !(sea || (shading & ROS_S3_K_TRANS))) {
+                continue;
+            }
+            if (pass && !sea && s3q_far(h, in)) {
+                continue;                       /* soft edges only near the eye */
+            }
+            const S3Mesh *me = &s3.mesh[in->mesh];
+            s3_unpack8(h->player[in->player % ROS_S3_PLAYERS], u.player);
+            memcpy(u.object, obj, 16);
+            s3_unpack8(in->shading, u.tint);
+            for (int c = 0; c < 3; c++) {       /* decoded here, once a draw */
+                u.player[c] = s3q_lin(u.player[c]);
+                u.object[c] = s3q_lin(u.object[c]);
+                u.tint[c] = s3q_lin(u.tint[c]);
+            }
+            u.tint[3] = in->alpha / 255.0f;
+            u.mode[0] = (int32_t)(shading | (in->flags & ROS_S3_I_NO_LOS ? 4096u : 0u));
+            u.mode[1] = t != NULL, u.mode[2] = t ? t->opaque : 0;
+            u.mode[3] = (int32_t)k;
+            u.terr[1] = (int32_t)me->nbones;
+            x.q[1] = 0;
+            if (t) {
+                bool dec;
+                u.tsize[0] = t->w, u.tsize[1] = t->h, u.tsize[2] = t->levels - 1;
+                [enc setFragmentTexture:s3q_colour(t, &dec) atIndex:0];
+                [enc setFragmentSamplerState:t->wrap ? s3.repeat : s3.clamp atIndex:0];
+                x.q[1] = dec;
+            }
+            s3q_size(tn, x.nsz);
+            s3q_size(ts, x.ssz);
+            s3q_size(q >= 2 ? ta : NULL, x.asz);
+            if (tn) {
+                [enc setFragmentTexture:tn->t atIndex:3];
+            }
+            if (ts) {
+                [enc setFragmentTexture:ts->t atIndex:4];
+            }
+            if (q >= 2 && ta) {
+                [enc setFragmentTexture:ta->t atIndex:5];
+            }
+            [enc setVertexBuffer:me->vb offset:0 atIndex:1];
+            [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
+            [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+            [enc setFragmentBytes:&x length:sizeof(x) atIndex:3];
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:me->nidx
+                             indexType:MTLIndexTypeUInt16 indexBuffer:me->ib indexBufferOffset:0];
+        }
+    }
+    [enc setDepthStencilState:s3.depth];
+    if (q < 2) {
+        s3_sky(enc, h, q);
+    }
+}
+
+/* ROSGD_SCENE3D_TIME=1: the scene drawn in a command buffer of its own,
+ * its GPU time averaged and logged every 60 frames */
+static bool s3q_timing(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *t = getenv("ROSGD_SCENE3D_TIME");
+        on = t && *t == '1';
+    }
+    return on;
+}
+
+static void s3q_timed(id<MTLCommandBuffer> qcb, int q, uint32_t w, uint32_t hh)
+{
+    [qcb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        if (@available(macOS 10.15, *)) {
+            double ms = (b.GPUEndTime - b.GPUStartTime) * 1000.0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                s3q.gpu_ms += ms;
+                if (++s3q.timed == 60) {
+                    metal_log("scene3d: quality %d, %ux%u: %.2f ms of GPU a frame (60 frames)", q, w, hh,
+                              s3q.gpu_ms / 60.0);
+                    s3q.gpu_ms = 0, s3q.timed = 0;
+                }
+            });
+        }
+    }];
+    [qcb commit];
+}
+
 /* Before the frame's main pass: the scene drawn into its own picture the
  * size of the icon's box in the target's pixels, when anything moved */
 static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t xres, uint32_t yres)
@@ -6414,6 +7896,13 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
     if (!s3.color || !s3.zbuf) {
         return;
     }
+    /* smooth and rich (s3q_draw): their uniforms and the shadow map first */
+    S3F qf;
+    id<MTLCommandBuffer> qcb = s3q_timing() ? [m.queue commandBuffer] : nil;
+    if (qcb) {
+        cb = qcb;
+    }
+    int q = s3q_prepare(cb, h, &qf);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     float sky[4];
     for (int k = 0; k < 3; k++) {
@@ -6431,6 +7920,9 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     [enc setDepthStencilState:s3.depth];
     [enc setCullMode:MTLCullModeNone];
+    if (q) {
+        s3q_draw(enc, h, q, &qf, w, hh);
+    }
     S3U u;
     memset(&u, 0, sizeof(u));
     memcpy(u.vp, h->view.viewproj, sizeof(u.vp));
@@ -6440,10 +7932,11 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
     u.vsize[0] = (float)w, u.vsize[1] = (float)hh;
     u.tint[0] = u.tint[1] = u.tint[2] = u.tint[3] = 1.0f;
     u.player[0] = u.player[1] = u.player[2] = u.object[0] = u.object[1] = u.object[2] = 1.0f;
+    s3_edge_uniforms(&u, h);
     /* the terrain (SCENE3D.md 6.3): the visible patches' sides, then their
      * opaque splats, then their blends, a run of one texture a draw */
     uint32_t patches = h->patches > ROS_S3_PATCHES ? ROS_S3_PATCHES : h->patches;
-    if (patches && !(h->flags & ROS_S3_F_NO_TERRAIN) && s3.splats) {
+    if (!q && patches && !(h->flags & ROS_S3_F_NO_TERRAIN) && s3.splats) {
         uint32_t n = patches * ROS_S3_PATCH, ns = (uint32_t)(s3.splats.length / 4);
         uint32_t nt = h->nterrains > ROS_S3_TERRAINS ? ROS_S3_TERRAINS : h->nterrains;
         uint8_t back[4];
@@ -6466,7 +7959,8 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
             [enc setFragmentSamplerState:s3.clamp atIndex:1];
         }
         [enc setVertexBuffer:s3.splats offset:0 atIndex:1];
-        for (int pass = 0; pass < 3; pass++) {
+        /* version 3 draws no sides: the haze beyond the edge is the sky's */
+        for (int pass = h->version >= 3 ? 1 : 0; pass < 3; pass++) {
             [enc setRenderPipelineState:pass == 0 ? s3.side : pass == 1 ? s3.splat : s3.blend];
             [enc setDepthStencilState:pass == 2 ? s3.depth_blend : s3.depth];
             for (uint32_t pz = 0; pz < patches; pz++) {
@@ -6556,7 +8050,7 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
     }
     /* the models: a draw an instance */
     uint32_t ni = h->ninstances > ROS_S3_INSTANCES ? ROS_S3_INSTANCES : h->ninstances;
-    if (ni) {
+    if (ni && !q) {
         [enc setRenderPipelineState:s3.model];
         [enc setFragmentTexture:s3.los atIndex:1];
         [enc setVertexTexture:s3.inst[s3.ring] atIndex:1];
@@ -6599,6 +8093,9 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
                              indexType:MTLIndexTypeUInt16 indexBuffer:me->ib indexBufferOffset:0];
         }
     }
+    if (!q) {
+        s3_sky(enc, h, 0);              /* version 3: where nothing was drawn */
+    }
     /* the HUD over it all: quads in order, a draw for each run of one texture */
     uint32_t nq = h->hud.nquads > ROS_S3_QUADS ? ROS_S3_QUADS : h->hud.nquads;
     id<MTLBuffer> hq = s3.hudq[s3.hud_ring];
@@ -6637,6 +8134,9 @@ static void surf_scene3d_render(id<MTLCommandBuffer> cb, CGSize target, uint32_t
         }
     }
     [enc endEncoding];
+    if (qcb) {
+        s3q_timed(qcb, q, w, hh);
+    }
     s3.drawn_frame = s3.frame, s3.drawn_w = w, s3.drawn_h = hh, s3.drawn_assets = s3.assets;
     if (!s3.drawn_any || ++s3.shown % 900 == 0) {
         metal_log("scene3d: frame %u, %ux%u, %u instances, %u bones, epoch %u", s3.frame, w, hh, ni,
@@ -7303,6 +8803,201 @@ static NSString *metal_shot_path(unsigned n)
             [NSString stringWithFormat:@"metal-screenshot-%u.png", n]];
 }
 
+/* The frame as composed, at the guest's own size and 1:1: whether the
+ * scale pass must run again for it (a backdrop shows through holes in the
+ * decoded surface; with the box's surfaces the pass is where the window's
+ * own icons -- the clock, the meter, a game pane -- go in), or whether
+ * fb.decoded is the picture already */
+static bool metal_composite_wanted(void)
+{
+    return (backdrop.mode != METAL_BACKDROP_OFF || surf.on)
+           && (backdrop.mode != METAL_BACKDROP_SHADER || backdrop.scene_tex[backdrop.scene_cur]);
+}
+
+/* A texture for it: RGBA8, the mode's size (retained: the caller's) */
+static id<MTLTexture> metal_composite_texture(void)
+{
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:fb.xres
+                                    height:fb.yres
+                                 mipmapped:NO];
+
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    return [m.device newTextureWithDescriptor:td];
+}
+
+/* The composite into `composite` (metal_composite_texture's), encoded in
+ * cb: the backdrop, the decoded surface or the surfaces with their
+ * shadows, and the icons this window draws itself -- as the window shows
+ * them, but one guest pixel to a pixel and without the pointer.  What a
+ * screenshot and a grab (design 55) read. */
+static bool metal_composite_into(id<MTLCommandBuffer> cb, id<MTLTexture> composite)
+{
+    if (!fb.shot) {
+        MTLFunctionConstantValues *scv = [[MTLFunctionConstantValues alloc] init];
+        uint32_t nearest = METAL_SCALING_NEAREST;
+        bool no = false;
+        uint32_t bd = (uint32_t)backdrop.mode;
+
+        [scv setConstantValue:&nearest type:MTLDataTypeUInt atIndex:1];
+        [scv setConstantValue:&no type:MTLDataTypeBool atIndex:2];
+        [scv setConstantValue:&bd type:MTLDataTypeUInt atIndex:3];
+        fb.shot = metal_pipeline(@"ps_scale", scv, MTLPixelFormatRGBA8Unorm);
+        [scv release];
+    }
+    if (!fb.shot || !composite) {
+        return false;
+    }
+    MetalParams sp;
+    MTLRenderPassDescriptor *srp = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLRenderCommandEncoder> senc;
+
+    memset(&sp, 0, sizeof(sp));
+    sp.dim[0] = fb.xres;
+    sp.dim[1] = fb.yres;
+    sp.post[0] = fb.xres;
+    sp.post[1] = fb.yres;
+    sp.post[2] = METAL_SCALING_NEAREST;
+    sp.misc[3] = surf.on ? surf.view.look : 0;
+    backdrop_params(&sp, 1.0);   /* the tile's size in guest pixels */
+    srp.colorAttachments[0].texture = composite;
+    srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    srp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    surf_gamepane_render(cb);
+    surf_scene3d_render(cb, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+    senc = [cb renderCommandEncoderWithDescriptor:srp];
+    [senc setRenderPipelineState:fb.shot];
+    [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
+    [senc setFragmentTexture:fb.decoded atIndex:0];
+    if (backdrop.mode >= METAL_BACKDROP_PICTURE) {
+        [senc setFragmentTexture:backdrop.mode == METAL_BACKDROP_SHADER
+                                 ? backdrop.scene_tex[backdrop.scene_cur] : backdrop.image
+                         atIndex:1];
+        [senc setFragmentSamplerState:m.repeat atIndex:1];
+    }
+    [senc setFragmentSamplerState:m.linear atIndex:0];
+    [senc drawPrimitives:MTLPrimitiveTypeTriangle
+             vertexStart:0 vertexCount:3];
+    /* the icons this window draws itself, as the window shows them */
+    surf_gamepanes(senc, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+    surf_tiles(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+    surf_tower(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+    surf_scene3d(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+    surf_faces(senc, surf.face_shot, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
+    [senc endEncoding];
+    return true;
+}
+
+/* ---- the grab (design 55) ------------------------------------------------
+ * The guest asks, in block v2, for a rectangle of the frame as composed:
+ * what the screen really shows, for !CloseUp.  The composite is made as a
+ * screenshot's is (no pointer), and the rectangle blitted straight into
+ * the region, where the guest reads it; the ack follows when the GPU has
+ * written it.  Asked for 25 times a second or so, while a magnifier is
+ * open; one request at a time. */
+static struct {
+    id<MTLTexture> tex;                 /* the composite, kept while the mode is */
+    uint32_t w, h;
+    id<MTLCommandBuffer> cb;            /* a request on the GPU: answered once it is done */
+    MetalGrab g;
+    uint8_t *dst;
+    uint32_t frame;
+    uint32_t answered;                  /* grabs answered, for metal-debug.txt */
+} grab;
+
+/* The request on the GPU, if it is done: the alpha bytes to 0 (RGBA8 is
+ * R, G, B, A in memory; the guest's &00BBGGRR has 0 there), then the ack
+ * the guest waits on.  On the UI thread, as everything of the view is. */
+static bool metal_grab_finish(void)
+{
+    MTLCommandBufferStatus st = grab.cb.status;
+
+    if (st != MTLCommandBufferStatusCompleted && st != MTLCommandBufferStatusError) {
+        return false;
+    }
+    size_t n = (size_t)grab.g.w * grab.g.h;
+
+    for (size_t i = 0; i < n; i++) {
+        grab.dst[i * 4 + 3] = 0;
+    }
+    metal_glue_grab_done(grab.g.seq, st == MTLCommandBufferStatusError ? 2u : 0u, grab.frame);
+    [grab.cb release];
+    grab.cb = nil;
+    if (++grab.answered % 500 == 1) {
+        metal_log("grab: %u answered (%ux%u at %d,%d)", grab.answered, grab.g.w, grab.g.h,
+                  grab.g.x, grab.g.y);
+    }
+    return true;
+}
+
+static void metal_grab_service(void)
+{
+    MetalGrab g;
+    uint32_t status = 0;
+
+    if (grab.cb && !metal_grab_finish()) {
+        return;
+    }
+    if (!metal_glue_grab_pending(&g)) {
+        return;
+    }
+    pthread_mutex_lock(&surf.mx);
+    if (!fb.up || !fb.decoded || !surf.region || !g.w || !g.h
+        || (uint64_t)g.offset + (uint64_t)g.w * g.h * 4 > surf.region.length
+        || (uint64_t)g.w * g.h * 4 > g.size) {
+        status = 1;                     /* nothing composed, or no room: the guest composes */
+    }
+    if (status) {
+        pthread_mutex_unlock(&surf.mx);
+        metal_glue_grab_done(g.seq, status, frame_count);
+        return;
+    }
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLTexture> source = fb.decoded;
+
+    if (metal_composite_wanted()) {
+        if (!grab.tex || grab.w != fb.xres || grab.h != fb.yres) {
+            [grab.tex release];
+            grab.tex = metal_composite_texture();
+            grab.w = fb.xres;
+            grab.h = fb.yres;
+        }
+        if (grab.tex && metal_composite_into(cb, grab.tex)) {
+            source = grab.tex;
+        }
+    }
+    /* the part of the rectangle on the screen; the rest black */
+    int32_t x0 = MAX(g.x, 0), y0 = MAX(g.y, 0);
+    int32_t x1 = MIN(g.x + (int32_t)g.w, (int32_t)fb.xres);
+    int32_t y1 = MIN(g.y + (int32_t)g.h, (int32_t)fb.yres);
+    uint8_t *dst = (uint8_t *)surf.region.contents + g.offset;
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+
+    if (x0 >= x1 || y0 >= y1 || x0 != g.x || y0 != g.y || x1 != g.x + (int32_t)g.w
+        || y1 != g.y + (int32_t)g.h) {
+        memset(dst, 0, (size_t)g.w * g.h * 4);
+    }
+    if (x0 < x1 && y0 < y1) {
+        [b copyFromTexture:source
+               sourceSlice:0 sourceLevel:0
+              sourceOrigin:MTLOriginMake(x0, y0, 0)
+                sourceSize:MTLSizeMake(x1 - x0, y1 - y0, 1)
+                  toBuffer:surf.region
+         destinationOffset:g.offset + ((size_t)(y0 - g.y) * g.w + (size_t)(x0 - g.x)) * 4
+    destinationBytesPerRow:(size_t)g.w * 4
+  destinationBytesPerImage:(size_t)g.w * g.h * 4];
+    }
+    [b endEncoding];
+    [cb commit];
+    grab.cb = [cb retain];
+    grab.g = g;
+    grab.dst = dst;
+    grab.frame = frame_count;
+    pthread_mutex_unlock(&surf.mx);
+}
+
 static bool metal_screenshot_to(NSString *path)
 {
     id<MTLBuffer> staging;
@@ -7327,76 +9022,19 @@ static bool metal_screenshot_to(NSString *path)
     }
     cb = [m.queue commandBuffer];
 
-    /* With a backdrop the decoded surface has holes in it: run the scale
-     * pass once more, at 1:1 into an RGBA8 texture, so the picture is
-     * the composite a human sees. */
+    /* With a backdrop the decoded surface has holes in it: the scale
+     * pass once more, at 1:1, so the picture is the composite a human
+     * sees (metal_composite_into) */
     id<MTLTexture> source = fb.decoded;
     id<MTLTexture> composite = nil;
 
-    /* (and with the box's surfaces, whatever the backdrop: the pass is
-     * where the window's own icons -- the clock, the meter -- go in) */
-    if ((backdrop.mode != METAL_BACKDROP_OFF || surf.on)
-        && (backdrop.mode != METAL_BACKDROP_SHADER || backdrop.scene_tex[backdrop.scene_cur])) {
-        if (!fb.shot) {
-            MTLFunctionConstantValues *scv = [[MTLFunctionConstantValues alloc] init];
-            uint32_t nearest = METAL_SCALING_NEAREST;
-            bool no = false;
-            uint32_t bd = (uint32_t)backdrop.mode;
-
-            [scv setConstantValue:&nearest type:MTLDataTypeUInt atIndex:1];
-            [scv setConstantValue:&no type:MTLDataTypeBool atIndex:2];
-            [scv setConstantValue:&bd type:MTLDataTypeUInt atIndex:3];
-            fb.shot = metal_pipeline(@"ps_scale", scv, MTLPixelFormatRGBA8Unorm);
-            [scv release];
-        }
-        MTLTextureDescriptor *std_ = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                         width:fb.xres
-                                        height:fb.yres
-                                     mipmapped:NO];
-        std_.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        std_.storageMode = MTLStorageModePrivate;
-        composite = fb.shot ? [m.device newTextureWithDescriptor:std_] : nil;
-        if (composite) {
-            MetalParams sp;
-            MTLRenderPassDescriptor *srp = [MTLRenderPassDescriptor renderPassDescriptor];
-            id<MTLRenderCommandEncoder> senc;
-
-            memset(&sp, 0, sizeof(sp));
-            sp.dim[0] = fb.xres;
-            sp.dim[1] = fb.yres;
-            sp.post[0] = fb.xres;
-            sp.post[1] = fb.yres;
-            sp.post[2] = METAL_SCALING_NEAREST;
-            sp.misc[3] = surf.on ? surf.view.look : 0;
-            /* the window's tile size, carried into guest pixels */
-            backdrop_params(&sp, 1.0);   /* the tile's size in guest pixels */
-            srp.colorAttachments[0].texture = composite;
-            srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-            srp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            surf_gamepane_render(cb);
-            surf_scene3d_render(cb, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
-            senc = [cb renderCommandEncoderWithDescriptor:srp];
-            [senc setRenderPipelineState:fb.shot];
-            [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
-            [senc setFragmentTexture:fb.decoded atIndex:0];
-            if (backdrop.mode >= METAL_BACKDROP_PICTURE) {
-                [senc setFragmentTexture:backdrop.mode == METAL_BACKDROP_SHADER
-                                         ? backdrop.scene_tex[backdrop.scene_cur] : backdrop.image
-                                 atIndex:1];
-                [senc setFragmentSamplerState:m.repeat atIndex:1];
-            }
-            [senc setFragmentSamplerState:m.linear atIndex:0];
-            [senc drawPrimitives:MTLPrimitiveTypeTriangle
-                     vertexStart:0 vertexCount:3];
-            /* the icons this window draws itself, as the window shows them */
-            surf_gamepanes(senc, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
-            surf_tiles(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
-            surf_tower(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
-            surf_scene3d(senc, true, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
-            surf_faces(senc, surf.face_shot, CGSizeMake(fb.xres, fb.yres), fb.xres, fb.yres);
-            [senc endEncoding];
+    if (metal_composite_wanted()) {
+        composite = metal_composite_texture();
+        if (composite && metal_composite_into(cb, composite)) {
             source = composite;
+        } else {
+            [composite release];
+            composite = nil;
         }
     }
 
@@ -8428,12 +10066,23 @@ int metal_backend_main(void)
                 frame_wanted = true;
             }
             metal_render_frame();
+            @autoreleasepool {
+                metal_grab_service();   /* a grab asked for: from the frame just composed */
+            }
             if (frame_skipped) {
                 frame_skipped = false;
                 /* nothing new: half a frame's wait -- but a list the box
                  * publishes meanwhile is taken at once, since the Wimp
-                 * draws nothing more till it is (ROSGD_PRESENT_SNAPSHOT) */
+                 * draws nothing more till it is (ROSGD_PRESENT_SNAPSHOT),
+                 * and a grab is answered at once (design 55) */
                 for (int i = 0; i < 8 && !metal_glue_surfaces_pending(); i++) {
+                    MetalGrab g;
+
+                    if (grab.cb || metal_glue_grab_pending(&g)) {
+                        @autoreleasepool {
+                            metal_grab_service();
+                        }
+                    }
                     usleep(1000);
                 }
             }

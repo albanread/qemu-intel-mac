@@ -130,6 +130,18 @@ bool metal_glue_surfaces_pending(void)
     return board && board->surfaces_pending && board->surfaces_pending();
 }
 
+bool metal_glue_grab_pending(MetalGrab *g)
+{
+    return board && board->grab_pending && board->grab_pending(g);
+}
+
+void metal_glue_grab_done(uint32_t seq, uint32_t status, uint32_t frame)
+{
+    if (board && board->grab_done) {
+        board->grab_done(seq, status, frame);
+    }
+}
+
 void metal_glue_surfaces_ack(uint32_t frame)
 {
     if (board && board->surfaces_ack) {

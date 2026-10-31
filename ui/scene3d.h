@@ -37,7 +37,11 @@
  *    rectangles.
  *
  * THE VERSION.  Version 2 added the HUD at the live block's end and changed
- * nothing before it.  A broker that copies the HUD tells the engine so
+ * nothing before it.  Version 3 fills the environment's sky and edge rows
+ * (SCENE3D.md 14), takes the map's edge out of the LOS grid and makes
+ * back_rgba the haze; nothing moved, so it is copied as version 2 is.  A
+ * broker that knows says "scene3d LIVE PAGES 3"; one that says 2 gets
+ * version 2.  A broker that copies the HUD tells the engine so
  * ("scene3d LIVE PAGES 2"); an engine told only "scene3d LIVE PAGES" writes
  * version 1 and no HUD, so that a box built before keeps drawing the scene.
  * Brokers and presenters take either: a version 1 block is read only to
@@ -86,9 +90,10 @@
 #define ROS_SURF_SCENE3D      9u                /* after ROS_SURF_BATTERY (8) */
 #define ROS_S3_MAGIC          0x44334353u       /* "SC3D" */
 #define ROS_S3_PAGE_MAGIC     0x50334353u       /* "SC3P" */
-#define ROS_S3_VERSION        2u                /* the live block's: 2 carries the HUD */
+#define ROS_S3_VERSION        3u                /* the live block's: 2 carries the HUD, 3 the sky */
+#define ROS_S3_VERSION_HUD    2u                /* 2: the HUD, the LOS edge, no sky */
 #define ROS_S3_VERSION_MIN    1u                /* 1: the same block without the HUD */
-#define ROS_S3_PAGE_VERSION   1u                /* an asset page's (unchanged by 2) */
+#define ROS_S3_PAGE_VERSION   1u                /* an asset page's (unchanged by 2 and 3) */
 #define ROS_S3_V1_SIZE        8408616u          /* a version 1 live block's bytes: to los[]'s end */
 
 /* ---- sizes ---------------------------------------------------------------- */
@@ -136,10 +141,14 @@ enum {
 
 #define ROS_S3_F_WIREFRAME  1u                  /* debugging: draw edges only */
 #define ROS_S3_F_NO_TERRAIN 2u                  /* models only (the actor viewer) */
+#define ROS_S3_F_SQUARE_EDGE 4u                 /* version 3: env.edge is a square's border */
 
 /* ---- quality: tiles.h's numbers -------------------------------------------- */
-/* 0 classic (lit, no shadows), 1 smooth (shadow map, fog), 2 rich (normal,
- * specular and AO maps, post effects).  Shared with ROS_TILES_Q_*. */
+/* 0 classic (lit per vertex and per pixel as SCENE3D.md 6.2 says), 1 smooth
+ * (lit per pixel through the normal and specular maps, colour filtered in
+ * linear light, fog), 2 rich (and a shadow map from the sun, the occlusion
+ * maps, the foliage's soft edges, the sea as water): SCENE3D.md 13.
+ * Shared with ROS_TILES_Q_*. */
 
 /* ---- a tile (RG16UI, 512 x 512) -------------------------------------------- */
 /* tex: index into terrain[] (not an asset id), 0xFFFF none (drawn black);
@@ -205,8 +214,15 @@ struct ros_s3_env {
     float water[4];         /* height (metres), wind angle, 0 (no water) or 1, 0 */
     float sky_rgb[4];       /* the clear colour where no sky is drawn */
     float time[4];          /* seconds since the map began, then 0, 0, 0 */
-    uint16_t sky[8];        /* the sky set's textures (P5), 0 none */
-    uint32_t reserved[16];  /* 256 bytes */
+    uint16_t sky[8];        /* the sky set's textures (unused), 0 none */
+    /* version 3 (SCENE3D.md 14): the sky made by the presenter, in the
+     * picture's values; the haze is sky_rgb */
+    float sky_zenith[4];    /* the zenith's colour, w the cloud cover 0..1 */
+    float sky_horizon[4];   /* the horizon's above the haze, w the haze's height (sine) */
+    float sky_cloud[4];     /* the clouds' colour, w 0 */
+    float edge[4];          /* the map's edge: centre x, z, the fade from r0 (clear)
+                               to r1 (haze), metres; r1 0 none.  A circle, or a
+                               square with ROS_S3_F_SQUARE_EDGE */  /* 256 bytes */
 };
 
 /* ---- where an asset page is ------------------------------------------------ */

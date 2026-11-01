@@ -8913,6 +8913,8 @@ static void metal_pace(void)
     t0 = now;
 }
 
+static void metal_grab_now(void);       /* the grab (design 55), below */
+
 static bool metal_render_frame(void)
 {
     metal_pace();
@@ -9078,7 +9080,9 @@ static bool metal_render_frame(void)
 
     /* Wait for a ring slot before touching one: the frame three back has
      * to have left the GPU. */
-    dispatch_semaphore_wait(m.inflight, DISPATCH_TIME_FOREVER);
+    while (dispatch_semaphore_wait(m.inflight, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC))) {
+        metal_grab_now();               /* a grab is not kept waiting behind the GPU (design 55) */
+    }
 
     drawable = [m.layer nextDrawable];
     if (!drawable) {
@@ -9488,8 +9492,17 @@ static bool metal_composite_into(id<MTLCommandBuffer> cb, id<MTLTexture> composi
  * screenshot's is (no pointer), and the rectangle blitted straight into
  * the region, where the guest reads it; the ack follows when the GPU has
  * written it.  Asked for 25 times a second or so, while a magnifier is
- * open; one request at a time. */
+ * open; one request at a time.
+ *
+ * Answered as soon as it is seen, not at the next frame shown: the loop
+ * looks before each frame, while it waits for a frame in flight to leave
+ * the GPU, after the frame and in its idle wait (metal_grab_now).  The
+ * work goes on a command queue of its own and is waited for there, so it
+ * does not queue behind the frames in flight: on the 2019 Mac Pro, whose
+ * window draws 29-30 frames a second, answering from the frame's own
+ * queue at the next pass took 38-51 ms, past the guest's 50 ms. */
 static struct {
+    id<MTLCommandQueue> queue;          /* the grab's own */
     id<MTLTexture> tex;                 /* the composite, kept while the mode is */
     uint32_t w, h;
     id<MTLCommandBuffer> cb;            /* a request on the GPU: answered once it is done */
@@ -9497,6 +9510,8 @@ static struct {
     uint8_t *dst;
     uint32_t frame;
     uint32_t answered;                  /* grabs answered, for metal-debug.txt */
+    double seen;                        /* when the request in hand was seen */
+    double ms_sum, ms_max;              /* seen to answered, for metal-debug.txt */
 } grab;
 
 /* The request on the GPU, if it is done: the alpha bytes to 0 (RGBA8 is
@@ -9517,9 +9532,13 @@ static bool metal_grab_finish(void)
     metal_glue_grab_done(grab.g.seq, st == MTLCommandBufferStatusError ? 2u : 0u, grab.frame);
     [grab.cb release];
     grab.cb = nil;
+    double ms = (CACurrentMediaTime() - grab.seen) * 1000.0;
+    grab.ms_sum += ms;
+    grab.ms_max = MAX(grab.ms_max, ms);
     if (++grab.answered % 500 == 1) {
-        metal_log("grab: %u answered (%ux%u at %d,%d)", grab.answered, grab.g.w, grab.g.h,
-                  grab.g.x, grab.g.y);
+        metal_log("grab: %u answered (%ux%u at %d,%d), %.1f ms, mean %.1f, most %.1f",
+                  grab.answered, grab.g.w, grab.g.h, grab.g.x, grab.g.y, ms,
+                  grab.ms_sum / grab.answered, grab.ms_max);
     }
     return true;
 }
@@ -9535,6 +9554,7 @@ static void metal_grab_service(void)
     if (!metal_glue_grab_pending(&g)) {
         return;
     }
+    grab.seen = CACurrentMediaTime();
     pthread_mutex_lock(&surf.mx);
     if (!fb.up || !fb.decoded || !surf.region || !g.w || !g.h
         || (uint64_t)g.offset + (uint64_t)g.w * g.h * 4 > surf.region.length
@@ -9546,7 +9566,10 @@ static void metal_grab_service(void)
         metal_glue_grab_done(g.seq, status, frame_count);
         return;
     }
-    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    if (!grab.queue) {
+        grab.queue = [m.device newCommandQueue];
+    }
+    id<MTLCommandBuffer> cb = [(grab.queue ? grab.queue : m.queue) commandBuffer];
     id<MTLTexture> source = fb.decoded;
 
     if (metal_composite_wanted()) {
@@ -9588,6 +9611,20 @@ static void metal_grab_service(void)
     grab.dst = dst;
     grab.frame = frame_count;
     pthread_mutex_unlock(&surf.mx);
+}
+
+/* A grab waiting: composed, waited for and answered now.  A few
+ * milliseconds of the UI thread's: the composite of one frame at the
+ * guest's size and a blit of the rectangle. */
+static void metal_grab_now(void)
+{
+    @autoreleasepool {
+        metal_grab_service();
+        if (grab.cb) {
+            [grab.cb waitUntilCompleted];
+            metal_grab_finish();
+        }
+    }
 }
 
 static bool metal_screenshot_to(NSString *path)
@@ -10657,10 +10694,9 @@ int metal_backend_main(void)
             } else if (backdrop_scene_due()) {
                 frame_wanted = true;
             }
+            metal_grab_now();           /* a grab asked for while the last pass ran */
             metal_render_frame();
-            @autoreleasepool {
-                metal_grab_service();   /* a grab asked for: from the frame just composed */
-            }
+            metal_grab_now();           /* and while this frame was drawn */
             if (frame_skipped) {
                 frame_skipped = false;
                 /* nothing new: half a frame's wait -- but a list the box
@@ -10671,9 +10707,7 @@ int metal_backend_main(void)
                     MetalGrab g;
 
                     if (grab.cb || metal_glue_grab_pending(&g)) {
-                        @autoreleasepool {
-                            metal_grab_service();
-                        }
+                        metal_grab_now();
                     }
                     usleep(1000);
                 }

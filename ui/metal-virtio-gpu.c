@@ -97,6 +97,8 @@ typedef struct VgMode {
 #define ROSGD_PRESENT_GRAB      64u             /* it answers block v2's grab (design 55) */
 #define ROSGD_PRESENT_SNAPSHOT  8u              /* the ack once the damage is copied: the Wimp
                                                    draws into no backing till then */
+#define ROSGD_PRESENT_VDU       128u            /* virtual displays drawn here, from their
+                                                   banks (ROSGD_SURF_VDU, design 54) */
 #define ROSGD_SCREEN_SURF       (ROSGD_SCREEN_PRESENT + 16u)
 #define ROSGD_V2_MAGIC          0x32565352u     /* "RSV2" */
 #define ROSGD_V2_SIZE           65536u
@@ -414,7 +416,7 @@ static void vg_announce(const VgBacking *b, const VgMode *m)
     p.beat = cpu_to_le32(++beat);
     p.caps = cpu_to_le32(ROSGD_PRESENT_SURFACES | ROSGD_PRESENT_REGION
                          | (mode == VG_SURF_ON ? ROSGD_PRESENT_SNAPSHOT | ROSGD_PRESENT_STAGING
-                                                 | ROSGD_PRESENT_GRAB : 0));
+                                                 | ROSGD_PRESENT_GRAB | ROSGD_PRESENT_VDU : 0));
     iov_from_buf(b->iov, b->niov, m->block_off + ROSGD_SCREEN_PRESENT,
                  &p, sizeof(p));
     if (mode != VG_SURF_PROBE) {
@@ -827,6 +829,7 @@ static int vg_surfaces_view(MetalSurfacesView *out)
     out->n = 0;
     out->nrects = 0;
     out->nicons = 0;
+    out->nvdus = 0;
     out->nplaces = 0;
     for (uint32_t k = 0; k < v->nsurfaces && k < ROSGD_V2_SURFACES; k++) {
         const RosgdV2Surface *e = &v->surface[k];
@@ -861,6 +864,37 @@ static int vg_surfaces_view(MetalSurfacesView *out)
                     vg_page_surface(out, p, e->x + p->x, e->y + p->y, &v->rect[e->rects],
                                     e->nrects, v->shm_size);
                 }
+            }
+            continue;
+        }
+        if (e->kind == ROSGD_SURF_VDU) {
+            /* a virtual display's picture: its block in the region, drawn
+             * here from the bank on show (metal.m) */
+            uint32_t vo, vs;
+
+            memcpy(&vo, e->data, 4);
+            memcpy(&vs, e->data + 4, 4);
+            vo = le32_to_cpu(vo), vs = le32_to_cpu(vs);
+            if (host && out->nvdus < METAL_VDUS && e->w > 0 && e->h > 0 && vo != ROSGD_V2_NO_OFFSET
+                && vs >= 4096 && (uint64_t)vo + vs <= v->shm_size) {
+                MetalVdu *d = &out->vdu[out->nvdus++];
+                uint32_t sm;
+
+                memcpy(&sm, e->data + 12, 4);
+                d->window = e->window;
+                d->x = e->x, d->y = e->y, d->w = e->w, d->h = e->h;
+                d->offset = vo, d->size = vs;
+                d->smooth = le32_to_cpu(sm) != 0;
+                d->rects = out->nrects;
+                for (uint32_t r = 0; r < e->nrects && e->rects + r < ROSGD_V2_RECTS
+                     && out->nrects < METAL_SURF_RECTS; r++) {
+                    const RosgdV2Rect *q = &v->rect[e->rects + r];
+
+                    out->rect[out->nrects][0] = q->x0, out->rect[out->nrects][1] = q->y0;
+                    out->rect[out->nrects][2] = q->x1, out->rect[out->nrects][3] = q->y1;
+                    out->nrects++;
+                }
+                d->nrects = out->nrects - d->rects;
             }
             continue;
         }

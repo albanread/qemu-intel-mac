@@ -185,6 +185,20 @@ typedef struct MetalSurface {
  * the box's rosgd/include/rosgd/scene3d.h): Antiquity's terrain and models,
  * drawn from a live block and asset pages in backings in the region */
 #define ROSGD_SURF_SCENE3D 9u
+/* 10 is a virtual display (screen.h's ROS_SURF_VDU, the box's
+ * include/rosgd/vdusurf.h): a GraphTask window's picture, which the window
+ * draws from the display's bank on show and its palette in the region,
+ * converting and scaling them itself (design 54, 6.1) */
+#define ROSGD_SURF_VDU 10u
+#define METAL_VDUS 4
+
+typedef struct MetalVdu {
+    uint32_t window;                /* the Wimp's handle */
+    int16_t x, y, w, h;             /* the picture's box, guest pixels */
+    uint32_t rects, nrects;         /* visible: a range of the rect pool */
+    uint32_t offset, size;          /* the display's block in the region */
+    uint32_t smooth;                /* 1: a fitted scale, filtered */
+} MetalVdu;
 
 typedef struct MetalIcon {
     uint32_t kind, style;           /* 1 the clock, 2 the meter, 5 a game pane */
@@ -211,6 +225,8 @@ typedef struct MetalSurfacesView {
     uint32_t rsoff[METAL_SURF_RECTS];
     uint32_t nicons;
     MetalIcon icon[METAL_ICONS];
+    uint32_t nvdus;
+    MetalVdu vdu[METAL_VDUS];
     /* Every external window's page place (ROS_SURF_PAGE), whoever draws
      * it: where the host's own browser views go (metal-browser.m) */
     uint32_t nplaces;

@@ -2235,7 +2235,9 @@ static NSString *backdrop_resolve(NSString *path)
  * image pixel to a RISC OS pixel, or two for a double-density one.
  * Anything that cannot be read or compiled gives none.  Only ever
  * reached with the feature gated on; UI thread only. */
-static void backdrop_set_scene(const char *spec_c)
+static void backdrop_set_scene(const char *spec_c);    /* below: under surf.mx */
+
+static void backdrop_set_scene_locked(const char *spec_c)
 {
     NSString *spec = spec_c ? [NSString stringWithUTF8String:spec_c] : @"none";
     NSString *kind = nil, *file = nil;
@@ -2886,6 +2888,15 @@ static struct {
     uint64_t copied, copies;            /* bytes copied out of the backings, lists copied */
 } surf = { .mx = PTHREAD_MUTEX_INITIALIZER };
 
+/* A scene, under surf.mx: the taker thread composes grabs from the
+ * backdrop too (design 55) */
+static void backdrop_set_scene(const char *spec_c)
+{
+    pthread_mutex_lock(&surf.mx);
+    backdrop_set_scene_locked(spec_c);
+    pthread_mutex_unlock(&surf.mx);
+}
+
 static bool surf_build(void)
 {
     NSError *err = nil;
@@ -3397,6 +3408,8 @@ static void surf_take(void)
  * until its last list is acked, stood still -- a drag spent most of its
  * time so (17 Oct).
  */
+static void metal_grab_now(void);       /* the grab (design 55), below */
+
 static void *surf_taker(void *arg)
 {
     unsigned n = 0;
@@ -3415,6 +3428,13 @@ static void *surf_taker(void *arg)
             }
         }
         pthread_mutex_unlock(&surf.mx);
+        {
+            MetalGrab g;
+
+            if (metal_glue_grab_pending(&g)) {
+                metal_grab_now();       /* a grab, answered now (design 55) */
+            }
+        }
     }
     return NULL;
 }
@@ -9494,15 +9514,16 @@ static bool metal_composite_into(id<MTLCommandBuffer> cb, id<MTLTexture> composi
  * written it.  Asked for 25 times a second or so, while a magnifier is
  * open; one request at a time.
  *
- * Answered as soon as it is seen, not at the next frame shown: the loop
- * looks before each frame, while it waits for a frame in flight to leave
- * the GPU, after the frame and in its idle wait (metal_grab_now).  The
- * work goes on a command queue of its own and is waited for there, so it
- * does not queue behind the frames in flight: on the 2019 Mac Pro, whose
- * window draws 29-30 frames a second, answering from the frame's own
- * queue at the next pass took 38-51 ms, past the guest's 50 ms. */
+ * Answered as soon as it is seen, not at the next frame shown: the
+ * taker thread, which looks at the block every half millisecond, answers
+ * it (metal_grab_now), and so does the render loop wherever it passes.
+ * The composite is made under surf.mx, as a frame's encoding is, so it
+ * never meets a frame half made.  On the 2019 Mac Pro, whose window draws
+ * 29-30 frames a second and whose loop waits most of a frame for a
+ * drawable, answering at the loop's next pass took 38-51 ms, past the
+ * guest's 50 ms. */
+static pthread_mutex_t grab_mx = PTHREAD_MUTEX_INITIALIZER;   /* one answerer at a time */
 static struct {
-    id<MTLCommandQueue> queue;          /* the grab's own */
     id<MTLTexture> tex;                 /* the composite, kept while the mode is */
     uint32_t w, h;
     id<MTLCommandBuffer> cb;            /* a request on the GPU: answered once it is done */
@@ -9566,10 +9587,7 @@ static void metal_grab_service(void)
         metal_glue_grab_done(g.seq, status, frame_count);
         return;
     }
-    if (!grab.queue) {
-        grab.queue = [m.device newCommandQueue];
-    }
-    id<MTLCommandBuffer> cb = [(grab.queue ? grab.queue : m.queue) commandBuffer];
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLTexture> source = fb.decoded;
 
     if (metal_composite_wanted()) {
@@ -9613,11 +9631,13 @@ static void metal_grab_service(void)
     pthread_mutex_unlock(&surf.mx);
 }
 
-/* A grab waiting: composed, waited for and answered now.  A few
- * milliseconds of the UI thread's: the composite of one frame at the
- * guest's size and a blit of the rectangle. */
+/* A grab waiting: composed, waited for and answered now: the composite
+ * of one frame at the guest's size and a blit of the rectangle, a few
+ * milliseconds.  From the taker thread or the render loop, never with
+ * surf.mx held. */
 static void metal_grab_now(void)
 {
+    pthread_mutex_lock(&grab_mx);
     @autoreleasepool {
         metal_grab_service();
         if (grab.cb) {
@@ -9625,6 +9645,7 @@ static void metal_grab_now(void)
             metal_grab_finish();
         }
     }
+    pthread_mutex_unlock(&grab_mx);
 }
 
 static bool metal_screenshot_to(NSString *path)
@@ -9657,9 +9678,15 @@ static bool metal_screenshot_to(NSString *path)
     id<MTLTexture> source = fb.decoded;
     id<MTLTexture> composite = nil;
 
+    pthread_mutex_lock(&surf.mx);       /* as a frame's and a grab's (the taker's) */
+    bool composed = false;
     if (metal_composite_wanted()) {
         composite = metal_composite_texture();
-        if (composite && metal_composite_into(cb, composite)) {
+        composed = composite && metal_composite_into(cb, composite);
+    }
+    pthread_mutex_unlock(&surf.mx);
+    if (composite) {
+        if (composed) {
             source = composite;
         } else {
             [composite release];

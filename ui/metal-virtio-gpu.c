@@ -94,7 +94,7 @@ typedef struct VgMode {
 #define ROSGD_PRESENT_REGION    4u              /* backings are drawn only from the region */
 #define ROSGD_PRESENT_STAGING   16u             /* the pixels from a list's staging buffer
                                                    (version 4), never from a backing */
-#define ROSGD_PRESENT_GRAB      32u             /* it answers block v2's grab (design 55) */
+#define ROSGD_PRESENT_GRAB      64u             /* it answers block v2's grab (design 55) */
 #define ROSGD_PRESENT_SNAPSHOT  8u              /* the ack once the damage is copied: the Wimp
                                                    draws into no backing till then */
 #define ROSGD_SCREEN_SURF       (ROSGD_SCREEN_PRESENT + 16u)

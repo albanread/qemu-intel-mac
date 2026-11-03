@@ -2992,6 +2992,100 @@ static bool surf_build(void)
 }
 
 /* The region as a buffer: made once, again only if the guest names another */
+/* The machine's task manager (Ctrl-Alt-Esc, rosgd/include/rosgd/monitor.h).
+ * The box's monitor draws its panel into the backings region, in the
+ * 4 MB just below the host channel (the region's last 64 KB): a header,
+ * then 1024 x 640 RGBA pixels.  It is copied here when its sequence
+ * number moves and drawn over everything, pointer included, while the
+ * header says it is up.  It needs nothing of RISC OS, so it is shown
+ * while a task holds the machine. */
+#define MON_MAGIC 0x4E4F4D52u
+#define MON_W 1024u
+#define MON_H 640u
+#define MON_PIXELS 64u
+#define MON_REGION (4u << 20)
+#define MON_HC_SIZE 65536u
+
+static struct {
+    id<MTLBuffer> image;                /* MON_W x MON_H words, B G R A */
+    uint32_t seq;
+    bool shown;
+} mon;
+
+static void mon_poll(void)
+{
+    const volatile uint32_t *h;
+    bool up;
+
+    /* the region's place as last seen: the panel matters most when the
+     * guest has stopped publishing surfaces (a task holding the machine,
+     * a single-tasking program on the plain screen) */
+    if (!surf.region_host
+        || surf.region_size < MON_REGION + MON_HC_SIZE + (64u << 20)) {
+        if (mon.shown) {
+            mon.shown = false;
+            frame_wanted = true;
+        }
+        return;
+    }
+    h = (const volatile uint32_t *)((uint8_t *)surf.region_host + surf.region_size
+                                    - MON_HC_SIZE - MON_REGION);
+    up = h[0] == MON_MAGIC && h[1] == MON_W && h[2] == MON_H && h[3];
+    if (up && (!mon.shown || h[4] != mon.seq)) {
+        const uint32_t *src = (const uint32_t *)((const uint8_t *)h + MON_PIXELS);
+        uint32_t *dst;
+        uint32_t seq = h[4];
+
+        if (!mon.image) {
+            mon.image = [m.device newBufferWithLength:MON_W * MON_H * 4
+                                              options:MTLResourceStorageModeShared];
+            if (!mon.image) {
+                return;
+            }
+        }
+        dst = [mon.image contents];
+        for (uint32_t i = 0; i < MON_W * MON_H; i++) {
+            uint32_t c = src[i];        /* bytes R G B A: swap R and B */
+            dst[i] = (c & 0xFF00FF00u) | ((c & 0xFFu) << 16) | ((c >> 16) & 0xFFu);
+        }
+        mon.seq = seq;
+        mon.shown = true;
+        frame_wanted = true;
+    } else if (!up && mon.shown) {
+        mon.shown = false;
+        frame_wanted = true;
+    }
+}
+
+/* Centred on the guest's screen, made smaller to fit a small mode */
+static void mon_draw(id<MTLRenderCommandEncoder> enc, uint32_t xres, uint32_t yres)
+{
+    float rect[4];
+    uint32_t dim[2] = { MON_W, MON_H };
+    double k = 1.0, w, h;
+
+    if (!mon.shown || !mon.image || !ptr.pipe || !xres || !yres) {
+        return;
+    }
+    if (xres < MON_W) {
+        k = (double)xres / MON_W;
+    }
+    if (yres * 1.0 < MON_H * k) {
+        k = (double)yres / MON_H;
+    }
+    w = MON_W * k * 2.0 / xres;
+    h = MON_H * k * 2.0 / yres;
+    rect[0] = (float)(-w / 2);
+    rect[1] = (float)(h / 2);
+    rect[2] = (float)(w / 2);
+    rect[3] = (float)(-h / 2);
+    [enc setRenderPipelineState:ptr.pipe];
+    [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
+    [enc setFragmentBytes:dim length:sizeof(dim) atIndex:0];
+    [enc setFragmentBuffer:mon.image offset:0 atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+
 static bool surf_region(void)
 {
     MetalSurfacesView *v = &surf.taken;
@@ -9047,6 +9141,9 @@ static bool metal_render_frame(void)
         surf.view = surf.taken;         /* this frame's list, and the copies are its */
     }
     pthread_mutex_unlock(&surf.mx);
+    if (have_fb) {
+        mon_poll();                     /* the task manager's panel: up, down, changed */
+    }
     /* the box's browser, the Mac's WebKit: its lines answered and its
      * panels placed, a frame presented or not */
     metal_browser_tick(m.window, [m.window contentView], have_fb ? &surf.view : NULL,
@@ -9312,6 +9409,9 @@ static bool metal_render_frame(void)
                         vertexStart:0 vertexCount:3];
             }
         }
+    }
+    if (have_fb) {
+        mon_draw(enc, v.xres, v.yres);
     }
     [enc endEncoding];
 

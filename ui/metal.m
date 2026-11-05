@@ -139,6 +139,14 @@ static struct {
     volatile bool scene_failed;         /* a GPU fault: drop to none */
     int guest_shows;                    /* the newest frame has tagged pixels */
     CFAbsoluteTime guest_checked;
+
+    /* Choices.Present on the disc (design 59, 4.3): what !Appearance
+     * chose -- "backdrop SPEC" and "tint &RRGGBB|none" -- looked at once
+     * a second, applied when it changes */
+    bool tint_on;
+    float tint[3];                      /* the scene's in.key while tint_on */
+    NSString *choices_text;             /* the file as last read */
+    CFAbsoluteTime choices_checked;
 } backdrop = { .mode = METAL_BACKDROP_OFF, .image_scale = 1.0 };
 
 /* Machine > HostNet, the doorbell switch: shown when this machine has
@@ -2093,9 +2101,9 @@ static void backdrop_scene_render(CGSize target, uint32_t gw, uint32_t gh)
     sp.b[1] = (float)METAL_ICONBAR_PX * sp.a[2];
     sp.b[2] = (float)gw;
     sp.b[3] = (float)gh;
-    sp.c[0] = 0xB7 / 255.0f;
-    sp.c[1] = 0xC0 / 255.0f;
-    sp.c[2] = 0xB4 / 255.0f;
+    sp.c[0] = backdrop.tint_on ? backdrop.tint[0] : 0xB7 / 255.0f;
+    sp.c[1] = backdrop.tint_on ? backdrop.tint[1] : 0xC0 / 255.0f;
+    sp.c[2] = backdrop.tint_on ? backdrop.tint[2] : 0xB4 / 255.0f;
     sp.d[0] = backdrop.scene_frame;
     sp.d[1] = backdrop.state_rows;
 
@@ -2128,13 +2136,20 @@ static void backdrop_scene_render(CGSize target, uint32_t gw, uint32_t gh)
 }
 
 /* Whether RISC OS is painting the below tag in the key colour right now,
- * sampled from the newest frame for the menu's hint: 1 yes, 0 no, -1 not
- * a 32bpp mode, -2 no frame yet. */
+ * sampled from the newest frame for the menu's hint and the scenes' pause:
+ * 1 yes, 0 no, -1 not a 32bpp mode, -2 no frame yet. */
+static int backdrop_guest_surfaces(void);       /* below, with the surfaces */
+
 static int backdrop_guest_state(void)
 {
     const uint8_t *raw;
     uint32_t x, y;
 
+    int on = backdrop_guest_surfaces();
+
+    if (on >= 0) {
+        return on;                      /* the list is composited: its holes */
+    }
     if (!fb.up || !fb.uploaded) {
         return -2;
     }
@@ -2257,11 +2272,17 @@ static void backdrop_set_scene_locked(const char *spec_c)
     } else if ([spec isEqualToString:@"acorn-live"]) {
         mode = METAL_BACKDROP_ACORN_LIVE;
     } else {
-        for (NSString *k in @[ @"shader", @"tile", @"picture", @"wallpaper" ]) {
+        for (NSString *k in @[ @"shader", @"tile", @"picture", @"wallpaper", @"scene" ]) {
             if ([spec hasPrefix:[k stringByAppendingString:@":"]]) {
                 kind = k;
                 file = [spec substringFromIndex:k.length + 1];
             }
+        }
+        if ([kind isEqualToString:@"scene"]) {
+            /* scene:NAME -- the scene in this host's language, Metal
+             * (the GPU presenter takes NAME.glsl): !Appearance's form */
+            kind = @"shader";
+            file = [@"Shaders" stringByAppendingPathComponent:[file stringByAppendingString:@".metal"]];
         }
         if (!kind) {
             file = spec;
@@ -2895,6 +2916,173 @@ static void backdrop_set_scene(const char *spec_c)
     pthread_mutex_lock(&surf.mx);
     backdrop_set_scene_locked(spec_c);
     pthread_mutex_unlock(&surf.mx);
+}
+
+/* backdrop_guest_state when the list is composited: whether a backing
+ * shows a hole -- a pixel whose alpha is the below tag -- anywhere it can
+ * be seen, sampled every 8 pixels of each visible rectangle.  A desktop
+ * whose every window covers the backdrop, or a blanked screen, has none,
+ * so a moving scene stops. */
+static int backdrop_guest_surfaces(void)
+{
+    const MetalSurfacesView *v = &surf.view;
+    const uint8_t *region = v->region;
+    uint32_t samples = 0;
+
+    if (!surf.on) {
+        return -3;                      /* the framebuffer is drawn: look there */
+    }
+    if (!region) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < v->n && i < METAL_SURFACES; i++) {
+        const MetalSurface *e = &v->s[i];
+
+        if (e->format != 0) {
+            continue;
+        }
+        for (uint32_t r = 0; r < e->nrects && e->rects + r < v->nrects; r++) {
+            const int16_t *b = v->rect[e->rects + r];
+
+            for (int y = b[1] + 3; y < b[3]; y += 8) {
+                for (int x = b[0] + 3; x < b[2]; x += 8) {
+                    int lx = x - e->x, ly = y - e->y;
+                    uint64_t at;
+
+                    if (lx < 0 || ly < 0 || lx >= e->w || ly >= e->h) {
+                        continue;
+                    }
+                    at = (uint64_t)e->offset + (uint64_t)ly * e->stride + (uint64_t)lx * 4;
+                    if (at + 4 > v->region_size) {
+                        continue;
+                    }
+                    if (region[at + 3] == 0x80) {
+                        return 1;
+                    }
+                    if (++samples > 200000) {
+                        return 1;       /* too much to look at: say yes */
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* The path of Choices.Present on the disc: two folders above
+ * backdrop-dir= (the disc's Resources/Wallpapers), with HostFS's ,fff or
+ * without; nil with no disc */
+static NSString *backdrop_choices_path(void)
+{
+    NSString *disc, *dir;
+
+    if (!backdrop.dir.length) {
+        return nil;
+    }
+    disc = [[backdrop.dir stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    dir = [disc stringByAppendingPathComponent:@"Choices"];
+    for (NSString *leaf in @[ @"Present,fff", @"Present" ]) {
+        NSString *p = [dir stringByAppendingPathComponent:leaf];
+
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            return p;
+        }
+    }
+    return [dir stringByAppendingPathComponent:@"Present,fff"];
+}
+
+/* Choices.Present, looked at once a second (design 59, 4.3): a changed
+ * "backdrop" line chooses the scene, as the Machine menu does; "tint"
+ * gives the scenes their colour.  A file with no backdrop line leaves
+ * the Mac's own choice alone.  UI thread. */
+static void backdrop_choices_poll(void)
+{
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSString *path, *text, *spec = nil;
+    bool tint_on = false;
+    float tint[3] = { 0, 0, 0 };
+
+    if (!backdrop.enabled || now - backdrop.choices_checked < 1.0) {
+        return;
+    }
+    backdrop.choices_checked = now;
+    path = backdrop_choices_path();
+    text = path ? [NSString stringWithContentsOfFile:path encoding:NSISOLatin1StringEncoding error:NULL] : nil;
+    if (!text || [text isEqualToString:backdrop.choices_text]) {
+        return;
+    }
+    [backdrop.choices_text release];
+    backdrop.choices_text = [text copy];
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        NSArray *w = [[line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]
+                      componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+
+        if (w.count < 2) {
+            continue;
+        }
+        if ([w[0] caseInsensitiveCompare:@"backdrop"] == NSOrderedSame) {
+            spec = w[1];
+        } else if ([w[0] caseInsensitiveCompare:@"tint"] == NSOrderedSame) {
+            NSString *v = w[1];
+            unsigned rgb = 0;
+
+            if ([v hasPrefix:@"&"] || [v hasPrefix:@"#"]) {
+                v = [v substringFromIndex:1];
+            }
+            if ([v caseInsensitiveCompare:@"none"] != NSOrderedSame
+                && [[NSScanner scannerWithString:v] scanHexInt:&rgb]) {
+                tint_on = true;
+                tint[0] = ((rgb >> 16) & 255) / 255.0f;
+                tint[1] = ((rgb >> 8) & 255) / 255.0f;
+                tint[2] = (rgb & 255) / 255.0f;
+            }
+        }
+    }
+    if (tint_on != backdrop.tint_on || memcmp(tint, backdrop.tint, sizeof tint)) {
+        backdrop.tint_on = tint_on;
+        memcpy(backdrop.tint, tint, sizeof tint);
+        backdrop.scene_valid = false;   /* drawn again in the new colour, moving or not */
+        frame_wanted = true;
+        metal_log("backdrop: tint %s %.3f %.3f %.3f", tint_on ? "on" : "none", tint[0], tint[1], tint[2]);
+    }
+    if (spec && ![spec isEqualToString:backdrop.spec]) {
+        metal_log("backdrop: Choices.Present chooses %s", [spec UTF8String]);
+        backdrop_set_scene([spec UTF8String]);
+    }
+}
+
+/* The Machine menu's choice into Choices.Present too, so !Appearance and
+ * the next start see it: the file's backdrop line replaced, its other
+ * lines kept.  A shader in the disc's Shaders is written as scene:NAME. */
+static void backdrop_choices_write(NSString *spec)
+{
+    NSString *path = backdrop_choices_path(), *text;
+    NSMutableArray *out = [NSMutableArray array];
+
+    if (!path || !spec) {
+        return;
+    }
+    if ([spec hasPrefix:@"shader:Shaders/"] && [spec hasSuffix:@".metal"]) {
+        NSString *name = [[spec substringFromIndex:15] stringByDeletingPathExtension];
+
+        if ([name rangeOfString:@"/"].location == NSNotFound) {
+            spec = [@"scene:" stringByAppendingString:name];
+        }
+    }
+    text = [NSString stringWithContentsOfFile:path encoding:NSISOLatin1StringEncoding error:NULL];
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        if (line.length && ![[line lowercaseString] hasPrefix:@"backdrop "]) {
+            [out addObject:line];
+        }
+    }
+    [out addObject:[@"backdrop " stringByAppendingString:spec]];
+    text = [[out componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES attributes:nil error:NULL];
+    if ([text writeToFile:path atomically:NO encoding:NSISOLatin1StringEncoding error:NULL]) {
+        [backdrop.choices_text release];
+        backdrop.choices_text = [text copy];    /* ours: not applied again */
+    }
 }
 
 static bool surf_build(void)
@@ -9243,7 +9431,8 @@ static bool metal_render_frame(void)
 
             backdrop_scene_size(target, v.xres, v.yres, &sw, &sh);
             if (!backdrop.scene_valid || sw != backdrop.scene_w || sh != backdrop.scene_h
-                || (backdrop.fps > 0 && now >= backdrop.scene_next)) {
+                || (backdrop.fps > 0 && now >= backdrop.scene_next && backdrop.guest_shows
+                    && ([m.window occlusionState] & NSWindowOcclusionStateVisible))) {
                 backdrop_scene_render(target, v.xres, v.yres);
                 if (backdrop.fps > 0) {
                     backdrop.scene_next = now + 1.0 / backdrop.fps;
@@ -10480,6 +10669,7 @@ static void backdrop_add_submenu(NSMenu *menu, NSString *title, NSMenu *sub)
          * would not compile is not tried again */
         [[NSUserDefaults standardUserDefaults] setObject:backdrop.spec forKey:@"backdrop"];
         [[NSUserDefaults standardUserDefaults] synchronize];
+        backdrop_choices_write(backdrop.spec);
     }
 }
 
@@ -10818,6 +11008,7 @@ int metal_backend_main(void)
                 usleep(50 * 1000);
                 continue;
             }
+            backdrop_choices_poll();    /* what !Appearance chose */
             /* a moving backdrop's next frame, or its fault: none */
             if (backdrop.scene_failed) {
                 metal_log("backdrop: the scene failed, so none");

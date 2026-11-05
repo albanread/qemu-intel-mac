@@ -140,7 +140,7 @@ static struct {
     int guest_shows;                    /* the newest frame has tagged pixels */
     CFAbsoluteTime guest_checked;
 
-    /* Choices.Present on the disc (design 59, 4.3): what !Appearance
+    /* Choices.Presenter on the disc (design 59, 4.3): what !Appearance
      * chose -- "backdrop SPEC" and "tint &RRGGBB|none" -- looked at once
      * a second, applied when it changes */
     bool tint_on;
@@ -2969,9 +2969,10 @@ static int backdrop_guest_surfaces(void)
     return 0;
 }
 
-/* The path of Choices.Present on the disc: two folders above
+/* The path of Choices.Presenter on the disc: two folders above
  * backdrop-dir= (the disc's Resources/Wallpapers), with HostFS's ,fff or
- * without; nil with no disc */
+ * without; nil with no disc.  Not Choices.Present, which is !Present's
+ * folder of choices on a disc that has run it. */
 static NSString *backdrop_choices_path(void)
 {
     NSString *disc, *dir;
@@ -2981,17 +2982,18 @@ static NSString *backdrop_choices_path(void)
     }
     disc = [[backdrop.dir stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
     dir = [disc stringByAppendingPathComponent:@"Choices"];
-    for (NSString *leaf in @[ @"Present,fff", @"Present" ]) {
+    for (NSString *leaf in @[ @"Presenter,fff", @"Presenter" ]) {
         NSString *p = [dir stringByAppendingPathComponent:leaf];
+        BOOL isdir = NO;
 
-        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&isdir] && !isdir) {
             return p;
         }
     }
-    return [dir stringByAppendingPathComponent:@"Present,fff"];
+    return [dir stringByAppendingPathComponent:@"Presenter"];
 }
 
-/* Choices.Present, looked at once a second (design 59, 4.3): a changed
+/* Choices.Presenter, looked at once a second (design 59, 4.3): a changed
  * "backdrop" line chooses the scene, as the Machine menu does; "tint"
  * gives the scenes their colour.  A file with no backdrop line leaves
  * the Mac's own choice alone.  UI thread. */
@@ -3046,12 +3048,12 @@ static void backdrop_choices_poll(void)
         metal_log("backdrop: tint %s %.3f %.3f %.3f", tint_on ? "on" : "none", tint[0], tint[1], tint[2]);
     }
     if (spec && ![spec isEqualToString:backdrop.spec]) {
-        metal_log("backdrop: Choices.Present chooses %s", [spec UTF8String]);
+        metal_log("backdrop: Choices.Presenter chooses %s", [spec UTF8String]);
         backdrop_set_scene([spec UTF8String]);
     }
 }
 
-/* The Machine menu's choice into Choices.Present too, so !Appearance and
+/* The Machine menu's choice into Choices.Presenter too, so !Appearance and
  * the next start see it: the file's backdrop line replaced, its other
  * lines kept.  A shader in the disc's Shaders is written as scene:NAME. */
 static void backdrop_choices_write(NSString *spec)
